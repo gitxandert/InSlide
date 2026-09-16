@@ -228,7 +228,7 @@ Desktop. Before each TQ upload, InSlide copies selected GT450 slides to
 `<IMAGE_STAGING_HOST>\<destination directory>\<renamed slide>.svs`, removes the
 identifying label and macro from those copies, then gives the staged slide paths
 and a generated metadata CSV to TQ. Each transfer uploads that CSV as
-`<destination directory>/metadata.csv` after the slides. It contains
+`<destination directory>/metadata.csv` before the slides. It contains
 `accession_id,pid,num_slides`, with one row per accession
 and the number of selected slides for that accession. A staging or
 deidentification failure prevents the whole selection from uploading. Files

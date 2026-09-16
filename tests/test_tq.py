@@ -506,7 +506,7 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(1, len(backups))
         self.assertEqual(malformed, backups[0].read_text(encoding="utf-8"))
 
-    def test_metadata_csv_aggregates_accessions_and_uploads_last(self):
+    def test_metadata_csv_aggregates_accessions_and_uploads_first(self):
         slides = [dict(slide) for slide in self.catalog()]
         other = dict(slides[0])
         other.update(
@@ -557,7 +557,14 @@ class TQTransferTests(unittest.TestCase):
                     "destination_dir": "StudyA",
                     "destination_name": "metadata.csv",
                 },
-                manifest[-1],
+                manifest[0],
+            )
+            self.assertEqual(
+                [
+                    slide.get("staged_path", slide["original_path"])
+                    for slide in slides
+                ],
+                [row["original_path"] for row in manifest[1:]],
             )
         finally:
             metadata_path.unlink(missing_ok=True)
@@ -729,14 +736,14 @@ class TQTransferTests(unittest.TestCase):
             self.assertEqual(["tq", "pusher", "--paths"], command[:3])
             with Path(command[3]).open("r", newline="", encoding="utf-8") as handle:
                 captured["manifest"] = list(csv.DictReader(handle))
-            metadata_row = captured["manifest"][-1]
+            metadata_row = captured["manifest"][0]
             self.assertEqual("StudyA", metadata_row["destination_dir"])
             self.assertEqual("metadata.csv", metadata_row["destination_name"])
             with Path(metadata_row["original_path"]).open(
                 "r", newline="", encoding="utf-8"
             ) as handle:
                 captured["metadata"] = list(csv.DictReader(handle))
-            staged_path = captured["manifest"][0]["original_path"]
+            staged_path = captured["manifest"][1]["original_path"]
             self.assertEqual(b"deidentified-slide", Path(staged_path).read_bytes())
             output = (
                 app_module.json.dumps(
@@ -749,7 +756,7 @@ class TQTransferTests(unittest.TestCase):
         with mock.patch.object(app_module.subprocess, "Popen", side_effect=launch):
             app_module._run_tq_job(job)
 
-        manifest_row = captured["manifest"][0]
+        manifest_row = captured["manifest"][1]
         self.assertEqual(slide["staged_path"], manifest_row["original_path"])
         self.assertEqual("StudyA/BRAIN/AAAAAA", manifest_row["destination_dir"])
         self.assertEqual(

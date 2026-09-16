@@ -3719,6 +3719,13 @@ def _tq_write_manifest(
                 fieldnames=("original_path", "destination_dir", "destination_name"),
             )
             writer.writeheader()
+            writer.writerow(
+                {
+                    "original_path": str(metadata_path),
+                    "destination_dir": slides[0]["staging_dir"],
+                    "destination_name": "metadata.csv",
+                }
+            )
             writer.writerows(
                 {
                     "original_path": slide.get(
@@ -3728,13 +3735,6 @@ def _tq_write_manifest(
                     "destination_name": slide["destination_name"],
                 }
                 for slide in slides
-            )
-            writer.writerow(
-                {
-                    "original_path": str(metadata_path),
-                    "destination_dir": slides[0]["staging_dir"],
-                    "destination_name": "metadata.csv",
-                }
             )
             handle.flush()
             os.fsync(handle.fileno())
