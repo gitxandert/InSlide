@@ -230,7 +230,14 @@ identifying label and macro from those copies, then gives the staged slide paths
 and a generated metadata CSV to TQ. Each transfer uploads that CSV as
 `<destination directory>/metadata.csv` before the slides. It contains
 `accession_id,pid,num_slides`, with one row per accession
-and the number of selected slides for that accession. A staging or
+and the number of selected slides for that accession. The transfer review page
+also offers an unchecked **Include CoPath data** option. When selected, the
+transfer uploads `<destination directory>/copath_data.csv` after `metadata.csv`
+and before the slides. It contains one full stored CoPath row per selected
+accession, including patient identifiers, clinical report text, and InSlide's
+derived fields. Missing accessions are reported in the transfer output while
+available CoPath rows and slides continue uploading; if none are available, the
+CoPath CSV contains only its header. A staging or
 deidentification failure prevents the whole selection from uploading. Files
 confirmed successful by TQ are removed; failed files remain for
 diagnosis and are replaced from GT450 on retry. Size this directory for the

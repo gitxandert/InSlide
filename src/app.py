@@ -2953,6 +2953,8 @@ class TQJob:
         all_slides: List[Dict[str, str]],
         manifest_path: Optional[Path] = None,
         metadata_path: Optional[Path] = None,
+        copath_path: Optional[Path] = None,
+        missing_copath_accessions: Sequence[str] = (),
     ):
         self.id = job_id
         self.owner_id = owner_id
@@ -2961,6 +2963,9 @@ class TQJob:
         self.all_slides = all_slides
         self.manifest_path = manifest_path
         self.metadata_path = metadata_path
+        self.copath_path = copath_path
+        self.include_copath = copath_path is not None
+        self.missing_copath_accessions = tuple(missing_copath_accessions)
         self.status = "running"
         self.return_code: Optional[int] = None
         self.output = ""
@@ -3704,8 +3709,87 @@ def _tq_write_metadata_csv(slides: List[Dict[str, str]]) -> Path:
     return path
 
 
+def _tq_copath_rows(
+    slides: List[Dict[str, str]],
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    requested: Dict[str, Dict[str, Any]] = {}
+    for slide in slides:
+        accession = slide.get("accession", "").strip()
+        key = renaming.accession_key(accession)
+        if not key:
+            continue
+        entry = requested.setdefault(
+            key,
+            {"accession": accession, "batch_roots": set()},
+        )
+        batch_root = slide.get("batch_root", "").strip()
+        if batch_root:
+            entry["batch_roots"].add(batch_root)
+
+    reports_by_root: Dict[str, Dict[str, Dict[str, str]]] = {}
+    exported: Dict[str, Dict[str, str]] = {}
+    missing: List[str] = []
+    for key in sorted(requested):
+        entry = requested[key]
+        candidates: List[Dict[str, str]] = []
+        try:
+            for batch_root in sorted(entry["batch_roots"]):
+                if batch_root not in reports_by_root:
+                    reports_by_root[batch_root] = renaming.report_rows(
+                        Path(batch_root), Path(Config.COPATH_CLONE)
+                    )
+                reports = reports_by_root[batch_root]
+                if key in reports:
+                    candidate = {
+                        field: reports[key].get(field, "")
+                        for field in renaming.COPATH_FIELDS
+                    }
+                    if candidate not in candidates:
+                        candidates.append(candidate)
+        except renaming.RenamingError as exc:
+            raise TQError(f"CoPath transfer data could not be read: {exc}") from exc
+        if not candidates:
+            missing.append(entry["accession"])
+            continue
+        if len(candidates) > 1:
+            raise TQError(
+                "Conflicting CoPath records were found for accession "
+                f"{entry['accession']}."
+            )
+        exported[key] = candidates[0]
+    return [exported[key] for key in sorted(exported)], missing
+
+
+def _tq_write_copath_csv(
+    slides: List[Dict[str, str]],
+) -> Tuple[Path, List[str]]:
+    directory = Path(Config.INSTANCE_DIR) / "tq_manifests"
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor, path_value = tempfile.mkstemp(
+        prefix="copath-", suffix=".csv", dir=directory
+    )
+    path = Path(path_value)
+    try:
+        rows, missing = _tq_copath_rows(slides)
+        with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as handle:
+            descriptor = -1
+            writer = csv.DictWriter(handle, fieldnames=renaming.COPATH_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        if descriptor != -1:
+            os.close(descriptor)
+        path.unlink(missing_ok=True)
+        raise
+    return path, missing
+
+
 def _tq_write_manifest(
-    slides: List[Dict[str, str]], metadata_path: Path
+    slides: List[Dict[str, str]],
+    metadata_path: Path,
+    copath_path: Optional[Path] = None,
 ) -> Path:
     directory = Path(Config.INSTANCE_DIR) / "tq_manifests"
     directory.mkdir(parents=True, exist_ok=True)
@@ -3726,6 +3810,14 @@ def _tq_write_manifest(
                     "destination_name": "metadata.csv",
                 }
             )
+            if copath_path is not None:
+                writer.writerow(
+                    {
+                        "original_path": str(copath_path),
+                        "destination_dir": slides[0]["staging_dir"],
+                        "destination_name": "copath_data.csv",
+                    }
+                )
             writer.writerows(
                 {
                     "original_path": slide.get(
@@ -4061,7 +4153,16 @@ def _run_tq_job(job: TQJob) -> None:
         _tq_deidentify_slides(job)
         _tq_append_output(job, "Starting TQ upload.\n")
         job.metadata_path = _tq_write_metadata_csv(job.slides)
-        job.manifest_path = _tq_write_manifest(job.slides, job.metadata_path)
+        if job.missing_copath_accessions:
+            _tq_append_output(
+                job,
+                "CoPath data was unavailable for accession(s): "
+                + ", ".join(job.missing_copath_accessions)
+                + ". Continuing with available CoPath data.\n",
+            )
+        job.manifest_path = _tq_write_manifest(
+            job.slides, job.metadata_path, job.copath_path
+        )
         command = [
             Config.TQ_EXECUTABLE,
             "pusher",
@@ -4086,7 +4187,7 @@ def _run_tq_job(job: TQJob) -> None:
 
 
 def _tq_cleanup_job_files(job: TQJob) -> None:
-    for path in (job.manifest_path, job.metadata_path):
+    for path in (job.manifest_path, job.metadata_path, job.copath_path):
         if path is not None:
             path.unlink(missing_ok=True)
 
@@ -4157,6 +4258,8 @@ def _start_tq_job(
     owner_id: str,
     slides: List[Dict[str, str]],
     all_slides: List[Dict[str, str]],
+    copath_path: Optional[Path] = None,
+    missing_copath_accessions: Sequence[str] = (),
 ) -> TQJob:
     global _tq_active_job_id
     config_result = _tq_config()
@@ -4173,6 +4276,8 @@ def _start_tq_job(
             None,
             slides,
             all_slides,
+            copath_path=copath_path,
+            missing_copath_accessions=missing_copath_accessions,
         )
         job.config_result = config_result
         _tq_jobs[job.id] = job
@@ -5140,11 +5245,17 @@ def tq_page():
     with _tq_state_lock:
         draft = _tq_drafts.setdefault(
             owner_id,
-            {"selected_ids": set(), "destination_dir": "", "phase": "select"},
+            {
+                "selected_ids": set(),
+                "destination_dir": "",
+                "include_copath": False,
+                "phase": "select",
+            },
         )
         draft_snapshot = {
             "selected_ids": set(draft["selected_ids"]),
             "destination_dir": str(draft.get("destination_dir", "")),
+            "include_copath": bool(draft.get("include_copath", False)),
             "phase": draft["phase"],
         }
     catalog_by_id = {slide["id"]: slide for slide in all_slides}
@@ -5174,6 +5285,7 @@ def tq_page():
         selected_ids=draft_snapshot["selected_ids"],
         selected_slides=selected_slides,
         destination_dir=draft_snapshot["destination_dir"],
+        include_copath=draft_snapshot["include_copath"],
         review=review,
         job=job,
         discovery_warnings=discovery_warnings,
@@ -5195,7 +5307,12 @@ def tq_review():
     with _tq_state_lock:
         draft = _tq_drafts.setdefault(
             str(current_user.id),
-            {"selected_ids": set(), "destination_dir": "", "phase": "select"},
+            {
+                "selected_ids": set(),
+                "destination_dir": "",
+                "include_copath": False,
+                "phase": "select",
+            },
         )
         draft["selected_ids"] = selected_ids
         draft["phase"] = "review"
@@ -5210,11 +5327,17 @@ def tq_save_draft():
         return jsonify({"success": False, "message": "Invalid draft request."}), 400
     selected_ids = payload.get("selected_ids")
     destination_dir = payload.get("destination_dir")
+    include_copath = payload.get("include_copath")
     phase = payload.get("phase")
     with _tq_state_lock:
         draft = _tq_drafts.setdefault(
             str(current_user.id),
-            {"selected_ids": set(), "destination_dir": "", "phase": "select"},
+            {
+                "selected_ids": set(),
+                "destination_dir": "",
+                "include_copath": False,
+                "phase": "select",
+            },
         )
         if selected_ids is not None:
             if not isinstance(selected_ids, list) or any(
@@ -5232,6 +5355,12 @@ def tq_save_draft():
                     {"success": False, "message": "Invalid destination draft."}
                 ), 400
             draft["destination_dir"] = destination_dir[:500]
+        if include_copath is not None:
+            if not isinstance(include_copath, bool):
+                return jsonify(
+                    {"success": False, "message": "Invalid CoPath draft option."}
+                ), 400
+            draft["include_copath"] = include_copath
         if phase in {"select", "review"}:
             draft["phase"] = phase
     return jsonify({"success": True})
@@ -5264,13 +5393,26 @@ def tq_transfer():
         flash("The transfer draft no longer contains any available slides.", "error")
         return redirect(url_for("tq_page"))
     destination_value = request.form.get("destination_dir", "")
+    include_copath = request.form.get("include_copath") == "1"
+    copath_path = None
     try:
         staging_dir = _tq_safe_prefix(destination_value)
         for slide in selected:
             slide["staging_dir"] = staging_dir
             slide["destination_dir"] = _tq_destination_dir(staging_dir, slide)
-        job = _start_tq_job(owner_id, selected, all_slides)
+        missing_copath_accessions: List[str] = []
+        if include_copath:
+            copath_path, missing_copath_accessions = _tq_write_copath_csv(selected)
+        job = _start_tq_job(
+            owner_id,
+            selected,
+            all_slides,
+            copath_path=copath_path,
+            missing_copath_accessions=missing_copath_accessions,
+        )
     except TQError as exc:
+        if copath_path is not None:
+            copath_path.unlink(missing_ok=True)
         app.logger.warning(
             "TQ_TRANSFER_PREFLIGHT user_id=%s status=failed",
             current_user.id,
@@ -5279,6 +5421,7 @@ def tq_transfer():
         with _tq_state_lock:
             if draft:
                 draft["destination_dir"] = destination_value[:500]
+                draft["include_copath"] = include_copath
                 draft["phase"] = "review"
         return redirect(url_for("tq_page", view="review"))
     session["tq_job_id"] = job.id
@@ -5299,6 +5442,13 @@ def tq_transfer():
             f"TQ configuration Windows path escaping was repaired on line(s) "
             f"{lines}. Original saved as {backup_name}.",
             "success",
+        )
+    if missing_copath_accessions:
+        flash(
+            "CoPath data was unavailable for accession(s): "
+            + ", ".join(missing_copath_accessions)
+            + ". The transfer will continue with available CoPath data.",
+            "warning",
         )
     flash(f"Transfer started for {len(selected)} slide(s).", "success")
     return redirect(url_for("tq_page"))

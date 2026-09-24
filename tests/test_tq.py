@@ -140,6 +140,7 @@ class TQTransferTests(unittest.TestCase):
             "IMAGE_STAGING_HOST_DISPLAY": (
                 app_module.Config.IMAGE_STAGING_HOST_DISPLAY
             ),
+            "COPATH_CLONE": app_module.Config.COPATH_CLONE,
         }
         app_module.Config.INSLIDE_BATCHES = str(self.batch_base)
         app_module.Config.INSTANCE_DIR = str(self.root / "instance")
@@ -157,6 +158,8 @@ class TQTransferTests(unittest.TestCase):
         app_module.Config.TQ_EXECUTABLE = "tq"
         app_module.Config.IMAGE_STAGING_ROOT = str(self.root / "image_staging")
         app_module.Config.IMAGE_STAGING_HOST_DISPLAY = r"D:\image_staging"
+        app_module.Config.COPATH_CLONE = str(self.root / "copath-clone")
+        renaming.initialize_clone(Path(app_module.Config.COPATH_CLONE))
         app_module.batch_contexts.clear()
         with app_module._tq_state_lock:
             app_module._tq_drafts.clear()
@@ -195,6 +198,26 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual([], warnings)
         self.assertEqual(2, len(slides))
         return slides
+
+    def write_copath_record(self, **values):
+        row = {field: "" for field in renaming.COPATH_FIELDS}
+        row.update(
+            {
+                "accession_id": "NP25-100",
+                "mrn": "12345678",
+                "patient_name": "PATIENT, TEST",
+                "report": "Final diagnosis text",
+                "organ": "BRAIN",
+                "PID": "AAAAAA",
+            }
+        )
+        row.update(values)
+        write_csv(
+            self.batch / "pending_CoPath_data.csv",
+            renaming.COPATH_FIELDS,
+            [row],
+        )
+        return row
 
     def test_catalog_filters_dates_and_builds_destination(self):
         slides = self.catalog()
@@ -274,6 +297,29 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b"Review Transfer", response.data)
         self.assertIn(b"AAAAAA", response.data)
 
+    def test_copath_checkbox_defaults_off_and_persists_in_draft(self):
+        slides = self.catalog()
+        self.client.post("/tq/review", data={"slide_id": slides[0]["id"]})
+
+        response = self.client.get("/tq?view=review")
+        self.assertIn(b'id="include-copath"', response.data)
+        checked_markup = (
+            b'id="include-copath" name="include_copath" '
+            b'type="checkbox" value="1" checked'
+        )
+        self.assertNotIn(checked_markup, response.data)
+
+        draft_response = self.client.post(
+            "/tq/draft",
+            json={"include_copath": True, "phase": "review"},
+        )
+        self.assertEqual(200, draft_response.status_code)
+        response = self.client.get("/tq?view=review")
+        self.assertIn(checked_markup, response.data)
+
+        invalid = self.client.post("/tq/draft", json={"include_copath": "yes"})
+        self.assertEqual(400, invalid.status_code)
+
     def test_transfer_console_uses_ansi_renderer(self):
         job = SimpleNamespace(
             id="ansi-job",
@@ -337,6 +383,31 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual("destination", launched[0]["staging_dir"])
         with self.client.session_transaction() as session:
             self.assertEqual("job-id", session["tq_job_id"])
+
+    def test_transfer_route_builds_copath_file_only_when_checked(self):
+        expected = self.write_copath_record()
+        slides = self.catalog()
+        self.client.post("/tq/review", data={"slide_id": slides[0]["id"]})
+        fake_job = SimpleNamespace(id="copath-job", status="running")
+
+        with mock.patch.object(
+            app_module, "_start_tq_job", return_value=fake_job
+        ) as start:
+            response = self.client.post(
+                "/tq/transfer",
+                data={"destination_dir": "destination", "include_copath": "1"},
+            )
+
+        self.assertEqual(302, response.status_code)
+        copath_path = start.call_args.kwargs["copath_path"]
+        try:
+            with copath_path.open("r", newline="", encoding="utf-8") as handle:
+                self.assertEqual([expected], list(csv.DictReader(handle)))
+            self.assertEqual(
+                [], start.call_args.kwargs["missing_copath_accessions"]
+            )
+        finally:
+            copath_path.unlink(missing_ok=True)
 
     def test_transfer_preflight_repairs_config_and_reports_backup(self):
         slides = self.catalog()
@@ -580,6 +651,84 @@ class TQTransferTests(unittest.TestCase):
 
         self.assertEqual([], list(metadata_dir.glob("metadata-*.csv")))
 
+    def test_copath_csv_exports_full_unique_rows_and_reports_missing(self):
+        expected = self.write_copath_record()
+        slides = [dict(slide) for slide in self.catalog()]
+        missing_slide = dict(slides[0])
+        missing_slide.update({"accession": "NP25-200", "original_path": "three.svs"})
+        slides.append(missing_slide)
+
+        copath_path, missing = app_module._tq_write_copath_csv(slides)
+        try:
+            with copath_path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                rows = list(reader)
+            self.assertEqual(list(renaming.COPATH_FIELDS), reader.fieldnames)
+            self.assertEqual([expected], rows)
+            self.assertEqual(["NP25-200"], missing)
+        finally:
+            copath_path.unlink(missing_ok=True)
+
+    def test_copath_csv_is_header_only_when_all_records_are_missing(self):
+        copath_path, missing = app_module._tq_write_copath_csv(self.catalog())
+        try:
+            with copath_path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                self.assertEqual([], list(reader))
+                self.assertEqual(list(renaming.COPATH_FIELDS), reader.fieldnames)
+            self.assertEqual(["NP25-100"], missing)
+        finally:
+            copath_path.unlink(missing_ok=True)
+
+    def test_copath_export_rejects_conflicting_batch_records(self):
+        first = self.write_copath_record()
+        other_batch = self.batch_base / "SS12798" / "2026-07-21"
+        second = dict(first, report="Different diagnosis text")
+        write_csv(
+            other_batch / "pending_CoPath_data.csv",
+            renaming.COPATH_FIELDS,
+            [second],
+        )
+        slides = [dict(self.catalog()[0])]
+        other_slide = dict(slides[0], batch_root=str(other_batch))
+
+        with self.assertRaisesRegex(app_module.TQError, "Conflicting CoPath"):
+            app_module._tq_write_copath_csv([slides[0], other_slide])
+
+        manifest_dir = Path(app_module.Config.INSTANCE_DIR) / "tq_manifests"
+        self.assertEqual([], list(manifest_dir.glob("copath-*.csv")))
+
+    def test_manifest_uploads_optional_copath_csv_before_slides(self):
+        self.write_copath_record()
+        slides = [dict(slide) for slide in self.catalog()]
+        for slide in slides:
+            slide["staging_dir"] = "StudyA"
+            slide["destination_dir"] = app_module._tq_destination_dir(
+                "StudyA", slide
+            )
+        metadata_path = app_module._tq_write_metadata_csv(slides)
+        copath_path, _ = app_module._tq_write_copath_csv(slides)
+        manifest_path = app_module._tq_write_manifest(
+            slides, metadata_path, copath_path
+        )
+        try:
+            with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+                manifest = list(csv.DictReader(handle))
+            self.assertEqual("metadata.csv", manifest[0]["destination_name"])
+            self.assertEqual(
+                {
+                    "original_path": str(copath_path),
+                    "destination_dir": "StudyA",
+                    "destination_name": "copath_data.csv",
+                },
+                manifest[1],
+            )
+            self.assertEqual(len(slides) + 2, len(manifest))
+        finally:
+            metadata_path.unlink(missing_ok=True)
+            copath_path.unlink(missing_ok=True)
+            manifest_path.unlink(missing_ok=True)
+
     def test_failed_upload_cleans_metadata_and_manifest(self):
         slide = dict(self.catalog()[0])
         slide["staging_dir"] = "StudyA"
@@ -593,6 +742,7 @@ class TQTransferTests(unittest.TestCase):
         job.manifest_path = app_module._tq_write_manifest(
             job.slides, job.metadata_path
         )
+        job.copath_path = app_module._tq_temporary_csv("copath-")
         job.process = FakeProcess(return_code=1)
 
         app_module._read_tq_output(job)
@@ -600,6 +750,7 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual("failed", job.status)
         self.assertFalse(job.metadata_path.exists())
         self.assertFalse(job.manifest_path.exists())
+        self.assertFalse(job.copath_path.exists())
 
     def run_result_job(self, slide, all_slides):
         slide = dict(slide)

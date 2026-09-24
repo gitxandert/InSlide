@@ -18,6 +18,8 @@
         .controls { display:grid; grid-template-columns:repeat(4,minmax(150px,1fr)); gap:14px; align-items:end; }
         .field { display:flex; flex-direction:column; gap:6px; }
         .field label,.field-label { font-size:.84rem; font-weight:700; }
+        .checkbox-field { display:flex; align-items:center; gap:8px; }
+        .checkbox-field input { width:auto; }
         input,select,button { font:inherit; }
         input,select { width:100%; padding:9px 10px; border:1px solid #aeb8c3; border-radius:6px; background:white; }
         button,.button-link { display:inline-block; padding:9px 15px; border:0; border-radius:6px; color:white; background:var(--primary); cursor:pointer; text-decoration:none; font-weight:700; }
@@ -181,6 +183,10 @@
                     <input id="destination-dir" name="destination_dir" value="{{ destination_dir }}" required placeholder="destination" autocomplete="off">
                     <span class="muted">Slides stage together in D:\image_staging\&lt;destination&gt; before deidentification and upload.</span>
                 </div>
+                <label class="checkbox-field" for="include-copath">
+                    <input id="include-copath" name="include_copath" type="checkbox" value="1" {% if include_copath %}checked{% endif %}>
+                    Include CoPath data
+                </label>
             </div>
             <div class="table-wrap">
                 <table class="review-table">
@@ -425,7 +431,8 @@ document.getElementById('review-form')?.addEventListener('submit', () => {
 updateAllParents();
 
 const destinationDir = document.getElementById('destination-dir');
-function saveDestinationDir() {
+const includeCopath = document.getElementById('include-copath');
+function saveReviewDraft() {
     const value = destinationDir.value;
     document.querySelectorAll('.destination-dir-preview').forEach((preview) => {
         preview.textContent = value || 'destination';
@@ -433,10 +440,15 @@ function saveDestinationDir() {
     fetch({{ url_for('tq_save_draft')|tojson }}, {
         method:'POST',
         headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},
-        body:JSON.stringify({destination_dir:value,phase:'review'})
+        body:JSON.stringify({
+            destination_dir:value,
+            include_copath:Boolean(includeCopath?.checked),
+            phase:'review'
+        })
     }).catch(() => {});
 }
-destinationDir?.addEventListener('input', saveDestinationDir);
+destinationDir?.addEventListener('input', saveReviewDraft);
+includeCopath?.addEventListener('change', saveReviewDraft);
 
 {% if job %}
 const consoleElement = document.getElementById('console');
