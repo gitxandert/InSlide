@@ -80,6 +80,40 @@ class BatchCatalogTests(unittest.TestCase):
         self.assertFalse(other["qc_complete"])
         self.assertEqual(1, first["queue_total"])
 
+    def test_schema_version_one_is_upgraded_with_transfer_tables(self):
+        legacy_instance = self.root / "legacy-instance"
+        legacy_instance.mkdir()
+        database = legacy_instance / "batch_catalog.sqlite3"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "CREATE TABLE catalog_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO catalog_metadata(key,value) VALUES('schema_version','1')"
+        )
+        connection.commit()
+        connection.close()
+
+        legacy_catalog = BatchCatalog()
+        self.assertEqual([], legacy_catalog.list_batches(legacy_instance))
+
+        connection = sqlite3.connect(database)
+        try:
+            version = connection.execute(
+                "SELECT value FROM catalog_metadata WHERE key='schema_version'"
+            ).fetchone()[0]
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        finally:
+            connection.close()
+        self.assertEqual("2", version)
+        self.assertIn("transfer_slides", tables)
+        self.assertIn("transfer_sources", tables)
+
 
 class BatchCatalogMigrationTests(unittest.TestCase):
     def setUp(self):

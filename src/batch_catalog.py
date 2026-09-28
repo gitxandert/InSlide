@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 QUEUE_STATUSES = {"pending", "leased", "completed"}
 
 
@@ -125,6 +125,52 @@ class BatchCatalog:
                         ON queue_items(leased_by_id, status);
                     CREATE INDEX IF NOT EXISTS queue_completion_owner
                         ON queue_items(completed_by_id, completed_at);
+                    CREATE TABLE IF NOT EXISTS transfer_sources (
+                        source_key TEXT PRIMARY KEY,
+                        source_kind TEXT NOT NULL CHECK(source_kind IN ('sdl','mapping')),
+                        batch_id INTEGER REFERENCES batches(id) ON DELETE CASCADE,
+                        path TEXT NOT NULL,
+                        size INTEGER,
+                        mtime_ns INTEGER,
+                        status TEXT NOT NULL CHECK(status IN ('ready','warning','error')),
+                        error TEXT NOT NULL DEFAULT '',
+                        indexed_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS transfer_slides (
+                        slide_id TEXT PRIMARY KEY,
+                        batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+                        source_row INTEGER NOT NULL CHECK(source_row >= 0),
+                        raw_original_path TEXT NOT NULL,
+                        original_path TEXT NOT NULL,
+                        accession TEXT NOT NULL,
+                        accession_key TEXT NOT NULL,
+                        organ TEXT NOT NULL,
+                        pid TEXT NOT NULL,
+                        accession_date TEXT NOT NULL,
+                        stain TEXT NOT NULL,
+                        image_type TEXT NOT NULL,
+                        samp_acq_type TEXT NOT NULL,
+                        block_number TEXT NOT NULL,
+                        section_count TEXT NOT NULL,
+                        destination_name TEXT NOT NULL,
+                        digitization_date TEXT NOT NULL DEFAULT '',
+                        UNIQUE(batch_id, source_row)
+                    );
+                    CREATE TABLE IF NOT EXISTS transfer_slide_types (
+                        slide_id TEXT NOT NULL REFERENCES transfer_slides(slide_id) ON DELETE CASCADE,
+                        slide_type TEXT NOT NULL,
+                        PRIMARY KEY(slide_id, slide_type)
+                    );
+                    CREATE INDEX IF NOT EXISTS transfer_slides_batch
+                        ON transfer_slides(batch_id);
+                    CREATE INDEX IF NOT EXISTS transfer_slides_accession
+                        ON transfer_slides(accession_key);
+                    CREATE INDEX IF NOT EXISTS transfer_slides_pid
+                        ON transfer_slides(pid);
+                    CREATE INDEX IF NOT EXISTS transfer_slides_organ
+                        ON transfer_slides(organ);
+                    CREATE INDEX IF NOT EXISTS transfer_slide_types_type
+                        ON transfer_slide_types(slide_type, slide_id);
                     """
                 )
                 connection.execute(
@@ -135,6 +181,12 @@ class BatchCatalog:
                 version = connection.execute(
                     "SELECT value FROM catalog_metadata WHERE key='schema_version'"
                 ).fetchone()[0]
+                if int(version) == 1:
+                    connection.execute(
+                        "UPDATE catalog_metadata SET value=? WHERE key='schema_version'",
+                        (str(SCHEMA_VERSION),),
+                    )
+                    version = str(SCHEMA_VERSION)
                 if int(version) != SCHEMA_VERSION:
                     raise RuntimeError(f"Unsupported batch catalog schema version: {version}")
                 connection.commit()
@@ -554,6 +606,130 @@ class BatchCatalog:
                 "SELECT value FROM catalog_metadata WHERE key=?", (key,)
             ).fetchone()
             return str(row[0]) if row is not None else None
+
+    def replace_transfer_catalog(
+        self,
+        instance_dir: str | Path,
+        slides: Iterable[Mapping[str, object]],
+        sources: Iterable[Mapping[str, object]],
+        signature: str,
+    ) -> None:
+        """Atomically replace derived transfer rows and their source state."""
+        slide_rows = [dict(row) for row in slides]
+        source_rows = [dict(row) for row in sources]
+        with self.connection(instance_dir) as connection:
+            batch_ids = {
+                str(row["public_id"]): int(row["id"])
+                for row in connection.execute("SELECT id,public_id FROM batches")
+            }
+            connection.execute("DELETE FROM transfer_sources")
+            connection.execute("DELETE FROM transfer_slides")
+            connection.executemany(
+                """
+                INSERT INTO transfer_sources(
+                    source_key,source_kind,batch_id,path,size,mtime_ns,status,error,indexed_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (
+                        row["source_key"], row["source_kind"],
+                        batch_ids.get(str(row.get("batch_id") or "")), row["path"],
+                        row.get("size"), row.get("mtime_ns"), row["status"],
+                        row.get("error", ""), utc_now(),
+                    )
+                    for row in source_rows
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO transfer_slides(
+                    slide_id,batch_id,source_row,raw_original_path,original_path,
+                    accession,accession_key,organ,pid,accession_date,stain,image_type,
+                    samp_acq_type,block_number,section_count,destination_name,digitization_date
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (
+                        row["id"], batch_ids[str(row["batch_id"])], row["source_row"],
+                        row["raw_original_path"], row["original_path"], row["accession"],
+                        row["accession_key"], row["organ"], row["pid"],
+                        row["accession_date"], row["stain"], row["image_type"],
+                        row["samp_acq_type"], row["block_number"], row["section_count"],
+                        row["destination_name"], row["digitization_date"],
+                    )
+                    for row in slide_rows
+                ],
+            )
+            type_rows = [
+                (row["id"], slide_type)
+                for row in slide_rows
+                for slide_type in row.get("sdl_types", ["NONE"])
+            ]
+            connection.executemany(
+                "INSERT INTO transfer_slide_types(slide_id,slide_type) VALUES(?,?)",
+                type_rows,
+            )
+            connection.execute(
+                "INSERT INTO catalog_metadata(key,value) VALUES('transfer_signature',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (signature,),
+            )
+
+    def list_transfer_slides(self, instance_dir: str | Path) -> list[dict]:
+        """Return transfer rows belonging to healthy, finalized batches."""
+        with self.connection(instance_dir) as connection:
+            rows = connection.execute(
+                """
+                SELECT s.*, b.public_id AS batch_public_id,
+                       b.scanner_name || '/' || b.batch_name AS batch_name,
+                       GROUP_CONCAT(t.slide_type, char(31)) AS sdl_types
+                FROM transfer_slides s
+                JOIN batches b ON b.id=s.batch_id
+                JOIN transfer_sources source
+                  ON source.batch_id=b.id AND source.source_kind='mapping'
+                LEFT JOIN transfer_slide_types t ON t.slide_id=s.slide_id
+                WHERE b.renamed_complete=1 AND b.validity='ready'
+                  AND source.status='ready'
+                GROUP BY s.slide_id
+                ORDER BY s.rowid
+                """
+            ).fetchall()
+        result = []
+        for raw in rows:
+            row = dict(raw)
+            row["id"] = row.pop("slide_id")
+            row["batch_id"] = row.pop("batch_public_id")
+            row["sdl_types"] = (row.get("sdl_types") or "NONE").split(chr(31))
+            row.pop("source_row", None)
+            row.pop("accession_key", None)
+            row.pop("raw_original_path", None)
+            result.append(row)
+        return result
+
+    def list_transfer_warnings(self, instance_dir: str | Path) -> list[str]:
+        """Return persistent warnings for transfer sources that are not healthy."""
+        with self.connection(instance_dir) as connection:
+            rows = connection.execute(
+                """
+                SELECT source.source_kind, source.error,
+                       b.scanner_name, b.batch_name
+                FROM transfer_sources source
+                LEFT JOIN batches b ON b.id=source.batch_id
+                WHERE source.status<>'ready'
+                  AND (source.source_kind='sdl' OR b.renamed_complete=1)
+                ORDER BY source.source_key
+                """
+            ).fetchall()
+        warnings = []
+        for row in rows:
+            if row["source_kind"] == "sdl":
+                warnings.append(str(row["error"]))
+            else:
+                warnings.append(
+                    f"Skipped {row['scanner_name']}/{row['batch_name']}: "
+                    f"name_mapping.csv {row['error']}."
+                )
+        return warnings
 
     def acquire_reconcile_lease(
         self, instance_dir: str | Path, owner: str, lease_seconds: int

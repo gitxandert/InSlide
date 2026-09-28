@@ -61,6 +61,8 @@
         .status.succeeded { color:#155724; background:#d4edda; }
         .status.failed { color:#721c24; background:#f8d7da; }
         .console-heading { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+        .pagination { display:flex; align-items:center; justify-content:center; gap:14px; margin-top:18px; }
+        .pagination .disabled { color:#adb5bd; }
         #console { min-height:240px; max-height:520px; overflow:auto; padding:16px; border-radius:8px; color:#e7edf3; background:#111820; white-space:pre-wrap; overflow-wrap:anywhere; font:13px/1.55 ui-monospace,Consolas,monospace; }
         [hidden] { display:none !important; }
         @media(max-width:850px) { header{align-items:flex-start;flex-direction:column;padding:15px 20px}.controls{grid-template-columns:1fr 1fr}.slide-row{min-width:900px}.selection-panel{overflow-x:auto} }
@@ -168,7 +170,7 @@
     {% if review %}
     <section class="card">
         <div class="result-heading">
-            <div><h2>Review transfer</h2><span class="muted">{{ selected_slides|length }} selected slide(s)</span></div>
+            <div><h2>Review transfer</h2><span class="muted">{{ selected_count }} selected slide(s)</span></div>
             <form method="POST" action="{{ url_for('tq_reset') }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <button class="danger" type="submit">Clear draft</button>
@@ -207,6 +209,13 @@
                     </tbody>
                 </table>
             </div>
+            {% if total_pages > 1 %}
+            <nav class="pagination" aria-label="Review pages">
+                {% if previous_url %}<a class="button-link secondary" href="{{ previous_url }}">Previous</a>{% else %}<span class="disabled">Previous</span>{% endif %}
+                <span>Page {{ current_page }} of {{ total_pages }}</span>
+                {% if next_url %}<a class="button-link secondary" href="{{ next_url }}">Next</a>{% else %}<span class="disabled">Next</span>{% endif %}
+            </nav>
+            {% endif %}
             <div class="actions">
                 <button type="submit" {% if job and job.status == 'running' %}disabled{% endif %}>Transfer</button>
                 {% if job and job.status == 'running' %}<span class="muted">Another transfer is currently running.</span>{% endif %}
@@ -226,17 +235,17 @@
                     {% for batch in rows %}
                     <details class="group batch-group">
                         <summary>
-                            <input class="parent-checkbox" type="checkbox" aria-label="Select batch {{ batch.name }}">
+                            <input class="parent-checkbox" type="checkbox" data-group-kind="batch" data-batch-id="{{ batch.batch_id }}" aria-label="Select batch {{ batch.name }}">
                             <span>{{ batch.name }}</span>
-                            <span class="summary-meta">{{ batch.accessions|length }} accession(s) · {{ batch.slides|length }} slide(s) · {{ batch.date }}</span>
+                            <span class="summary-meta">{{ group_accession_counts.get('batch|' ~ batch.batch_id, batch.accessions|length) }} accession(s) · {{ group_counts.get('batch|' ~ batch.batch_id, batch.slides|length) }} slide(s) · {{ batch.date }}</span>
                         </summary>
                         <div class="nested">
                             {% for accession in batch.accessions %}
                             <details class="group accession-group">
                                 <summary>
-                                    <input class="parent-checkbox" type="checkbox" aria-label="Select accession {{ accession.name }}">
+                                    <input class="parent-checkbox" type="checkbox" data-group-kind="accession" data-batch-id="{{ accession.batch_id }}" data-accession="{{ accession.name }}" aria-label="Select accession {{ accession.name }}">
                                     <span>{{ accession.name }}</span>
-                                    <span class="summary-meta">{{ accession.slides|length }} slide(s) · {{ accession.date }}</span>
+                                    <span class="summary-meta">{{ group_counts.get('accession|' ~ accession.batch_id ~ '|' ~ accession.name, accession.slides|length) }} slide(s) · {{ accession.date }}</span>
                                 </summary>
                                 <div class="nested">
                                     {% for slide in accession.slides %}
@@ -257,9 +266,9 @@
                     {% for accession in rows %}
                     <details class="group accession-group">
                         <summary>
-                            <input class="parent-checkbox" type="checkbox" aria-label="Select accession {{ accession.name }}">
+                            <input class="parent-checkbox" type="checkbox" data-group-kind="accession" data-batch-id="{{ accession.batch_id }}" data-accession="{{ accession.name }}" aria-label="Select accession {{ accession.name }}">
                             <span>{{ accession.name }} <span class="muted">({{ accession.batch_name }})</span></span>
-                            <span class="summary-meta">{{ accession.slides|length }} slide(s) · {{ accession.date }}</span>
+                            <span class="summary-meta">{{ group_counts.get('accession|' ~ accession.batch_id ~ '|' ~ accession.name, accession.slides|length) }} slide(s) · {{ accession.date }}</span>
                         </summary>
                         <div class="nested">
                             {% for slide in accession.slides %}
@@ -277,17 +286,17 @@
                     {% for type_group in rows %}
                     <details class="group type-group">
                         <summary>
-                            <input class="parent-checkbox" type="checkbox" aria-label="Select type {{ type_group.name }}">
+                            <input class="parent-checkbox" type="checkbox" data-group-kind="type" data-slide-type="{{ type_group.name }}" aria-label="Select type {{ type_group.name }}">
                             <span>{{ type_group.name }}</span>
-                            <span class="summary-meta">{{ type_group.accessions|length }} accession(s) · {{ type_group.slides|length }} slide(s) · {{ type_group.date }}</span>
+                            <span class="summary-meta">{{ group_accession_counts.get('type|' ~ type_group.name, type_group.accessions|length) }} accession(s) · {{ group_counts.get('type|' ~ type_group.name, type_group.slides|length) }} slide(s) · {{ type_group.date }}</span>
                         </summary>
                         <div class="nested">
                             {% for accession in type_group.accessions %}
                             <details class="group accession-group">
                                 <summary>
-                                    <input class="parent-checkbox" type="checkbox" aria-label="Select accession {{ accession.name }}">
+                                    <input class="parent-checkbox" type="checkbox" data-group-kind="type_accession" data-batch-id="{{ accession.batch_id }}" data-accession="{{ accession.name }}" data-slide-type="{{ type_group.name }}" aria-label="Select accession {{ accession.name }}">
                                     <span>{{ accession.name }} <span class="muted">({{ accession.batch_name }})</span></span>
-                                    <span class="summary-meta">{{ accession.slides|length }} slide(s) · {{ accession.date }}</span>
+                                    <span class="summary-meta">{{ group_counts.get('type_accession|' ~ type_group.name ~ '|' ~ accession.batch_id ~ '|' ~ accession.name, accession.slides|length) }} slide(s) · {{ accession.date }}</span>
                                 </summary>
                                 <div class="nested">
                                     {% for slide in accession.slides %}
@@ -317,6 +326,13 @@
                 <div class="actions">
                     <button type="submit">Review Transfer</button>
                 </div>
+                {% if total_pages > 1 %}
+                <nav class="pagination" aria-label="Transfer selection pages">
+                    {% if previous_url %}<a class="button-link secondary" href="{{ previous_url }}">Previous</a>{% else %}<span class="disabled">Previous</span>{% endif %}
+                    <span>Page {{ current_page }} of {{ total_pages }}</span>
+                    {% if next_url %}<a class="button-link secondary" href="{{ next_url }}">Next</a>{% else %}<span class="disabled">Next</span>{% endif %}
+                </nav>
+                {% endif %}
             {% else %}<p class="muted">No completed slides match these options.</p>{% endif %}
         </form>
     </section>
@@ -335,6 +351,11 @@
 </main>
 <script nonce="{{ csp_nonce() }}">
 const csrfToken = {{ csrf_token()|tojson }};
+const groupDraftUrl = {{ url_for('tq_save_group_draft')|tojson }};
+const transferView = {
+    filter:{{ filter_field|tojson }}, filter_value:{{ filter_value|tojson }},
+    start_date:{{ start_date|tojson }}, end_date:{{ end_date|tojson }}
+};
 const filterSelect = document.getElementById('filter');
 const filterValue = document.getElementById('filter-value');
 const filterControls = Array.from(document.querySelectorAll('.filter-control'));
@@ -369,15 +390,19 @@ function captureVisibleSelection() {
     });
 }
 let draftTimer;
+function persistSelectionDraft() {
+    captureVisibleSelection();
+    return fetch({{ url_for('tq_save_draft')|tojson }}, {
+        method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},
+        body:JSON.stringify({selected_ids:selectedSlideIds(),phase:'select'})
+    });
+}
 function saveSelectionDraft() {
     captureVisibleSelection();
     window.clearTimeout(draftTimer);
     draftTimer = window.setTimeout(() => {
-        fetch({{ url_for('tq_save_draft')|tojson }}, {
-            method:'POST',
-            headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},
-            body:JSON.stringify({selected_ids:selectedSlideIds(),phase:'select'})
-        }).catch(() => {});
+        persistSelectionDraft().catch(() => {});
     }, 250);
 }
 function updateParentState(group) {
@@ -400,13 +425,44 @@ function setSlideChecked(slideId, checked) {
 }
 document.querySelectorAll('.parent-checkbox').forEach((checkbox) => {
     checkbox.addEventListener('click', (event) => event.stopPropagation());
-    checkbox.addEventListener('change', () => {
+    checkbox.addEventListener('change', async () => {
         const group = checkbox.closest('.group');
+        const checked = checkbox.checked;
         group.querySelectorAll('.slide-checkbox').forEach((child) => {
-            setSlideChecked(child.value, checkbox.checked);
+            setSlideChecked(child.value, checked);
         });
         updateAllParents();
-        saveSelectionDraft();
+        checkbox.disabled = true;
+        try {
+            const response = await fetch(groupDraftUrl, {
+                method:'POST',
+                headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},
+                body:JSON.stringify({
+                    kind:checkbox.dataset.groupKind,
+                    batch_id:checkbox.dataset.batchId || '',
+                    accession:checkbox.dataset.accession || '',
+                    slide_type:checkbox.dataset.slideType || '',
+                    checked,
+                    view:transferView
+                })
+            });
+            if (!response.ok) throw new Error(`Selection failed with HTTP ${response.status}`);
+            const data = await response.json();
+            draftSelectedIds.clear();
+            data.selected_ids.forEach((slideId) => draftSelectedIds.add(slideId));
+            document.querySelectorAll('.slide-checkbox').forEach((item) => {
+                item.checked = draftSelectedIds.has(item.value);
+            });
+            updateAllParents();
+        } catch (_error) {
+            checkbox.checked = !checked;
+            group.querySelectorAll('.slide-checkbox').forEach((child) => {
+                setSlideChecked(child.value, !checked);
+            });
+            updateAllParents();
+        } finally {
+            checkbox.disabled = false;
+        }
     });
 });
 document.querySelectorAll('.slide-checkbox').forEach((checkbox) => {
@@ -429,6 +485,16 @@ document.getElementById('review-form')?.addEventListener('submit', () => {
     });
 });
 updateAllParents();
+document.querySelectorAll('.pagination a').forEach((link) => {
+    link.addEventListener('click', (event) => {
+        if (!document.getElementById('review-form')) return;
+        event.preventDefault();
+        window.clearTimeout(draftTimer);
+        persistSelectionDraft()
+            .catch(() => {})
+            .finally(() => window.location.assign(link.href));
+    });
+});
 
 const destinationDir = document.getElementById('destination-dir');
 const includeCopath = document.getElementById('include-copath');

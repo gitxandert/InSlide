@@ -1793,6 +1793,7 @@ def _catalog_reconciler() -> None:
                         batch_catalog.release_reconcile_lease(
                             Config.INSTANCE_DIR, _catalog_reconcile_owner
                         )
+            _tq_catalog()
         except Exception:
             app.logger.exception("Background batch catalog reconciliation failed")
 
@@ -2255,8 +2256,12 @@ def _format_sdl_value(header: str, value: Any) -> str:
     return str(value)
 
 
-def _sdl_row_signature(worksheet: Worksheet, row_number: int) -> str:
-    header_columns = _sdl_header_columns(worksheet)
+def _sdl_row_signature(
+    worksheet: Worksheet,
+    row_number: int,
+    header_columns: Optional[Dict[str, int]] = None,
+) -> str:
+    header_columns = header_columns or _sdl_header_columns(worksheet)
     values = tuple(
         worksheet.cell(row=row_number, column=header_columns[header]).value
         for header in SDL_HEADERS
@@ -2287,7 +2292,9 @@ def _read_sdl_rows(worksheet: Worksheet) -> List[Dict[str, Any]]:
                     header: _coerce_sdl_bool(raw_values[header])
                     for header in SDL_STATUS_HEADERS
                 },
-                "signature": _sdl_row_signature(worksheet, row_number),
+                "signature": _sdl_row_signature(
+                    worksheet, row_number, header_columns
+                ),
             }
         )
     return rows
@@ -2930,6 +2937,7 @@ _tq_pid_pattern = re.compile(r"^[A-Z]{6}$")
 _tq_section_pattern = re.compile(r"^[0-9]{3}$")
 _tq_state_lock = threading.Lock()
 _tq_config_lock = threading.Lock()
+_tq_catalog_lock = threading.Lock()
 _tq_drafts: Dict[str, Dict[str, Any]] = {}
 _tq_jobs: Dict[str, "TQJob"] = {}
 _tq_active_job_id: Optional[str] = None
@@ -3094,16 +3102,19 @@ def _tq_sdl_accession_metadata(
                 accession = renaming.accession_key(row["values"]["Accession ID"])
                 loaded = row["values"]["Date Loaded"].strip()
                 slide_type = row["values"]["Type"].strip()
+                if slide_type.casefold() == "none":
+                    slide_type = "NONE"
                 if accession and _strict_sdl_date(loaded):
                     dates[accession].add(loaded)
                 if accession and slide_type:
                     types[accession].add(slide_type)
+            accessions = set(dates) | set(types)
             return {
                 accession: {
                     "dates": sorted(dates.get(accession, set())),
-                    "types": sorted(values, key=str.casefold),
+                    "types": sorted(types.get(accession, set()), key=str.casefold),
                 }
-                for accession, values in types.items()
+                for accession in accessions
             }, None
     except (SDLWorkbookError, OSError) as exc:
         return {}, f"Slide Digitization Log transfer metadata is unavailable: {exc}"
@@ -3128,20 +3139,80 @@ def _tq_digitization_date(
     return candidates[0] if len(candidates) == 1 else ""
 
 
-def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
-    batches, warnings = discover_batches()
+def _tq_source_stat(path: Path) -> Dict[str, Optional[int]]:
+    try:
+        details = path.stat()
+        return {"size": details.st_size, "mtime_ns": details.st_mtime_ns}
+    except OSError:
+        return {"size": None, "mtime_ns": None}
+
+
+def _tq_catalog_signature(batches: Sequence[BatchContext]) -> str:
+    sdl_path = Path(Config.SDL_FILE_PATH)
+    values: List[Dict[str, Any]] = [
+        {
+            "kind": "configuration",
+            "batches_root": str(Config.INSLIDE_BATCHES),
+            "image_host_prefix": os.environ.get("GT450_IMAGES_HOST_PREFIX", ""),
+            "image_container_root": os.environ.get("GT450_IMAGES_CONTAINER_ROOT", ""),
+        },
+        {"kind": "sdl", "path": str(sdl_path), **_tq_source_stat(sdl_path)},
+    ]
+    for context in batches:
+        mapping_path = context.root / "name_mapping.csv"
+        values.append(
+            {
+                "kind": "mapping",
+                "batch_id": context.id,
+                "path": str(mapping_path),
+                **_tq_source_stat(mapping_path),
+            }
+        )
+    return hashlib.sha256(
+        json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _tq_rebuild_catalog(
+    batches: Sequence[BatchContext], signature: str
+) -> List[str]:
     sdl_metadata, sdl_warning = _tq_sdl_accession_metadata()
-    if sdl_warning:
-        warnings.append(sdl_warning)
-    slides: List[Dict[str, str]] = []
+    warnings = [sdl_warning] if sdl_warning else []
+    sdl_path = Path(Config.SDL_FILE_PATH)
+    sdl_stat = _tq_source_stat(sdl_path)
+    sources: List[Dict[str, Any]] = [
+        {
+            "source_key": "sdl",
+            "source_kind": "sdl",
+            "path": str(sdl_path),
+            **sdl_stat,
+            "status": "warning" if sdl_warning else "ready",
+            "error": sdl_warning or "",
+        }
+    ]
+    slides: List[Dict[str, Any]] = []
     required = set(renaming.MAPPING_FIELDS)
     for context in batches:
-        if not (
-            context.completed_stages["QC"]
-            and context.completed_stages["Renamed"]
-        ):
-            continue
         mapping_path = context.root / "name_mapping.csv"
+        mapping_stat = _tq_source_stat(mapping_path)
+        source = {
+            "source_key": f"mapping:{context.id}",
+            "source_kind": "mapping",
+            "batch_id": context.id,
+            "path": str(mapping_path),
+            **mapping_stat,
+            "status": "ready",
+            "error": "",
+        }
+        if not mapping_path.is_file():
+            source["status"] = "error"
+            source["error"] = "file was not found"
+            if context.completed_stages["Renamed"]:
+                warnings.append(
+                    f"Skipped {context.display_name}: name_mapping.csv was not found."
+                )
+            sources.append(source)
+            continue
         try:
             fields, rows = renaming.read_csv(mapping_path)
             missing = required.difference(fields)
@@ -3149,9 +3220,12 @@ def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
                 raise renaming.RenamingError(
                     f"missing columns: {', '.join(sorted(missing))}"
                 )
-            for row in rows:
-                original_path = str(runtime_path(row["OriginalPath"].strip()))
+            batch_slides: List[Dict[str, Any]] = []
+            for source_row, row in enumerate(rows):
+                raw_original_path = row["OriginalPath"].strip()
+                original_path = str(runtime_path(raw_original_path))
                 accession = renaming.row_accession(row)
+                accession_key = renaming.accession_key(accession)
                 organ = row["Organ"].strip().upper()
                 pid = row["PID"].strip().upper()
                 destination_name = row["NewName"].strip()
@@ -3160,16 +3234,18 @@ def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
                         "contains a row missing OriginalPath, AccessionID, "
                         "Organ, PID, or NewName"
                     )
-                accession_metadata = sdl_metadata.get(renaming.accession_key(accession))
-                if not accession_metadata:
-                    continue
-                slides.append(
+                metadata = sdl_metadata.get(
+                    accession_key, {"dates": [], "types": []}
+                )
+                batch_slides.append(
                     {
                         "id": _tq_slide_id(context.id, original_path),
                         "batch_id": context.id,
-                        "batch_name": context.display_name,
-                        "batch_root": str(context.root),
+                        "source_row": source_row,
+                        "raw_original_path": raw_original_path,
+                        "original_path": original_path,
                         "accession": accession,
+                        "accession_key": accession_key,
                         "organ": organ,
                         "pid": pid,
                         "accession_date": row["AccessionDate"].strip(),
@@ -3178,21 +3254,47 @@ def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
                         "samp_acq_type": row["SampAcqType"].strip().upper(),
                         "block_number": row["BlockNumber"].strip(),
                         "section_count": row["SectionCount"].strip(),
-                        "original_path": original_path,
                         "destination_name": destination_name,
-                        "sdl_types": accession_metadata["types"],
+                        "sdl_types": metadata["types"] or ["NONE"],
                         "digitization_date": _tq_digitization_date(
                             original_path,
                             context.root,
                             accession,
-                            {renaming.accession_key(accession): accession_metadata["dates"]},
+                            {accession_key: metadata["dates"]},
                         ),
                     }
                 )
+            slides.extend(batch_slides)
         except renaming.RenamingError as exc:
-            warnings.append(
-                f"Skipped {context.display_name}: name_mapping.csv {exc}."
-            )
+            source["status"] = "error"
+            source["error"] = str(exc)
+            if context.completed_stages["Renamed"]:
+                warnings.append(
+                    f"Skipped {context.display_name}: name_mapping.csv {exc}."
+                )
+        sources.append(source)
+    batch_catalog.replace_transfer_catalog(
+        Config.INSTANCE_DIR, slides, sources, signature
+    )
+    return warnings
+
+
+def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
+    batches, warnings = discover_batches()
+    signature = _tq_catalog_signature(batches)
+    with _tq_catalog_lock:
+        stored_signature = batch_catalog.get_metadata(
+            Config.INSTANCE_DIR, "transfer_signature"
+        )
+        if stored_signature != signature:
+            warnings.extend(_tq_rebuild_catalog(batches, signature))
+    slides = batch_catalog.list_transfer_slides(Config.INSTANCE_DIR)
+    for warning in batch_catalog.list_transfer_warnings(Config.INSTANCE_DIR):
+        if warning and warning not in warnings:
+            warnings.append(warning)
+    roots = {context.id: context.root for context in batches}
+    for slide in slides:
+        slide["batch_root"] = str(roots.get(slide["batch_id"], ""))
     return slides, warnings
 
 
@@ -3313,6 +3415,7 @@ def _tq_grouped_rows(
                 "type": "accession",
                 "name": accession,
                 "batch_name": batch_name,
+                "batch_id": values[0]["batch_id"],
                 "slides": values,
                 "date": _tq_date_summary(values),
             }
@@ -3340,6 +3443,7 @@ def _tq_grouped_rows(
                         {
                             "name": accession,
                             "batch_name": batch_name,
+                            "batch_id": values[0]["batch_id"],
                             "slides": values,
                             "date": _tq_date_summary(values),
                         }
@@ -3361,11 +3465,13 @@ def _tq_grouped_rows(
             {
                 "type": "batch",
                 "name": batch_name,
+                "batch_id": batch_slides[0]["batch_id"],
                 "slides": batch_slides,
                 "date": _tq_date_summary(batch_slides),
                 "accessions": [
                     {
                         "name": accession,
+                        "batch_id": values[0]["batch_id"],
                         "slides": values,
                         "date": _tq_date_summary(values),
                     }
@@ -5238,9 +5344,6 @@ def tq_page():
             sort_order,
         )
     )
-    rows = _tq_sort_grouped_rows(
-        _tq_grouped_rows(filtered_slides, selection_type), sort_order
-    )
     owner_id = str(current_user.id)
     with _tq_state_lock:
         draft = _tq_drafts.setdefault(
@@ -5268,6 +5371,50 @@ def tq_page():
     review = requested_view == "review" or (
         requested_view is None and draft_snapshot["phase"] == "review"
     )
+    try:
+        requested_page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        requested_page = 1
+    page_size = 200
+    page_source = selected_slides if review else filtered_slides
+    group_counts: Dict[str, int] = defaultdict(int)
+    group_accessions: Dict[str, set] = defaultdict(set)
+    if not review:
+        for slide in filtered_slides:
+            batch_key = f"batch|{slide['batch_id']}"
+            accession_key = (
+                f"accession|{slide['batch_id']}|{slide['accession']}"
+            )
+            group_counts[batch_key] += 1
+            group_counts[accession_key] += 1
+            group_accessions[batch_key].add(slide["accession"])
+            for slide_type in slide["sdl_types"]:
+                type_key = f"type|{slide_type}"
+                type_accession_key = (
+                    f"type_accession|{slide_type}|{slide['batch_id']}|"
+                    f"{slide['accession']}"
+                )
+                group_counts[type_key] += 1
+                group_counts[type_accession_key] += 1
+                group_accessions[type_key].add(
+                    (slide["batch_id"], slide["accession"])
+                )
+    total_pages = max(1, (len(page_source) + page_size - 1) // page_size)
+    current_page = min(requested_page, total_pages)
+    page_start = (current_page - 1) * page_size
+    page_slides = page_source[page_start:page_start + page_size]
+    rows = _tq_sort_grouped_rows(
+        _tq_grouped_rows(page_slides, selection_type), sort_order
+    )
+    if review:
+        selected_slides = page_slides
+    page_args = request.args.to_dict(flat=True)
+    previous_url = None
+    next_url = None
+    if current_page > 1:
+        previous_url = url_for("tq_page", **{**page_args, "page": current_page - 1})
+    if current_page < total_pages:
+        next_url = url_for("tq_page", **{**page_args, "page": current_page + 1})
     job = _tq_job_for_user(session.get("tq_job_id"))
     return render_template(
         "tq.html",
@@ -5284,6 +5431,15 @@ def tq_page():
         filter_error=filter_error,
         selected_ids=draft_snapshot["selected_ids"],
         selected_slides=selected_slides,
+        selected_count=len(draft_snapshot["selected_ids"]),
+        current_page=current_page,
+        total_pages=total_pages,
+        previous_url=previous_url,
+        next_url=next_url,
+        group_counts=group_counts,
+        group_accession_counts={
+            key: len(values) for key, values in group_accessions.items()
+        },
         destination_dir=draft_snapshot["destination_dir"],
         include_copath=draft_snapshot["include_copath"],
         review=review,
@@ -5364,6 +5520,62 @@ def tq_save_draft():
         if phase in {"select", "review"}:
             draft["phase"] = phase
     return jsonify({"success": True})
+
+
+@app.route("/tq/draft/group", methods=["POST"])
+@login_required
+def tq_save_group_draft():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("checked"), bool):
+        return jsonify({"success": False, "message": "Invalid group selection."}), 400
+    kind = payload.get("kind")
+    if kind not in {"batch", "accession", "type", "type_accession"}:
+        return jsonify({"success": False, "message": "Invalid group selection."}), 400
+    view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
+    filter_field = str(view.get("filter", "None"))
+    filter_value = str(view.get("filter_value", ""))[:500].strip()
+    start_date = str(view.get("start_date", "")).strip()
+    end_date = str(view.get("end_date", "")).strip()
+    filter_error = _tq_validate_filter(
+        filter_field, filter_value, start_date, end_date
+    )
+    if filter_error:
+        return jsonify({"success": False, "message": filter_error}), 400
+    slides, _ = _tq_catalog()
+    slides = _tq_filtered_slides(
+        slides, filter_field, filter_value, start_date, end_date, "none"
+    )
+    batch_id = str(payload.get("batch_id", ""))
+    accession = str(payload.get("accession", ""))
+    slide_type = str(payload.get("slide_type", ""))
+
+    def in_group(slide: Dict[str, Any]) -> bool:
+        if kind in {"batch", "accession", "type_accession"} and slide["batch_id"] != batch_id:
+            return False
+        if kind in {"accession", "type_accession"} and slide["accession"] != accession:
+            return False
+        if kind in {"type", "type_accession"} and slide_type not in slide["sdl_types"]:
+            return False
+        return True
+
+    group_ids = {slide["id"] for slide in slides if in_group(slide)}
+    if not group_ids:
+        return jsonify({"success": False, "message": "Transfer group is unavailable."}), 404
+    with _tq_state_lock:
+        draft = _tq_drafts.setdefault(
+            str(current_user.id),
+            {
+                "selected_ids": set(), "destination_dir": "",
+                "include_copath": False, "phase": "select",
+            },
+        )
+        if payload["checked"]:
+            draft["selected_ids"].update(group_ids)
+        else:
+            draft["selected_ids"].difference_update(group_ids)
+        draft["phase"] = "select"
+        selected_ids = sorted(draft["selected_ids"])
+    return jsonify({"success": True, "selected_ids": selected_ids})
 
 
 @app.route("/tq/reset", methods=["POST"])
@@ -5939,6 +6151,13 @@ def renaming_approve(batch_id: str):
                 renaming.finalize_batch(context.root, Path(Config.COPATH_CLONE))
                 _update_sdl_after_renaming(context.root)
                 context.mark_renamed_complete()
+            try:
+                _tq_catalog()
+            except Exception:
+                app.logger.exception(
+                    "Could not refresh transfer catalog after finalizing batch %s",
+                    context.id,
+                )
             message = "All names are approved and the batch has been finalized."
             if wants_json:
                 flash(message, "success")
@@ -7127,6 +7346,11 @@ def init_db_command():
     print(f"Discovered and initialized {len(batches)} valid batch(es).")
     for warning in warnings:
         print(f"WARNING: {warning}")
+    transfer_slides, transfer_warnings = _tq_catalog()
+    print(f"Indexed {len(transfer_slides)} transferable slide(s).")
+    for warning in transfer_warnings:
+        if warning not in warnings:
+            print(f"WARNING: {warning}")
 
     print("--- Initialization complete. ---")
 

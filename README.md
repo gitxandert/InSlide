@@ -88,6 +88,13 @@ this catalog and load `enriched.csv` only after a batch is selected. A
 background reconciliation scans for externally-created batches at startup and
 every `BATCH_CATALOG_RECONCILE_SECONDS` seconds (60 by default).
 
+The same database stores a derived transfer-slide catalog populated from each
+batch's `name_mapping.csv` and the Slide Digitization Log. Transfer pages read
+this catalog for batches whose existing `renamed_complete` state is true. They
+verify source modification times before each request, rebuild changed sources,
+show slides without an SDL type under `NONE`, and paginate slide rows in groups
+of 200. CSV and SDL files remain the authoritative source data.
+
 Before the first catalog-aware deployment, stop the InSlide container and
 validate legacy state from a PowerShell prompt:
 

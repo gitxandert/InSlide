@@ -237,7 +237,7 @@ class TQTransferTests(unittest.TestCase):
         with self.assertRaises(app_module.TQError):
             app_module._tq_destination_dir("../outside", slides[0])
 
-    def test_catalog_excludes_accessions_without_nonblank_sdl_type(self):
+    def test_catalog_includes_untyped_accessions_as_none(self):
         workbook = load_workbook(self.sdl_path)
         worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
         columns = app_module._sdl_header_columns(worksheet)
@@ -248,7 +248,8 @@ class TQTransferTests(unittest.TestCase):
         slides, warnings = app_module._tq_catalog()
 
         self.assertEqual([], warnings)
-        self.assertEqual([], slides)
+        self.assertEqual(2, len(slides))
+        self.assertTrue(all(slide["sdl_types"] == ["NONE"] for slide in slides))
 
         workbook = load_workbook(self.sdl_path)
         worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
@@ -259,7 +260,12 @@ class TQTransferTests(unittest.TestCase):
         missing_slides, missing_warnings = app_module._tq_catalog()
 
         self.assertEqual([], missing_warnings)
-        self.assertEqual([], missing_slides)
+        self.assertEqual(2, len(missing_slides))
+        self.assertTrue(
+            all(slide["sdl_types"] == ["NONE"] for slide in missing_slides)
+        )
+        response = self.client.get("/tq?select=Type")
+        self.assertIn(b"Select type NONE", response.data)
 
     def test_type_selection_groups_all_nonblank_types_and_ignores_blank_rows(self):
         workbook = load_workbook(self.sdl_path)
@@ -296,6 +302,79 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b"Transfers", response.data)
         self.assertIn(b"Review Transfer", response.data)
         self.assertIn(b"AAAAAA", response.data)
+
+    def test_unchanged_catalog_is_served_without_reparsing_mapping(self):
+        self.catalog()
+
+        with mock.patch.object(
+            app_module.renaming,
+            "read_csv",
+            wraps=app_module.renaming.read_csv,
+        ) as read_csv:
+            slides, warnings = app_module._tq_catalog()
+
+        self.assertEqual([], warnings)
+        self.assertEqual(2, len(slides))
+        read_csv.assert_not_called()
+
+    def test_transfer_catalog_uses_existing_renamed_complete_state(self):
+        self.catalog()
+        batch_id = app_module.discover_batches()[0][0].id
+
+        app_module.batch_catalog.update_stages(
+            app_module.Config.INSTANCE_DIR, batch_id, renamed_complete=False
+        )
+        hidden, _ = app_module._tq_catalog()
+        app_module.batch_catalog.update_stages(
+            app_module.Config.INSTANCE_DIR, batch_id, renamed_complete=True
+        )
+        visible, _ = app_module._tq_catalog()
+
+        self.assertEqual([], hidden)
+        self.assertEqual(2, len(visible))
+
+    def test_large_transfer_page_renders_only_one_page_of_slides(self):
+        prototype = self.catalog()[0]
+        slides = []
+        for index in range(7000):
+            slide = dict(prototype)
+            slide["id"] = f"{index:024x}"
+            slide["destination_name"] = f"slide-{index:05d}.svs"
+            slide["original_path"] = f"D:/scanner/slide-{index:05d}.svs"
+            slides.append(slide)
+
+        with mock.patch.object(
+            app_module, "_tq_catalog", return_value=(slides, [])
+        ):
+            first = self.client.get("/tq?select=Slide")
+            last = self.client.get("/tq?select=Slide&page=35")
+
+        self.assertEqual(200, first.status_code)
+        self.assertEqual(200, first.data.count(b'class="slide-checkbox"'))
+        self.assertIn(b"Page 1 of 35", first.data)
+        self.assertEqual(200, last.data.count(b'class="slide-checkbox"'))
+
+    def test_group_selection_includes_slides_on_unrendered_pages(self):
+        prototype = self.catalog()[0]
+        slides = []
+        for index in range(300):
+            slide = dict(prototype)
+            slide["id"] = f"{index:024x}"
+            slides.append(slide)
+
+        payload = {
+            "kind": "batch",
+            "batch_id": prototype["batch_id"],
+            "checked": True,
+            "view": {"filter": "None"},
+        }
+        with mock.patch.object(
+            app_module, "_tq_catalog", return_value=(slides, [])
+        ):
+            response = self.client.post("/tq/draft/group", json=payload)
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(300, len(response.get_json()["selected_ids"]))
 
     def test_copath_checkbox_defaults_off_and_persists_in_draft(self):
         slides = self.catalog()
