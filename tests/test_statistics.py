@@ -143,6 +143,29 @@ class SDLStatisticsIntegrationTests(unittest.TestCase):
             1,
         )
 
+    def test_conflicting_type_is_not_saved_or_counted(self):
+        first = self.client.post("/sdl", data=self.form_data())
+        conflicting = self.form_data()
+        conflicting["type"] = "SEMINOMA"
+
+        response = self.client.post("/sdl", data=conflicting)
+
+        self.assertEqual(302, first.status_code)
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b"already has Type PROSP", response.data)
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        self.assertEqual(
+            2, workbook[app_module.Config.SDL_SHEET_NAME].max_row
+        )
+        workbook.close()
+        today = datetime.date.today().isoformat()
+        self.assertEqual(
+            1,
+            app_module.stats_store._database_rows(self.user.id)[today][
+                "accessions_logged"
+            ],
+        )
+
         workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
         worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
         signature = app_module._sdl_row_signature(worksheet, 2)

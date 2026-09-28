@@ -82,6 +82,16 @@ Copy `.env.example` to `.env`, replace all placeholders, and create the host
 directories. `INSLIDE_STATE_HOST` must contain
 `Slide_Digitization_Log.xlsx` before SDL workflows run.
 
+Audit the SDL for contrasting Types assigned to the same scanner, loaded date,
+and accession before deploying changes:
+
+```powershell
+conda run -n label_check python src/audit_sdl_type_conflicts.py --workbook "D:\path\to\Slide_Digitization_Log.xlsx"
+```
+
+The command is read-only. Exit status `0` means no conflicts, `1` means
+conflicts were found, and `2` means the workbook could not be audited.
+
 Batch workflow stages, queues, and leases are stored in
 `INSLIDE_STATE_HOST\instance\batch_catalog.sqlite3`. Batch list pages query
 this catalog and load `enriched.csv` only after a batch is selected. A

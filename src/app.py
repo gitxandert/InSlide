@@ -54,6 +54,12 @@ from batch_catalog import catalog as batch_catalog, normalize_relative_path
 from container_paths import runtime_path
 import deidentify_anonymize
 import renaming
+from sdl_type_rules import (
+    format_conflict as format_sdl_type_conflict,
+    resolve_types as resolve_sdl_types,
+    type_key as sdl_type_key,
+    type_record as sdl_type_record,
+)
 
 # Flask and its extensions for web framework, user management
 from flask import (
@@ -2506,6 +2512,32 @@ def _validate_sdl_form(values: Dict[str, str]) -> Dict[str, Any]:
     }
 
 
+def _validate_sdl_type_consistency(
+    worksheet: Worksheet,
+    values: Dict[str, Any],
+    *,
+    excluded_row: Optional[int] = None,
+) -> None:
+    """Reject contrasting Types within one scanner/date/accession scan group."""
+    candidate = sdl_type_record(values, excluded_row or worksheet.max_row + 1)
+    if candidate is None:
+        return
+    for row in _read_sdl_rows(worksheet):
+        if row["worksheet_row"] == excluded_row:
+            continue
+        existing = sdl_type_record(row["values"], row["worksheet_row"])
+        if (
+            existing is not None
+            and existing.key == candidate.key
+            and existing.slide_type.casefold() != candidate.slide_type.casefold()
+        ):
+            raise SDLValidationError(
+                f"{candidate.accession} already has Type {existing.slide_type} "
+                f"for {candidate.scanner} on {candidate.loaded_date} "
+                f"(worksheet row {existing.row_number})."
+            )
+
+
 def _strict_sdl_date(value: str) -> Optional[datetime.date]:
     """Return a calendar date only for canonical YYYY-MM-DD values."""
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
@@ -2542,16 +2574,16 @@ def _post_qc_sdl_rows(
     batch_root: Path,
     worksheet: Worksheet,
 ) -> List[Dict[str, Any]]:
-    """Build new SDL rows for accessions absent from the workbook."""
+    """Build new SDL rows for scan groups absent from the workbook."""
     _, mapping = renaming.read_csv(batch_root / "name_mapping.csv")
-    header_columns = _sdl_header_columns(worksheet)
-    accession_column = header_columns["Accession ID"]
-    existing_accessions = {
-        renaming.accession_key(
-            worksheet.cell(row=row_number, column=accession_column).value
+    existing_groups = {
+        sdl_type_key(
+            row["values"]["Accession ID"],
+            row["values"]["Scanner"],
+            row["values"]["Date Loaded"],
         )
-        for row_number in range(2, worksheet.max_row + 1)
-        if worksheet.cell(row=row_number, column=accession_column).value is not None
+        for row in _read_sdl_rows(worksheet)
+        if row["values"]["Accession ID"].strip()
     }
 
     slides_by_accession: Dict[str, List[Dict[str, str]]] = defaultdict(list)
@@ -2581,8 +2613,6 @@ def _post_qc_sdl_rows(
     scanner = _sdl_scanner_for_batch(batch_root)
     new_rows: List[Dict[str, Any]] = []
     for key, slides in slides_by_accession.items():
-        if key in existing_accessions:
-            continue
         accession = renaming.row_accession(slides[0])
         if batch_date is not None:
             date_groups: Dict[Union[datetime.date, str], List[Dict[str, str]]] = {
@@ -2601,6 +2631,9 @@ def _post_qc_sdl_rows(
 
         organ = mapping_organs.get(key) or clone_organs.get(key) or "UNKNOWN"
         for loaded_date, grouped_slides in date_groups.items():
+            group_key = sdl_type_key(accession, scanner, loaded_date)
+            if group_key in existing_groups:
+                continue
             row = {header: None for header in SDL_HEADERS}
             row.update(
                 {
@@ -2617,6 +2650,7 @@ def _post_qc_sdl_rows(
                 }
             )
             new_rows.append(row)
+            existing_groups.add(group_key)
     return new_rows
 
 
@@ -3081,34 +3115,44 @@ def _tq_slide_id(batch_id: str, original_path: str) -> str:
     return hashlib.sha256(value).hexdigest()[:24]
 
 
-def _tq_sdl_accession_metadata(
-) -> Tuple[Dict[str, Dict[str, List[str]]], Optional[str]]:
+def _tq_sdl_accession_metadata() -> Tuple[Dict[str, Any], Optional[str]]:
     workbook = None
     try:
         with _sdl_workbook_lock:
             workbook, worksheet, _ = _load_sdl_workbook()
             dates: Dict[str, set] = defaultdict(set)
-            types: Dict[str, set] = defaultdict(set)
+            records = []
             for row in _read_sdl_rows(worksheet):
                 accession = renaming.accession_key(row["values"]["Accession ID"])
                 loaded = row["values"]["Date Loaded"].strip()
-                slide_type = row["values"]["Type"].strip()
-                if slide_type.casefold() == "none":
-                    slide_type = "NONE"
                 if accession and _strict_sdl_date(loaded):
                     dates[accession].add(loaded)
-                if accession and slide_type:
-                    types[accession].add(slide_type)
-            accessions = set(dates) | set(types)
+                record = sdl_type_record(row["values"], row["worksheet_row"])
+                if record is not None:
+                    records.append(record)
+            types, conflicts = resolve_sdl_types(records)
+            warning = None
+            if conflicts:
+                warning = (
+                    "Slide Digitization Log has contrasting Types; using the "
+                    "first Type for each affected scan group: "
+                    + "; ".join(
+                        format_sdl_type_conflict(conflict)
+                        for conflict in conflicts
+                    )
+                )
             return {
-                accession: {
-                    "dates": sorted(dates.get(accession, set())),
-                    "types": sorted(types.get(accession, set()), key=str.casefold),
-                }
-                for accession in accessions
-            }, None
+                "dates": {
+                    accession: sorted(values)
+                    for accession, values in dates.items()
+                },
+                "types": types,
+            }, warning
     except (SDLWorkbookError, OSError) as exc:
-        return {}, f"Slide Digitization Log transfer metadata is unavailable: {exc}"
+        return {
+            "dates": {},
+            "types": {},
+        }, f"Slide Digitization Log transfer metadata is unavailable: {exc}"
     finally:
         if workbook is not None:
             workbook.close()
@@ -3225,8 +3269,16 @@ def _tq_rebuild_catalog(
                         "contains a row missing OriginalPath, AccessionID, "
                         "Organ, PID, or NewName"
                     )
-                metadata = sdl_metadata.get(
-                    accession_key, {"dates": [], "types": []}
+                digitization_date = _tq_digitization_date(
+                    original_path,
+                    context.root,
+                    accession,
+                    sdl_metadata["dates"],
+                )
+                scanner = _sdl_scanner_for_batch(context.root)
+                slide_type = sdl_metadata["types"].get(
+                    sdl_type_key(accession, scanner, digitization_date),
+                    "NONE",
                 )
                 batch_slides.append(
                     {
@@ -3246,13 +3298,8 @@ def _tq_rebuild_catalog(
                         "block_number": row["BlockNumber"].strip(),
                         "section_count": row["SectionCount"].strip(),
                         "destination_name": destination_name,
-                        "sdl_types": metadata["types"] or ["NONE"],
-                        "digitization_date": _tq_digitization_date(
-                            original_path,
-                            context.root,
-                            accession,
-                            {accession_key: metadata["dates"]},
-                        ),
+                        "sdl_types": [slide_type],
+                        "digitization_date": digitization_date,
                     }
                 )
             slides.extend(batch_slides)
@@ -6226,6 +6273,12 @@ def sdl():
                 row_number = worksheet.max_row + 1
             else:
                 raise SDLValidationError("Invalid SDL action.")
+
+            _validate_sdl_type_consistency(
+                worksheet,
+                normalized_values,
+                excluded_row=row_number if action == "update" else None,
+            )
 
             for header in SDL_HEADERS:
                 column = header_columns[header]

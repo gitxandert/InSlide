@@ -115,6 +115,7 @@ class TQTransferTests(unittest.TestCase):
         row = [None] * len(app_module.SDL_HEADERS)
         row[app_module.SDL_HEADERS.index("Accession ID")] = "NP25-100"
         row[app_module.SDL_HEADERS.index("Type")] = "PROSP"
+        row[app_module.SDL_HEADERS.index("Scanner")] = "RSCH1 (SS12797)"
         row[app_module.SDL_HEADERS.index("Date Loaded")] = app_module.datetime.date(
             2026, 7, 20
         )
@@ -269,25 +270,83 @@ class TQTransferTests(unittest.TestCase):
             )
         )
 
-    def test_catalog_endpoint_returns_all_nonblank_types_and_ignores_blank_rows(self):
+    def test_catalog_uses_first_type_and_warns_about_legacy_conflict(self):
         workbook = load_workbook(self.sdl_path)
         worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
         for slide_type in ("SEMINOMA", None):
             row = [None] * len(app_module.SDL_HEADERS)
             row[app_module.SDL_HEADERS.index("Accession ID")] = "NP25-100"
             row[app_module.SDL_HEADERS.index("Type")] = slide_type
+            row[app_module.SDL_HEADERS.index("Scanner")] = "RSCH1 (SS12797)"
+            row[app_module.SDL_HEADERS.index("Date Loaded")] = "2026-07-20"
             worksheet.append(row)
         workbook.save(self.sdl_path)
         workbook.close()
 
-        slides = self.catalog()
+        slides, warnings = app_module._tq_catalog()
         response = self.client.get("/tq/catalog")
 
-        self.assertEqual(["PROSP", "SEMINOMA"], slides[0]["sdl_types"])
+        self.assertEqual(["PROSP"], slides[0]["sdl_types"])
+        self.assertIn("contrasting Types", warnings[0])
+        self.assertIn("row 2 (PROSP)", warnings[0])
+        self.assertIn("row 3 (SEMINOMA)", warnings[0])
         self.assertEqual(200, response.status_code)
         self.assertEqual(
-            ["PROSP", "SEMINOMA"], response.get_json()["slides"][0]["sdl_types"]
+            ["PROSP"], response.get_json()["slides"][0]["sdl_types"]
         )
+
+    def test_types_are_isolated_by_scanner_date_batch(self):
+        other_batch = self.batch.parent / "2026-07-21"
+        (other_batch / "label").mkdir(parents=True)
+        (other_batch / "macro").mkdir()
+        write_csv(
+            other_batch / "enriched.csv",
+            ["AccessionID", "Stain", "BlockNumber", "ParsingQCPassed", "original_slide_path"],
+            [{
+                "AccessionID": "NP25-100", "Stain": "HE", "BlockNumber": "B4",
+                "ParsingQCPassed": "TRUE", "original_slide_path": "three.svs",
+            }],
+        )
+        write_csv(
+            other_batch / "completed_stages.csv",
+            ["QC", "Renamed"],
+            [{"QC": "True", "Renamed": "True"}],
+        )
+        renaming.atomic_write(
+            other_batch / "name_mapping.csv",
+            renaming.MAPPING_FIELDS,
+            [mapping_row(r"D:\scanner\misc\three.svs", "AAAAAA", "003")],
+        )
+        workbook = load_workbook(self.sdl_path)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        row = [None] * len(app_module.SDL_HEADERS)
+        row[app_module.SDL_HEADERS.index("Accession ID")] = "NP25-100"
+        row[app_module.SDL_HEADERS.index("Type")] = "SEMINOMA"
+        row[app_module.SDL_HEADERS.index("Scanner")] = "RSCH1 (SS12797)"
+        row[app_module.SDL_HEADERS.index("Date Loaded")] = "2026-07-21"
+        worksheet.append(row)
+        workbook.save(self.sdl_path)
+        workbook.close()
+        app_module.batch_contexts.clear()
+        app_module.reconcile_batch_catalog()
+        batches, _ = app_module.discover_batches()
+        for batch in batches:
+            app_module.batch_catalog.update_stages(
+                app_module.Config.INSTANCE_DIR,
+                batch.id,
+                qc_complete=True,
+                renamed_complete=True,
+            )
+
+        slides, warnings = app_module._tq_catalog()
+
+        self.assertEqual([], warnings)
+        by_date = {
+            date: {slide["sdl_types"][0] for slide in slides if slide["digitization_date"] == date}
+            for date in ("2026-07-20", "2026-07-21")
+        }
+        self.assertEqual({"PROSP"}, by_date["2026-07-20"])
+        self.assertEqual({"SEMINOMA"}, by_date["2026-07-21"])
 
     def test_page_contains_client_filters_and_transfer_navigation(self):
         self.catalog()

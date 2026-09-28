@@ -147,6 +147,8 @@ class SDLPostQCTests(unittest.TestCase):
         worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
         columns = app_module._sdl_header_columns(worksheet)
         worksheet.cell(row=2, column=columns["Accession ID"]).value = " np25-100 "
+        worksheet.cell(row=2, column=columns["Scanner"]).value = "RSCH1 (SS12797)"
+        worksheet.cell(row=2, column=columns["Date Loaded"]).value = app_module.SDL_UNKNOWN_DATE
         workbook.save(self.workbook_path)
         workbook.close()
         renaming.atomic_write(
@@ -160,6 +162,50 @@ class SDLPostQCTests(unittest.TestCase):
         workbook = load_workbook(self.workbook_path)
         self.assertEqual(
             2, workbook[app_module.Config.SDL_SHEET_NAME].max_row
+        )
+        workbook.close()
+
+    def test_existing_accession_on_another_date_gets_new_row(self):
+        make_workbook(self.workbook_path, app_module.SDL_HEADERS)
+        workbook = load_workbook(self.workbook_path)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        columns = app_module._sdl_header_columns(worksheet)
+        worksheet.cell(row=2, column=columns["Accession ID"]).value = "NP25-100"
+        worksheet.cell(row=2, column=columns["Scanner"]).value = "RSCH1 (SS12797)"
+        worksheet.cell(row=2, column=columns["Date Loaded"]).value = "2026-07-19"
+        workbook.save(self.workbook_path)
+        workbook.close()
+        renaming.atomic_write(
+            self.batch / "name_mapping.csv",
+            renaming.MAPPING_FIELDS,
+            [mapping_row("NP25-100", "BRAIN", "/scanner/2026-07-20/one.svs", "000")],
+        )
+
+        self.assertEqual(1, app_module._update_sdl_after_renaming(self.batch))
+
+    def test_type_consistency_rejects_only_contrasting_same_scan_group(self):
+        make_workbook(self.workbook_path, app_module.SDL_HEADERS)
+        workbook = load_workbook(self.workbook_path)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        columns = app_module._sdl_header_columns(worksheet)
+        existing = {
+            "Accession ID": "NP25-100",
+            "Type": "PROSP",
+            "Scanner": "RSCH1 (SS12797)",
+            "Date Loaded": "2026-07-20",
+        }
+        for header, value in existing.items():
+            worksheet.cell(row=2, column=columns[header]).value = value
+        contrasting = dict(existing, Type="SEMINOMA")
+
+        with self.assertRaisesRegex(app_module.SDLValidationError, "already has Type PROSP"):
+            app_module._validate_sdl_type_consistency(worksheet, contrasting)
+        app_module._validate_sdl_type_consistency(worksheet, existing)
+        app_module._validate_sdl_type_consistency(
+            worksheet, dict(contrasting, **{"Date Loaded": "2026-07-21"})
+        )
+        app_module._validate_sdl_type_consistency(
+            worksheet, contrasting, excluded_row=2
         )
         workbook.close()
 
