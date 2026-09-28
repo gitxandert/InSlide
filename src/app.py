@@ -1798,8 +1798,16 @@ def _catalog_reconciler() -> None:
             app.logger.exception("Background batch catalog reconciliation failed")
 
 
+def _start_catalog_reconciler() -> None:
+    """Start periodic reconciliation; caller must hold _catalog_reconcile_lock."""
+    global _catalog_reconciler_started
+    if not app.config.get("TESTING") and not _catalog_reconciler_started:
+        threading.Thread(target=_catalog_reconciler, daemon=True).start()
+        _catalog_reconciler_started = True
+
+
 def _ensure_catalog_reconciled() -> List[str]:
-    global _catalog_reconciled_target, _catalog_reconciler_started
+    global _catalog_reconciled_target
     target = (str(Path(Config.INSTANCE_DIR)), str(Path(Config.INSLIDE_BATCHES)))
     warnings: List[str] = []
     with _catalog_reconcile_lock:
@@ -1816,9 +1824,7 @@ def _ensure_catalog_reconciled() -> List[str]:
                         Config.INSTANCE_DIR, _catalog_reconcile_owner
                     )
             _catalog_reconciled_target = target
-    if not app.config.get("TESTING") and not _catalog_reconciler_started:
-        threading.Thread(target=_catalog_reconciler, daemon=True).start()
-        _catalog_reconciler_started = True
+        _start_catalog_reconciler()
     return warnings
 
 
@@ -2920,21 +2926,6 @@ TQ_LOG_FIELDS = (
     "status",
 )
 TQ_METADATA_FIELDS = ("accession_id", "pid", "num_slides")
-TQ_FILTER_FIELDS = (
-    "None",
-    "Organ",
-    "PID",
-    "AccessionDate",
-    "Stain",
-    "ImageType",
-    "SampAcqType",
-    "BlockNumber",
-    "SectionCount",
-    "OriginalPath",
-    "NewName",
-)
-_tq_pid_pattern = re.compile(r"^[A-Z]{6}$")
-_tq_section_pattern = re.compile(r"^[0-9]{3}$")
 _tq_state_lock = threading.Lock()
 _tq_config_lock = threading.Lock()
 _tq_catalog_lock = threading.Lock()
@@ -3296,258 +3287,6 @@ def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
     for slide in slides:
         slide["batch_root"] = str(roots.get(slide["batch_id"], ""))
     return slides, warnings
-
-
-def _tq_validate_filter(
-    field: str,
-    value: str,
-    start: str,
-    end: str,
-) -> Optional[str]:
-    if field not in TQ_FILTER_FIELDS:
-        return "Choose a valid filter field."
-    if field == "PID" and value and not _tq_pid_pattern.fullmatch(value.upper()):
-        return "PID must contain exactly six uppercase letters."
-    if field == "SectionCount" and value and not _tq_section_pattern.fullmatch(value):
-        return "Section Count must contain exactly three digits."
-    if field == "AccessionDate":
-        parsed = []
-        for label, candidate in (("Start", start), ("End", end)):
-            if not candidate:
-                parsed.append(None)
-                continue
-            try:
-                parsed.append(datetime.date.fromisoformat(candidate))
-            except ValueError:
-                return f"{label} date must use YYYY-MM-DD."
-        if parsed[0] and parsed[1] and parsed[1] < parsed[0]:
-            return "End date cannot precede Start date."
-    return None
-
-
-def _tq_filtered_slides(
-    slides: List[Dict[str, str]],
-    field: str,
-    value: str,
-    start: str,
-    end: str,
-    sort_order: str,
-) -> List[Dict[str, str]]:
-    attribute = {
-        "Organ": "organ",
-        "PID": "pid",
-        "AccessionDate": "accession_date",
-        "Stain": "stain",
-        "ImageType": "image_type",
-        "SampAcqType": "samp_acq_type",
-        "BlockNumber": "block_number",
-        "SectionCount": "section_count",
-        "OriginalPath": "original_path",
-        "NewName": "destination_name",
-    }.get(field)
-    matched = []
-    for slide in slides:
-        candidate = slide.get(attribute, "") if attribute else ""
-        include = True
-        if field == "AccessionDate":
-            try:
-                candidate_date = datetime.datetime.strptime(
-                    candidate, "%Y%m%d"
-                ).date()
-            except ValueError:
-                include = False
-            else:
-                start_date = datetime.date.fromisoformat(start) if start else None
-                end_date = datetime.date.fromisoformat(end) if end else None
-                include = not (
-                    (start_date and candidate_date < start_date)
-                    or (end_date and candidate_date > end_date)
-                )
-        elif field in {"Organ", "PID", "ImageType", "SampAcqType", "SectionCount"}:
-            include = not value or candidate.casefold() == value.casefold()
-        elif attribute:
-            include = not value or value.casefold() in candidate.casefold()
-        if include:
-            matched.append(slide)
-
-    if sort_order in {"az", "za"}:
-        matched.sort(
-            key=lambda item: (
-                item["destination_name"].casefold(),
-                item["original_path"].casefold(),
-            ),
-            reverse=sort_order == "za",
-        )
-    elif sort_order in {"date", "date_reverse"}:
-        dated = [item for item in matched if item["digitization_date"]]
-        undated = [item for item in matched if not item["digitization_date"]]
-        dated.sort(
-            key=lambda item: (
-                item["digitization_date"],
-                item["destination_name"].casefold(),
-            ),
-            reverse=sort_order == "date_reverse",
-        )
-        matched = dated + undated
-    return matched
-
-
-def _tq_date_summary(slides: List[Dict[str, str]]) -> str:
-    values = sorted(
-        {slide["digitization_date"] for slide in slides if slide["digitization_date"]}
-    )
-    if not values:
-        return "Unknown"
-    return values[0] if len(values) == 1 else f"{values[0]} – {values[-1]}"
-
-
-def _tq_grouped_rows(
-    slides: List[Dict[str, str]], selection_type: str
-) -> List[Dict[str, Any]]:
-    if selection_type == "Slide":
-        return [{"type": "slide", "slide": slide} for slide in slides]
-    if selection_type == "Accession":
-        grouped: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
-        for slide in slides:
-            grouped[(slide["batch_name"], slide["accession"])].append(slide)
-        return [
-            {
-                "type": "accession",
-                "name": accession,
-                "batch_name": batch_name,
-                "batch_id": values[0]["batch_id"],
-                "slides": values,
-                "date": _tq_date_summary(values),
-            }
-            for (batch_name, accession), values in grouped.items()
-        ]
-    if selection_type == "Type":
-        grouped_types: Dict[str, List[Dict[str, str]]] = defaultdict(list)
-        for slide in slides:
-            for slide_type in slide["sdl_types"]:
-                grouped_types[slide_type].append(slide)
-        rows = []
-        for slide_type, type_slides in grouped_types.items():
-            accessions: Dict[
-                Tuple[str, str], List[Dict[str, str]]
-            ] = defaultdict(list)
-            for slide in type_slides:
-                accessions[(slide["batch_name"], slide["accession"])].append(slide)
-            rows.append(
-                {
-                    "type": "sdl_type",
-                    "name": slide_type,
-                    "slides": type_slides,
-                    "date": _tq_date_summary(type_slides),
-                    "accessions": [
-                        {
-                            "name": accession,
-                            "batch_name": batch_name,
-                            "batch_id": values[0]["batch_id"],
-                            "slides": values,
-                            "date": _tq_date_summary(values),
-                        }
-                        for (batch_name, accession), values in accessions.items()
-                    ],
-                }
-            )
-        return rows
-
-    batch_groups: Dict[str, List[Dict[str, str]]] = defaultdict(list)
-    for slide in slides:
-        batch_groups[slide["batch_name"]].append(slide)
-    rows = []
-    for batch_name, batch_slides in batch_groups.items():
-        accessions: Dict[str, List[Dict[str, str]]] = defaultdict(list)
-        for slide in batch_slides:
-            accessions[slide["accession"]].append(slide)
-        rows.append(
-            {
-                "type": "batch",
-                "name": batch_name,
-                "batch_id": batch_slides[0]["batch_id"],
-                "slides": batch_slides,
-                "date": _tq_date_summary(batch_slides),
-                "accessions": [
-                    {
-                        "name": accession,
-                        "batch_id": values[0]["batch_id"],
-                        "slides": values,
-                        "date": _tq_date_summary(values),
-                    }
-                    for accession, values in accessions.items()
-                ],
-            }
-        )
-    return rows
-
-
-def _tq_sort_grouped_rows(
-    rows: List[Dict[str, Any]], sort_order: str
-) -> List[Dict[str, Any]]:
-    if sort_order not in {"az", "za", "date", "date_reverse"}:
-        return rows
-    if sort_order in {"az", "za"}:
-        rows.sort(
-            key=lambda row: (
-                (
-                    row["slide"]["destination_name"]
-                    if row["type"] == "slide"
-                    else row["name"]
-                ).casefold()
-            ),
-            reverse=sort_order == "za",
-        )
-        for row in rows:
-            if "accessions" in row:
-                row["accessions"].sort(
-                    key=lambda accession: accession["name"].casefold(),
-                    reverse=sort_order == "za",
-                )
-        return rows
-    dated = []
-    undated = []
-    for row in rows:
-        date_value = (
-            row["slide"]["digitization_date"]
-            if row["type"] == "slide"
-            else next(
-                (
-                    slide["digitization_date"]
-                    for slide in row["slides"]
-                    if slide["digitization_date"]
-                ),
-                "",
-            )
-        )
-        (dated if date_value else undated).append((date_value, row))
-        if "accessions" in row:
-            nested_dated = []
-            nested_undated = []
-            for accession in row["accessions"]:
-                accession_date = next(
-                    (
-                        slide["digitization_date"]
-                        for slide in accession["slides"]
-                        if slide["digitization_date"]
-                    ),
-                    "",
-                )
-                (nested_dated if accession_date else nested_undated).append(
-                    (accession_date, accession)
-                )
-            nested_dated.sort(
-                key=lambda item: item[0],
-                reverse=sort_order == "date_reverse",
-            )
-            row["accessions"] = [
-                accession for _, accession in nested_dated
-            ] + [accession for _, accession in nested_undated]
-    dated.sort(
-        key=lambda item: item[0],
-        reverse=sort_order == "date_reverse",
-    )
-    return [row for _, row in dated] + [row for _, row in undated]
 
 
 def _tq_safe_prefix(value: str) -> str:
@@ -5318,32 +5057,19 @@ def admin_download_lifetime_statistics():
 @app.route("/tq", methods=["GET"])
 @login_required
 def tq_page():
-    all_slides, discovery_warnings = _tq_catalog()
-    selection_type = request.args.get("select", "Batch")
-    if selection_type not in {"Batch", "Accession", "Slide", "Type"}:
-        selection_type = "Batch"
-    filter_field = request.args.get("filter", "None")
-    filter_value = request.args.get("filter_value", "").strip()
-    start_date = request.args.get("start_date", "").strip()
-    end_date = request.args.get("end_date", "").strip()
-    sort_order = request.args.get("sort", "none")
-    if sort_order not in {"none", "az", "za", "date", "date_reverse"}:
-        sort_order = "none"
-    filter_error = _tq_validate_filter(
-        filter_field, filter_value, start_date, end_date
+    # Keep this response a small page shell. Existing catalog data is usable
+    # immediately while periodic reconciliation handles source changes.
+    with _catalog_reconcile_lock:
+        _start_catalog_reconciler()
+    discovery_warnings: List[str] = []
+    raw_warnings = batch_catalog.get_metadata(
+        Config.INSTANCE_DIR, "last_reconcile_warnings"
     )
-    filtered_slides = (
-        []
-        if filter_error
-        else _tq_filtered_slides(
-            all_slides,
-            filter_field,
-            filter_value,
-            start_date,
-            end_date,
-            sort_order,
-        )
-    )
+    if raw_warnings:
+        try:
+            discovery_warnings = list(json.loads(raw_warnings))
+        except (TypeError, ValueError):
+            pass
     owner_id = str(current_user.id)
     with _tq_state_lock:
         draft = _tq_drafts.setdefault(
@@ -5361,99 +5087,46 @@ def tq_page():
             "include_copath": bool(draft.get("include_copath", False)),
             "phase": draft["phase"],
         }
-    catalog_by_id = {slide["id"]: slide for slide in all_slides}
-    selected_slides = [
-        catalog_by_id[slide_id]
-        for slide_id in draft_snapshot["selected_ids"]
-        if slide_id in catalog_by_id
-    ]
     requested_view = request.args.get("view")
     review = requested_view == "review" or (
         requested_view is None and draft_snapshot["phase"] == "review"
     )
-    try:
-        requested_page = max(1, int(request.args.get("page", "1")))
-    except ValueError:
-        requested_page = 1
-    page_size = 200
-    page_source = selected_slides if review else filtered_slides
-    group_counts: Dict[str, int] = defaultdict(int)
-    group_accessions: Dict[str, set] = defaultdict(set)
-    if not review:
-        for slide in filtered_slides:
-            batch_key = f"batch|{slide['batch_id']}"
-            accession_key = (
-                f"accession|{slide['batch_id']}|{slide['accession']}"
-            )
-            group_counts[batch_key] += 1
-            group_counts[accession_key] += 1
-            group_accessions[batch_key].add(slide["accession"])
-            for slide_type in slide["sdl_types"]:
-                type_key = f"type|{slide_type}"
-                type_accession_key = (
-                    f"type_accession|{slide_type}|{slide['batch_id']}|"
-                    f"{slide['accession']}"
-                )
-                group_counts[type_key] += 1
-                group_counts[type_accession_key] += 1
-                group_accessions[type_key].add(
-                    (slide["batch_id"], slide["accession"])
-                )
-    total_pages = max(1, (len(page_source) + page_size - 1) // page_size)
-    current_page = min(requested_page, total_pages)
-    page_start = (current_page - 1) * page_size
-    page_slides = page_source[page_start:page_start + page_size]
-    rows = _tq_sort_grouped_rows(
-        _tq_grouped_rows(page_slides, selection_type), sort_order
-    )
-    if review:
-        selected_slides = page_slides
-    page_args = request.args.to_dict(flat=True)
-    previous_url = None
-    next_url = None
-    if current_page > 1:
-        previous_url = url_for("tq_page", **{**page_args, "page": current_page - 1})
-    if current_page < total_pages:
-        next_url = url_for("tq_page", **{**page_args, "page": current_page + 1})
     job = _tq_job_for_user(session.get("tq_job_id"))
     return render_template(
         "tq.html",
-        rows=rows,
-        all_slides=all_slides,
-        filtered_count=len(filtered_slides),
-        selection_type=selection_type,
-        filter_fields=TQ_FILTER_FIELDS,
-        filter_field=filter_field,
-        filter_value=filter_value,
-        start_date=start_date,
-        end_date=end_date,
-        sort_order=sort_order,
-        filter_error=filter_error,
         selected_ids=draft_snapshot["selected_ids"],
-        selected_slides=selected_slides,
         selected_count=len(draft_snapshot["selected_ids"]),
-        current_page=current_page,
-        total_pages=total_pages,
-        previous_url=previous_url,
-        next_url=next_url,
-        group_counts=group_counts,
-        group_accession_counts={
-            key: len(values) for key, values in group_accessions.items()
-        },
         destination_dir=draft_snapshot["destination_dir"],
         include_copath=draft_snapshot["include_copath"],
         review=review,
         job=job,
         discovery_warnings=discovery_warnings,
         messages=flash_messages(),
-        organ_options=renaming.ORGANS,
     )
+
+
+@app.route("/tq/catalog", methods=["GET"])
+@login_required
+def tq_catalog_data():
+    """Return one complete client-side record for every transferable slide."""
+    if batch_catalog.get_metadata(Config.INSTANCE_DIR, "transfer_signature") is None:
+        slides, warnings = _tq_catalog()
+    else:
+        slides = batch_catalog.list_transfer_slides(Config.INSTANCE_DIR)
+        warnings = batch_catalog.list_transfer_warnings(Config.INSTANCE_DIR)
+    response = jsonify({"slides": slides, "warnings": warnings})
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/tq/review", methods=["POST"])
 @login_required
 def tq_review():
     requested_ids = set(request.form.getlist("slide_id"))
+    if not requested_ids:
+        with _tq_state_lock:
+            draft = _tq_drafts.get(str(current_user.id))
+            requested_ids = set(draft["selected_ids"]) if draft else set()
     all_slides, _ = _tq_catalog()
     valid_ids = {slide["id"] for slide in all_slides}
     selected_ids = requested_ids.intersection(valid_ids)
@@ -5520,62 +5193,6 @@ def tq_save_draft():
         if phase in {"select", "review"}:
             draft["phase"] = phase
     return jsonify({"success": True})
-
-
-@app.route("/tq/draft/group", methods=["POST"])
-@login_required
-def tq_save_group_draft():
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict) or not isinstance(payload.get("checked"), bool):
-        return jsonify({"success": False, "message": "Invalid group selection."}), 400
-    kind = payload.get("kind")
-    if kind not in {"batch", "accession", "type", "type_accession"}:
-        return jsonify({"success": False, "message": "Invalid group selection."}), 400
-    view = payload.get("view") if isinstance(payload.get("view"), dict) else {}
-    filter_field = str(view.get("filter", "None"))
-    filter_value = str(view.get("filter_value", ""))[:500].strip()
-    start_date = str(view.get("start_date", "")).strip()
-    end_date = str(view.get("end_date", "")).strip()
-    filter_error = _tq_validate_filter(
-        filter_field, filter_value, start_date, end_date
-    )
-    if filter_error:
-        return jsonify({"success": False, "message": filter_error}), 400
-    slides, _ = _tq_catalog()
-    slides = _tq_filtered_slides(
-        slides, filter_field, filter_value, start_date, end_date, "none"
-    )
-    batch_id = str(payload.get("batch_id", ""))
-    accession = str(payload.get("accession", ""))
-    slide_type = str(payload.get("slide_type", ""))
-
-    def in_group(slide: Dict[str, Any]) -> bool:
-        if kind in {"batch", "accession", "type_accession"} and slide["batch_id"] != batch_id:
-            return False
-        if kind in {"accession", "type_accession"} and slide["accession"] != accession:
-            return False
-        if kind in {"type", "type_accession"} and slide_type not in slide["sdl_types"]:
-            return False
-        return True
-
-    group_ids = {slide["id"] for slide in slides if in_group(slide)}
-    if not group_ids:
-        return jsonify({"success": False, "message": "Transfer group is unavailable."}), 404
-    with _tq_state_lock:
-        draft = _tq_drafts.setdefault(
-            str(current_user.id),
-            {
-                "selected_ids": set(), "destination_dir": "",
-                "include_copath": False, "phase": "select",
-            },
-        )
-        if payload["checked"]:
-            draft["selected_ids"].update(group_ids)
-        else:
-            draft["selected_ids"].difference_update(group_ids)
-        draft["phase"] = "select"
-        selected_ids = sorted(draft["selected_ids"])
-    return jsonify({"success": True, "selected_ids": selected_ids})
 
 
 @app.route("/tq/reset", methods=["POST"])

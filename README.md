@@ -89,11 +89,11 @@ background reconciliation scans for externally-created batches at startup and
 every `BATCH_CATALOG_RECONCILE_SECONDS` seconds (60 by default).
 
 The same database stores a derived transfer-slide catalog populated from each
-batch's `name_mapping.csv` and the Slide Digitization Log. Transfer pages read
-this catalog for batches whose existing `renamed_complete` state is true. They
-verify source modification times before each request, rebuild changed sources,
-show slides without an SDL type under `NONE`, and paginate slide rows in groups
-of 200. CSV and SDL files remain the authoritative source data.
+batch's `name_mapping.csv` and the Slide Digitization Log. Transfer pages load
+every catalog row for batches whose existing `renamed_complete` state is true,
+then filter, sort, select, and virtually render those rows in the browser.
+Background reconciliation rebuilds changed sources; slides without an SDL type
+appear under `NONE`. CSV and SDL files remain the authoritative source data.
 
 Before the first catalog-aware deployment, stop the InSlide container and
 validate legacy state from a PowerShell prompt:

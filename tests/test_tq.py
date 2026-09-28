@@ -219,17 +219,13 @@ class TQTransferTests(unittest.TestCase):
         )
         return row
 
-    def test_catalog_filters_dates_and_builds_destination(self):
+    def test_catalog_builds_complete_transfer_rows_and_destination(self):
         slides = self.catalog()
 
         self.assertEqual("2026-07-20", slides[0]["digitization_date"])
         self.assertEqual(["PROSP"], slides[0]["sdl_types"])
-        self.assertEqual(
-            [slides[0]],
-            app_module._tq_filtered_slides(
-                slides, "SectionCount", "001", "", "", "none"
-            ),
-        )
+        self.assertEqual("HE", slides[0]["stain"])
+        self.assertEqual("001", slides[0]["section_count"])
         self.assertEqual(
             "destination/BRAIN/AAAAAA",
             app_module._tq_destination_dir("destination", slides[0]),
@@ -264,10 +260,16 @@ class TQTransferTests(unittest.TestCase):
         self.assertTrue(
             all(slide["sdl_types"] == ["NONE"] for slide in missing_slides)
         )
-        response = self.client.get("/tq?select=Type")
-        self.assertIn(b"Select type NONE", response.data)
+        response = self.client.get("/tq/catalog")
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(
+            all(
+                slide["sdl_types"] == ["NONE"]
+                for slide in response.get_json()["slides"]
+            )
+        )
 
-    def test_type_selection_groups_all_nonblank_types_and_ignores_blank_rows(self):
+    def test_catalog_endpoint_returns_all_nonblank_types_and_ignores_blank_rows(self):
         workbook = load_workbook(self.sdl_path)
         worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
         for slide_type in ("SEMINOMA", None):
@@ -279,29 +281,26 @@ class TQTransferTests(unittest.TestCase):
         workbook.close()
 
         slides = self.catalog()
-        groups = app_module._tq_grouped_rows(slides, "Type")
-        response = self.client.get("/tq?select=Type")
+        response = self.client.get("/tq/catalog")
 
         self.assertEqual(["PROSP", "SEMINOMA"], slides[0]["sdl_types"])
-        self.assertEqual({"PROSP", "SEMINOMA"}, {row["name"] for row in groups})
-        self.assertTrue(all(len(row["slides"]) == 2 for row in groups))
         self.assertEqual(200, response.status_code)
-        self.assertIn(b"Available types", response.data)
-        self.assertIn(b"Select type PROSP", response.data)
-        self.assertIn(b"Select type SEMINOMA", response.data)
         self.assertEqual(
-            2,
-            response.data.count(f'value="{slides[0]["id"]}"'.encode()),
+            ["PROSP", "SEMINOMA"], response.get_json()["slides"][0]["sdl_types"]
         )
-        self.assertIn(b"function setSlideChecked(slideId, checked)", response.data)
 
-    def test_page_filters_pid_and_contains_transfer_navigation(self):
-        response = self.client.get("/tq?filter=PID&filter_value=AAAAAA")
+    def test_page_contains_client_filters_and_transfer_navigation(self):
+        self.catalog()
+        response = self.client.get("/tq")
+        catalog = self.client.get("/tq/catalog")
 
         self.assertEqual(200, response.status_code)
         self.assertIn(b"Transfers", response.data)
         self.assertIn(b"Review Transfer", response.data)
-        self.assertIn(b"AAAAAA", response.data)
+        self.assertIn(b'data-exact="sdl_types"', response.data)
+        self.assertIn(b'data-text="stain"', response.data)
+        self.assertEqual("no-store", catalog.headers["Cache-Control"])
+        self.assertEqual("AAAAAA", catalog.get_json()["slides"][0]["pid"])
 
     def test_unchanged_catalog_is_served_without_reparsing_mapping(self):
         self.catalog()
@@ -333,7 +332,7 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual([], hidden)
         self.assertEqual(2, len(visible))
 
-    def test_large_transfer_page_renders_only_one_page_of_slides(self):
+    def test_large_transfer_catalog_loads_all_rows_into_virtual_table(self):
         prototype = self.catalog()[0]
         slides = []
         for index in range(7000):
@@ -344,17 +343,18 @@ class TQTransferTests(unittest.TestCase):
             slides.append(slide)
 
         with mock.patch.object(
-            app_module, "_tq_catalog", return_value=(slides, [])
+            app_module.batch_catalog, "list_transfer_slides", return_value=slides
         ):
-            first = self.client.get("/tq?select=Slide")
-            last = self.client.get("/tq?select=Slide&page=35")
+            page = self.client.get("/tq")
+            catalog = self.client.get("/tq/catalog")
 
-        self.assertEqual(200, first.status_code)
-        self.assertEqual(200, first.data.count(b'class="slide-checkbox"'))
-        self.assertIn(b"Page 1 of 35", first.data)
-        self.assertEqual(200, last.data.count(b'class="slide-checkbox"'))
+        self.assertEqual(200, page.status_code)
+        self.assertEqual(7000, len(catalog.get_json()["slides"]))
+        self.assertNotIn(b'class="slide-checkbox"', page.data)
+        self.assertIn(b"const overscan = 8", page.data)
+        self.assertIn(b"filteredSlides.length * rowHeight", page.data)
 
-    def test_group_selection_includes_slides_on_unrendered_pages(self):
+    def test_draft_accepts_selection_larger_than_rendered_viewport(self):
         prototype = self.catalog()[0]
         slides = []
         for index in range(300):
@@ -362,19 +362,32 @@ class TQTransferTests(unittest.TestCase):
             slide["id"] = f"{index:024x}"
             slides.append(slide)
 
-        payload = {
-            "kind": "batch",
-            "batch_id": prototype["batch_id"],
-            "checked": True,
-            "view": {"filter": "None"},
-        }
-        with mock.patch.object(
-            app_module, "_tq_catalog", return_value=(slides, [])
-        ):
-            response = self.client.post("/tq/draft/group", json=payload)
+        response = self.client.post(
+            "/tq/draft",
+            json={"selected_ids": [slide["id"] for slide in slides], "phase": "select"},
+        )
 
         self.assertEqual(200, response.status_code)
-        self.assertEqual(300, len(response.get_json()["selected_ids"]))
+        with app_module._tq_state_lock:
+            self.assertEqual(
+                300,
+                len(app_module._tq_drafts[self.user.id]["selected_ids"]),
+            )
+
+    def test_review_uses_persisted_virtual_table_selection(self):
+        slides = self.catalog()
+        self.client.post(
+            "/tq/draft",
+            json={"selected_ids": [slides[0]["id"]], "phase": "select"},
+        )
+
+        response = self.client.post("/tq/review", data={})
+
+        self.assertEqual(302, response.status_code)
+        with app_module._tq_state_lock:
+            draft = app_module._tq_drafts[self.user.id]
+            self.assertEqual({slides[0]["id"]}, draft["selected_ids"])
+            self.assertEqual("review", draft["phase"])
 
     def test_copath_checkbox_defaults_off_and_persists_in_draft(self):
         slides = self.catalog()
@@ -421,21 +434,10 @@ class TQTransferTests(unittest.TestCase):
             b"consoleElement.textContent += data.output", response.data
         )
 
-    def test_filter_validation_rejects_bad_typed_values_and_date_ranges(self):
-        self.assertIn(
-            "six uppercase letters",
-            app_module._tq_validate_filter("PID", "ABC", "", ""),
-        )
-        self.assertIn(
-            "three digits",
-            app_module._tq_validate_filter("SectionCount", "12", "", ""),
-        )
-        self.assertIn(
-            "cannot precede",
-            app_module._tq_validate_filter(
-                "AccessionDate", "", "2026-07-20", "2026-07-19"
-            ),
-        )
+    def test_catalog_endpoint_requires_login(self):
+        anonymous = app_module.app.test_client()
+        response = anonymous.get("/tq/catalog")
+        self.assertEqual(302, response.status_code)
 
     def test_review_and_transfer_route_use_authoritative_mapping_values(self):
         slides = self.catalog()
