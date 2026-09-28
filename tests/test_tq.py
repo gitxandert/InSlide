@@ -298,7 +298,12 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b"Transfers", response.data)
         self.assertIn(b"Review Transfer", response.data)
         self.assertIn(b'data-exact="sdl_types"', response.data)
-        self.assertIn(b'data-text="stain"', response.data)
+        self.assertIn(b'class="filter-row exact-filter-row"', response.data)
+        self.assertIn(b'class="filter-row date-filter-row"', response.data)
+        self.assertIn(b'id="text-filter-groups"', response.data)
+        self.assertIn(b"addOr.textContent = '+ OR'", response.data)
+        self.assertIn(b"addAnd.textContent = '+ AND'", response.data)
+        self.assertIn(b"activeConditions.some", response.data)
         self.assertEqual("no-store", catalog.headers["Cache-Control"])
         self.assertEqual("AAAAAA", catalog.get_json()["slides"][0]["pid"])
 
