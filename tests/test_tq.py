@@ -301,9 +301,10 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b'class="filter-row exact-filter-row"', response.data)
         self.assertIn(b'class="filter-row date-filter-row"', response.data)
         self.assertIn(b'id="text-filter-groups"', response.data)
-        self.assertIn(b"addOr.textContent = '+ OR'", response.data)
-        self.assertIn(b"addAnd.textContent = '+ AND'", response.data)
-        self.assertIn(b"activeConditions.some", response.data)
+        self.assertIn(b"conditionActions", response.data)
+        self.assertIn(b"rowActions", response.data)
+        self.assertEqual(2, response.data.count(b"['and','or'].forEach"))
+        self.assertIn(b"evaluateTextGroup", response.data)
         self.assertEqual("no-store", catalog.headers["Cache-Control"])
         self.assertEqual("AAAAAA", catalog.get_json()["slides"][0]["pid"])
 

@@ -41,7 +41,9 @@
         .text-filter-condition .contains-label { flex:0 0 auto; }
         .text-filter-button { flex:0 0 auto; padding:8px 11px; white-space:nowrap; }
         .text-filter-button.remove { padding:7px 10px; color:var(--danger); border:1px solid #f1aeb5; background:white; }
-        .and-action { margin-top:8px; }
+        .condition-actions { flex:0 0 auto; display:flex; flex-wrap:wrap; gap:6px; }
+        .row-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+        .group-operator { margin:0 0 8px 2px; font-weight:700; color:var(--primary-dark); }
         .filter-heading,.result-heading,.console-heading { display:flex; justify-content:space-between; align-items:center; gap:12px; }
         .filter-heading { margin-bottom:14px; }
         .filter-heading h2,.result-heading h2 { margin:0; }
@@ -243,50 +245,75 @@ function dateInRange(value,start,end,isCompact=false) {
     const lower = start.replaceAll('-',''); const upper = end.replaceAll('-','');
     return (!lower || comparable >= lower) && (!upper || comparable <= upper);
 }
-function createTextCondition(isOr=false) {
+function createTextCondition(operator='') {
     const condition = document.createElement('div'); condition.className = 'text-filter-condition';
-    if (isOr) {
-        const operator = document.createElement('span'); operator.className = 'boolean-label'; operator.textContent = 'OR'; condition.appendChild(operator);
+    condition.dataset.operator = operator;
+    if (operator) {
+        const operatorLabel = document.createElement('span'); operatorLabel.className = 'boolean-label'; operatorLabel.textContent = operator.toUpperCase(); condition.appendChild(operatorLabel);
     }
     const field = document.createElement('select'); field.className = 'text-filter-field'; field.setAttribute('aria-label','Text field');
     textFilterFields.forEach(([value,label]) => { const option = document.createElement('option'); option.value = value; option.textContent = label; field.appendChild(option); });
     const contains = document.createElement('span'); contains.className = 'contains-label'; contains.textContent = 'contains';
     const input = document.createElement('input'); input.type = 'search'; input.className = 'text-filter-value'; input.setAttribute('aria-label','Text to find'); input.autocomplete = 'off';
     condition.append(field,contains,input);
-    if (isOr) {
-        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'text-filter-button remove'; remove.textContent = '×'; remove.setAttribute('aria-label','Remove OR condition');
+    if (operator) {
+        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'text-filter-button remove'; remove.textContent = '×'; remove.setAttribute('aria-label',`Remove ${operator.toUpperCase()} condition`);
         remove.addEventListener('click',() => { condition.remove(); applyFilters(); }); condition.appendChild(remove);
     }
     return condition;
 }
-function createTextFilterGroup(removable=false) {
-    const group = document.createElement('div'); group.className = 'text-filter-group'; group.setAttribute('role','group'); group.setAttribute('aria-label','OR text filter group');
+function createTextFilterGroup(operator='') {
+    const group = document.createElement('div'); group.className = 'text-filter-group'; group.setAttribute('role','group'); group.setAttribute('aria-label','Text filter group');
+    group.dataset.operator = operator;
+    if (operator) {
+        const operatorLabel = document.createElement('div'); operatorLabel.className = 'group-operator'; operatorLabel.textContent = operator.toUpperCase(); group.appendChild(operatorLabel);
+    }
     const line = document.createElement('div'); line.className = 'text-filter-line';
     const conditions = document.createElement('div'); conditions.className = 'text-filter-conditions'; conditions.appendChild(createTextCondition());
-    const addOr = document.createElement('button'); addOr.type = 'button'; addOr.className = 'text-filter-button'; addOr.textContent = '+ OR';
-    addOr.addEventListener('click',() => { const condition = createTextCondition(true); conditions.appendChild(condition); condition.querySelector('.text-filter-value').focus(); });
-    line.append(conditions,addOr);
-    if (removable) {
+    const conditionActions = document.createElement('div'); conditionActions.className = 'condition-actions';
+    ['and','or'].forEach((nextOperator) => {
+        const addCondition = document.createElement('button'); addCondition.type = 'button'; addCondition.className = `text-filter-button${nextOperator === 'or' ? ' secondary' : ''}`; addCondition.textContent = `+ ${nextOperator.toUpperCase()}`;
+        addCondition.addEventListener('click',() => { const condition = createTextCondition(nextOperator); conditions.appendChild(condition); condition.querySelector('.text-filter-value').focus(); }); conditionActions.appendChild(addCondition);
+    });
+    line.append(conditions,conditionActions);
+    if (operator) {
         const removeGroup = document.createElement('button'); removeGroup.type = 'button'; removeGroup.className = 'text-filter-button remove'; removeGroup.textContent = 'Remove row';
         removeGroup.addEventListener('click',() => { group.remove(); applyFilters(); }); line.appendChild(removeGroup);
     }
-    const andAction = document.createElement('div'); andAction.className = 'and-action';
-    const addAnd = document.createElement('button'); addAnd.type = 'button'; addAnd.className = 'text-filter-button secondary'; addAnd.textContent = '+ AND';
-    addAnd.addEventListener('click',() => { const nextGroup = createTextFilterGroup(true); group.after(nextGroup); nextGroup.querySelector('.text-filter-value').focus(); });
-    andAction.appendChild(addAnd); group.append(line,andAction); return group;
+    const rowActions = document.createElement('div'); rowActions.className = 'row-actions';
+    ['and','or'].forEach((nextOperator) => {
+        const addGroup = document.createElement('button'); addGroup.type = 'button'; addGroup.className = `text-filter-button${nextOperator === 'or' ? ' secondary' : ''}`; addGroup.textContent = `+ ${nextOperator.toUpperCase()} row`;
+        addGroup.addEventListener('click',() => { const nextGroup = createTextFilterGroup(nextOperator); group.after(nextGroup); nextGroup.querySelector('.text-filter-value').focus(); }); rowActions.appendChild(addGroup);
+    });
+    group.append(line,rowActions); return group;
 }
 function resetTextFilters() {
     if (textFilterGroups) textFilterGroups.replaceChildren(createTextFilterGroup());
 }
-function textFiltersMatch(slide) {
-    if (!textFilterGroups) return true;
-    return Array.from(textFilterGroups.querySelectorAll('.text-filter-group')).every((group) => {
-        const activeConditions = Array.from(group.querySelectorAll('.text-filter-condition')).map((condition) => ({
+function evaluateTextGroup(slide,group) {
+    const activeConditions = Array.from(group.querySelectorAll('.text-filter-condition')).map((condition) => ({
+            operator: condition.dataset.operator,
             field: condition.querySelector('.text-filter-field').value,
             term: condition.querySelector('.text-filter-value').value.trim()
         })).filter(({term}) => term);
-        return !activeConditions.length || activeConditions.some(({field,term}) => normalized(slide[field]).includes(normalized(term)));
+    if (!activeConditions.length) return null;
+    let matches = normalized(slide[activeConditions[0].field]).includes(normalized(activeConditions[0].term));
+    activeConditions.slice(1).forEach(({operator,field,term}) => {
+        const conditionMatches = normalized(slide[field]).includes(normalized(term));
+        matches = operator === 'and' ? matches && conditionMatches : matches || conditionMatches;
     });
+    return matches;
+}
+function textFiltersMatch(slide) {
+    if (!textFilterGroups) return true;
+    const activeGroups = Array.from(textFilterGroups.querySelectorAll('.text-filter-group')).map((group) => ({
+        operator: group.dataset.operator,
+        matches: evaluateTextGroup(slide,group)
+    })).filter(({matches}) => matches !== null);
+    if (!activeGroups.length) return true;
+    let matches = activeGroups[0].matches;
+    activeGroups.slice(1).forEach((group) => { matches = group.operator === 'and' ? matches && group.matches : matches || group.matches; });
+    return matches;
 }
 function applyFilters() {
     const exactFilters = Array.from(document.querySelectorAll('[data-exact]'));
