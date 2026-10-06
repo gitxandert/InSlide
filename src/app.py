@@ -198,6 +198,10 @@ class Config:
     SCANNER_INVENTORIES = os.environ.get(
         "SCANNER_INVENTORIES", "D:\\scanner_inventories"
     )
+    GT450_IMAGES = os.environ.get(
+        "GT450_IMAGES_CONTAINER_ROOT",
+        os.environ.get("GT450_IMAGES_HOST_PREFIX", "D:\\GT450_images"),
+    )
     # Path to batches of new slides to process in InSlide
     INSLIDE_BATCHES = os.environ.get(
         "INSLIDE_BATCHES", "D:\\label_check_batches"
@@ -1529,6 +1533,7 @@ class BatchContext:
         self.queue_manager = QueueManager(batch_id)
         self.csv_mod_time: Optional[float] = None
         row = catalog_row or {}
+        self.run_type = str(row.get("run_type", "nightly"))
         self.completed_stages = {
             "QC": bool(row.get("qc_complete", False)),
             "Renamed": bool(row.get("renamed_complete", False)),
@@ -1700,6 +1705,21 @@ def reconcile_batch_catalog() -> List[str]:
         display_name = f"{root.parent.name}/{root.name}"
         relative_path = normalize_relative_path(f"{root.parent.name}/{root.name}")
         seen.append(relative_path)
+        run_type = "nightly"
+        run_type_path = root / ".inslide_run_type"
+        try:
+            if run_type_path.is_file():
+                stored_run_type = run_type_path.read_text(encoding="utf-8").strip()
+                if stored_run_type in {"nightly", "on_demand"}:
+                    run_type = stored_run_type
+                else:
+                    warnings.append(
+                        f"{display_name} has invalid run metadata; treating it as Nightly."
+                    )
+        except (OSError, UnicodeError) as exc:
+            warnings.append(
+                f"{display_name} run metadata could not be read; treating it as Nightly: {exc}"
+            )
         missing = [
             name for name in ("label", "macro")
             if not (root / name).is_dir() or not os.access(root / name, os.R_OK | os.X_OK)
@@ -1711,7 +1731,7 @@ def reconcile_batch_catalog() -> List[str]:
             if missing:
                 message = f"missing {', '.join(missing)}"
                 batch_catalog.upsert_batch(
-                    Config.INSTANCE_DIR, relative_path, validity="invalid",
+                    Config.INSTANCE_DIR, relative_path, run_type=run_type, validity="invalid",
                     validation_error=message,
                 )
                 warnings.append(f"Skipped {display_name}: {message}.")
@@ -1732,6 +1752,7 @@ def reconcile_batch_catalog() -> List[str]:
                 batch_catalog.upsert_batch(
                     Config.INSTANCE_DIR,
                     relative_path,
+                    run_type=run_type,
                     validity="ready",
                     slide_count=int(existing["slide_count"]),
                     enriched_mtime_ns=enriched_mtime,
@@ -1760,6 +1781,7 @@ def reconcile_batch_catalog() -> List[str]:
             public_id = batch_catalog.upsert_batch(
                 Config.INSTANCE_DIR,
                 relative_path,
+                run_type=run_type,
                 validity="ready",
                 validation_error="",
                 slide_count=len(slide_rows),
@@ -1774,7 +1796,7 @@ def reconcile_batch_catalog() -> List[str]:
             app.logger.warning("Skipping invalid batch %s: %s", root, exc)
             warnings.append(f"Skipped {display_name}: {exc}")
             batch_catalog.upsert_batch(
-                Config.INSTANCE_DIR, relative_path, validity="invalid",
+                Config.INSTANCE_DIR, relative_path, run_type=run_type, validity="invalid",
                 validation_error=str(exc),
             )
 
@@ -1858,6 +1880,7 @@ def discover_batches() -> Tuple[List[BatchContext], List[str]]:
                 context = BatchContext(batch_id, root, row)
                 batch_contexts[batch_id] = context
             else:
+                context.run_type = str(row.get("run_type", "nightly"))
                 context.completed_stages = {
                     "QC": bool(row["qc_complete"]),
                     "Renamed": bool(row["renamed_complete"]),
@@ -4342,6 +4365,90 @@ def _pipeline_path_is_allowed(candidate: Path, roots: List[Path]) -> bool:
     return False
 
 
+def _pipeline_date_options() -> Tuple[List[Dict[str, str]], List[str]]:
+    """Return readable scanner/date directories named by scanner inventories."""
+    inventory_root = Path(Config.SCANNER_INVENTORIES)
+    gt450_root = runtime_path(Config.GT450_IMAGES).expanduser().resolve()
+    warnings: List[str] = []
+    options: Dict[str, Dict[str, str]] = {}
+    unavailable = 0
+    try:
+        inventory_files = sorted(
+            (
+                path for path in inventory_root.iterdir()
+                if path.is_file() and not path.is_symlink()
+                and path.name.endswith("_inventory.csv")
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+    except OSError as exc:
+        return [], [f"Scanner inventories are unavailable: {exc}"]
+
+    for inventory_path in inventory_files:
+        scanner = inventory_path.name.removesuffix("_inventory.csv")
+        if not scanner.startswith("SS"):
+            continue
+        try:
+            with inventory_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle, strict=True)
+                if not reader.fieldnames or "directory" not in reader.fieldnames:
+                    warnings.append(f"{inventory_path.name} has no directory column.")
+                    continue
+                for row in reader:
+                    raw_path = (row.get("directory") or "").strip()
+                    if not raw_path:
+                        continue
+                    candidate = runtime_path(raw_path).expanduser().resolve()
+                    try:
+                        relative = candidate.relative_to(gt450_root)
+                    except ValueError:
+                        continue
+                    if len(relative.parts) != 2 or relative.parts[0] != scanner:
+                        continue
+                    try:
+                        date = datetime.date.fromisoformat(relative.parts[1])
+                    except ValueError:
+                        continue
+                    if date.isoformat() != relative.parts[1]:
+                        continue
+                    if not candidate.is_dir() or not os.access(candidate, os.R_OK | os.X_OK):
+                        unavailable += 1
+                        continue
+                    value = str(candidate)
+                    options[value] = {
+                        "value": value,
+                        "label": f"{scanner}/{date.isoformat()}",
+                        "scanner": scanner,
+                        "date": date.isoformat(),
+                    }
+        except (OSError, UnicodeError, csv.Error) as exc:
+            warnings.append(f"{inventory_path.name} could not be read: {exc}")
+
+    if unavailable:
+        warnings.append(f"Skipped {unavailable} unavailable inventory director{'y' if unavailable == 1 else 'ies'}.")
+    if not options:
+        warnings.append("No available scanner/date directories were found in scanner inventories.")
+    return sorted(
+        options.values(),
+        key=lambda option: (option["date"], option["scanner"]),
+        reverse=True,
+    ), warnings
+
+
+def _pipeline_web_paths(
+    values: Dict[str, str], options: Sequence[Dict[str, str]]
+) -> List[str]:
+    selected = values["input_dir"].strip()
+    option = next((item for item in options if item["value"] == selected), None)
+    if option is None:
+        return ["Choose an available scanner/date directory."]
+    values["input_dir"] = option["value"]
+    values["output_dir"] = str(
+        Path(Config.INSLIDE_BATCHES) / option["scanner"] / option["date"]
+    )
+    return []
+
+
 def _pipeline_extensions(value: str, label: str, errors: List[str]) -> List[str]:
     extensions = [item.lstrip(".") for item in re.split(r"[\s,]+", value.strip()) if item]
     if not extensions:
@@ -4455,6 +4562,8 @@ def _pipeline_command(values: Dict[str, str]) -> Tuple[Optional[List[str]], List
         str(input_dir),
         "--output-dir",
         str(output_dir),
+        "--run-type",
+        "on_demand",
         "--start-from",
         str(start_stage),
         "--end-at",
@@ -5908,9 +6017,12 @@ def pipeline_launcher():
     job_id = session.get("pipeline_job_id")
     if job_id:
         job = _pipeline_job_for_user(job_id)
+    date_options, inventory_warnings = _pipeline_date_options()
     return render_template(
         "pipeline.html",
         form_values=_pipeline_form_values(),
+        date_options=date_options,
+        inventory_warnings=inventory_warnings,
         job=job,
         pipeline_busy=_pipeline_is_busy(),
         messages=flash_messages(),
@@ -5921,7 +6033,11 @@ def pipeline_launcher():
 @login_required
 def run_pipeline():
     values = _pipeline_form_values(request.form)
-    command, errors = _pipeline_command(values)
+    date_options, inventory_warnings = _pipeline_date_options()
+    errors = _pipeline_web_paths(values, date_options)
+    command = None
+    if not errors:
+        command, errors = _pipeline_command(values)
     if errors:
         for error in errors:
             flash(error, "error")
@@ -5929,6 +6045,8 @@ def run_pipeline():
             render_template(
                 "pipeline.html",
                 form_values=values,
+                date_options=date_options,
+                inventory_warnings=inventory_warnings,
                 job=None,
                 pipeline_busy=_pipeline_is_busy(),
                 messages=flash_messages(),
@@ -5944,6 +6062,8 @@ def run_pipeline():
             render_template(
                 "pipeline.html",
                 form_values=values,
+                date_options=date_options,
+                inventory_warnings=inventory_warnings,
                 job=None,
                 pipeline_busy=True,
                 messages=flash_messages(),
@@ -5957,6 +6077,8 @@ def run_pipeline():
             render_template(
                 "pipeline.html",
                 form_values=values,
+                date_options=date_options,
+                inventory_warnings=inventory_warnings,
                 job=None,
                 pipeline_busy=False,
                 messages=flash_messages(),
@@ -6340,9 +6462,21 @@ def sdl():
 def qc():
     context, available_batches, discovery_warnings = _selected_batch()
     if context is None:
+        selected_run_type = request.args.get("run_type")
+        if selected_run_type not in {"nightly", "on_demand"}:
+            selected_run_type = None
+        category_counts = {
+            run_type: sum(batch.run_type == run_type for batch in available_batches)
+            for run_type in ("nightly", "on_demand")
+        }
         return render_template(
             "batches.html",
-            batches=available_batches,
+            batches=(
+                [batch for batch in available_batches if batch.run_type == selected_run_type]
+                if selected_run_type else []
+            ),
+            selected_run_type=selected_run_type,
+            category_counts=category_counts,
             discovery_warnings=discovery_warnings,
             messages=flash_messages(),
         )

@@ -26,7 +26,7 @@
 <body>
 {% include '_app_sidebar.html' %}
     <header>
-        <h1>Choose a QC batch</h1>
+        <h1>{% if selected_run_type %}Choose a {{ 'Nightly' if selected_run_type == 'nightly' else 'On-demand' }} batch{% else %}Choose a QC run type{% endif %}</h1>
         <nav><a href="{{ url_for('index') }}">Menu</a><a href="{{ url_for('logout') }}">Logout</a></nav>
     </header>
     <main>
@@ -36,8 +36,21 @@
                 {% for warning in discovery_warnings %}<li>{{ warning }}</li>{% endfor %}
             </ul>
         {% endif %}
-        {% if batches %}
+        {% if not selected_run_type %}
+            <p>Choose how the Label-Check run was started.</p>
+            <div class="batch-grid">
+                <a class="batch" href="{{ url_for('qc', run_type='nightly') }}">
+                    <h2>Nightly</h2>
+                    <p>{{ category_counts.nightly }} unfinished batch(es)</p>
+                </a>
+                <a class="batch" href="{{ url_for('qc', run_type='on_demand') }}">
+                    <h2>On-demand</h2>
+                    <p>{{ category_counts.on_demand }} unfinished batch(es)</p>
+                </a>
+            </div>
+        {% elif batches %}
             <p>Select an unfinished batch. This list is refreshed whenever this page is opened.</p>
+            <p><a href="{{ url_for('qc', choose=1) }}">Back to run types</a></p>
             <div class="batch-grid">
                 {% for batch in batches %}
                     <a class="batch" href="{{ url_for('qc', batch=batch.id) }}">
@@ -47,7 +60,8 @@
                 {% endfor %}
             </div>
         {% else %}
-            <p class="empty">No unfinished, valid Label-Check pipeline batches are currently available.</p>
+            <p class="empty">No unfinished {{ 'Nightly' if selected_run_type == 'nightly' else 'On-demand' }} batches are currently available.</p>
+            <p><a href="{{ url_for('qc', choose=1) }}">Back to run types</a></p>
         {% endif %}
     </main>
 </body>

@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+RUN_TYPE_FILE = ".inslide_run_type"
 
 
 def parse_except(error: subprocess.CalledProcessError) -> None:
@@ -191,6 +192,12 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-dir", required=True, help="Input image directory")
     parser.add_argument("--output-dir", required=True, help="Pipeline output directory")
     parser.add_argument(
+        "--run-type",
+        choices=["nightly", "on_demand"],
+        default="on_demand",
+        help="Run category shown in the QC application",
+    )
+    parser.add_argument(
         "--start-from",
         choices=["1", "macro", "2", "ocr", "3", "name", "app"],
         help="Stage at which to start",
@@ -237,11 +244,14 @@ def main() -> int:
         parse_except(error)
         return error.returncode or 1
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / RUN_TYPE_FILE).write_text(args.run_type, encoding="utf-8")
+
     if end_stage <= 3:
         print(f"\n\x1b[1mEnding at stage {end_stage}.\x1b[0m", flush=True)
         return 0
 
-    output_dir = Path(args.output_dir)
     output_app = copy_app_bundle(output_dir)
 
     print("\n\x1b[1mInitializing database...\x1b[0m\n", flush=True)

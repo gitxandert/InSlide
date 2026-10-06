@@ -67,6 +67,24 @@ class PipelineCommandTests(unittest.TestCase):
             )
             self.assertTrue((output_app.parent / "templates" / "pipeline.html").is_file())
 
+    def test_successful_pipeline_records_run_type(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "pipeline.py", "--input-dir", str(root / "input"),
+                    "--output-dir", str(root / "output"), "--end-at", "1",
+                    "--run-type", "nightly",
+                ],
+            ), mock.patch.object(pipeline, "run_stage"):
+                result = pipeline.main()
+
+            marker = root / "output" / pipeline.RUN_TYPE_FILE
+            self.assertEqual(0, result)
+            self.assertEqual("nightly", marker.read_text(encoding="utf-8"))
+
 
 class PipelineLauncherTests(unittest.TestCase):
     def setUp(self):
@@ -123,7 +141,53 @@ class PipelineLauncherTests(unittest.TestCase):
         self.assertEqual("1", command[command.index("--start-from") + 1])
         self.assertEqual("3", command[command.index("--end-at") + 1])
         self.assertEqual("4", command[command.index("--ocr-workers") + 1])
+        self.assertEqual("on_demand", command[command.index("--run-type") + 1])
         self.assertNotIn("--ocr-use-cpu", command)
+
+    def test_inventory_dates_drive_web_paths(self):
+        root = Path(self.temporary_directory.name)
+        gt450 = root / "gt450"
+        inventories = root / "inventories"
+        batches = root / "batches"
+        newest = gt450 / "SS100" / "2026-10-02"
+        older = gt450 / "SS100" / "2026-09-30"
+        newest.mkdir(parents=True)
+        older.mkdir(parents=True)
+        inventories.mkdir()
+        (inventories / "SS100_inventory.csv").write_text(
+            "directory\n"
+            f"{older}\n{newest}\n{newest}\n"
+            f"{gt450 / 'SS100' / 'not-a-date'}\n",
+            encoding="utf-8",
+        )
+        previous = (
+            app_module.Config.GT450_IMAGES,
+            app_module.Config.SCANNER_INVENTORIES,
+            app_module.Config.INSLIDE_BATCHES,
+        )
+        app_module.Config.GT450_IMAGES = str(gt450)
+        app_module.Config.SCANNER_INVENTORIES = str(inventories)
+        app_module.Config.INSLIDE_BATCHES = str(batches)
+        try:
+            options, warnings = app_module._pipeline_date_options()
+            values = app_module._pipeline_form_values({"input_dir": str(newest)})
+            errors = app_module._pipeline_web_paths(values, options)
+            forged = app_module._pipeline_form_values(
+                {"input_dir": str(gt450 / "SS100" / "2026-10-03")}
+            )
+            forged_errors = app_module._pipeline_web_paths(forged, options)
+        finally:
+            (
+                app_module.Config.GT450_IMAGES,
+                app_module.Config.SCANNER_INVENTORIES,
+                app_module.Config.INSLIDE_BATCHES,
+            ) = previous
+
+        self.assertEqual([], warnings)
+        self.assertEqual(["SS100/2026-10-02", "SS100/2026-09-30"], [item["label"] for item in options])
+        self.assertEqual([], errors)
+        self.assertEqual(["Choose an available scanner/date directory."], forged_errors)
+        self.assertEqual(str(batches / "SS100" / "2026-10-02"), values["output_dir"])
 
     def test_starting_later_requires_the_previous_stage_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -246,12 +310,18 @@ class PipelineLauncherTests(unittest.TestCase):
                 root = Path(temporary_directory)
                 input_dir = root / "input"
                 input_dir.mkdir()
-                with mock.patch.object(
+                option = {
+                    "value": str(input_dir), "label": "SS100/2026-10-02",
+                    "scanner": "SS100", "date": "2026-10-02",
+                }
+                with mock.patch.object(app_module, "_pipeline_date_options", return_value=([option], [])), mock.patch.object(
                     app_module, "_start_pipeline_job", return_value=fake_job
-                ) as start_job:
+                ) as start_job, mock.patch.object(
+                    app_module.Config, "INSLIDE_BATCHES", str(root)
+                ):
                     launch_response = client.post(
                         "/pipeline/run",
-                        data={"input_dir": str(input_dir), "output_dir": str(root / "output")},
+                        data={"input_dir": str(input_dir)},
                     )
 
         self.assertEqual(200, response.status_code)

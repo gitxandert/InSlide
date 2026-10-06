@@ -80,6 +80,17 @@ class BatchCatalogTests(unittest.TestCase):
         self.assertFalse(other["qc_complete"])
         self.assertEqual(1, first["queue_total"])
 
+    def test_run_type_is_stored_and_validated(self):
+        batch_id = self.catalog.upsert_batch(
+            self.instance, "SS300/2026-10-02", run_type="on_demand"
+        )
+
+        self.assertEqual("on_demand", self.catalog.get_batch(self.instance, batch_id)["run_type"])
+        with self.assertRaisesRegex(ValueError, "invalid run type"):
+            self.catalog.upsert_batch(
+                self.instance, "SS300/2026-10-03", run_type="unknown"
+            )
+
     def test_schema_version_one_is_upgraded_with_transfer_tables(self):
         legacy_instance = self.root / "legacy-instance"
         legacy_instance.mkdir()
@@ -110,9 +121,26 @@ class BatchCatalogTests(unittest.TestCase):
             }
         finally:
             connection.close()
-        self.assertEqual("2", version)
+        self.assertEqual("3", version)
         self.assertIn("transfer_slides", tables)
         self.assertIn("transfer_sources", tables)
+
+    def test_schema_version_two_adds_nightly_run_type(self):
+        legacy_instance = self.root / "version-two-instance"
+        legacy_catalog = BatchCatalog()
+        batch_id = legacy_catalog.upsert_batch(legacy_instance, "SS100/2026-10-01")
+        database = legacy_catalog.database_path(legacy_instance)
+        connection = sqlite3.connect(database)
+        connection.execute("ALTER TABLE batches DROP COLUMN run_type")
+        connection.execute(
+            "UPDATE catalog_metadata SET value='2' WHERE key='schema_version'"
+        )
+        connection.commit()
+        connection.close()
+
+        upgraded = BatchCatalog().get_batch(legacy_instance, batch_id)
+
+        self.assertEqual("nightly", upgraded["run_type"])
 
 
 class BatchCatalogMigrationTests(unittest.TestCase):

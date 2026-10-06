@@ -2,6 +2,7 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import app as qc_app
 
@@ -57,6 +58,7 @@ class CompletedStagesTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(len(batches), 1)
         self.assertFalse(batches[0].qc_complete)
+        self.assertEqual("nightly", batches[0].run_type)
         self.assertTrue(
             (Path(qc_app.Config.INSTANCE_DIR) / "batch_catalog.sqlite3").exists()
         )
@@ -67,6 +69,23 @@ class CompletedStagesTests(unittest.TestCase):
             self.assertIsNone(selected)
             self.assertEqual(len(available), 1)
             self.assertEqual(selection_warnings, [])
+
+    def test_qc_chooser_groups_on_demand_batches(self):
+        (self.batch_root / ".inslide_run_type").write_text(
+            "on_demand", encoding="utf-8"
+        )
+        user = qc_app.User("operator", "", is_admin=False)
+        client = qc_app.app.test_client()
+        with mock.patch.object(qc_app.user_manager, "get", return_value=user):
+            with client.session_transaction() as flask_session:
+                flask_session["_user_id"] = user.id
+                flask_session["_fresh"] = True
+            chooser = client.get("/qc")
+            category = client.get("/qc?run_type=on_demand")
+
+        self.assertIn(b"Nightly", chooser.data)
+        self.assertIn(b"On-demand", chooser.data)
+        self.assertIn(b"SS100/batch-1", category.data)
 
     def test_qc_true_is_not_available_but_can_be_selected_explicitly(self):
         batches, _ = qc_app.discover_batches()

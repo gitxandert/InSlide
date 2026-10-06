@@ -79,6 +79,8 @@ for scanner_dir in label_check_batches.iterdir():
             dir_path,
             "--output-dir",
             output_folder,
+            "--run-type",
+            "nightly",
             "--end-at",
             'name'
         ]

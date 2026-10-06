@@ -72,27 +72,28 @@
         </nav>
     </header>
     <main>
-        {% if messages %}
+        {% if messages or inventory_warnings %}
             <ul class="flash-messages">
                 {% for message in messages %}<li class="{{ message.category }}">{{ message.message }}</li>{% endfor %}
+                {% for warning in inventory_warnings %}<li class="warning">{{ warning }}</li>{% endfor %}
             </ul>
         {% endif %}
 
         <section class="card">
             <h2>Pipeline settings</h2>
-            <p class="lead">Enter directories on the server, choose the stages to run, and adjust advanced script arguments if needed.</p>
+            <p class="lead">Choose a scanner date from the current inventories. Results use the matching scanner/date batch directory.</p>
             <form method="POST" action="{{ url_for('run_pipeline') }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <div class="grid">
                     <div class="field full">
-                        <label for="input_dir">Input directory</label>
-                        <input id="input_dir" name="input_dir" type="text" value="{{ form_values.input_dir }}" required placeholder="/path/to/input">
-                        <span class="help">An existing directory containing slides or label/macro image folders.</span>
-                    </div>
-                    <div class="field full">
-                        <label for="output_dir">Output directory</label>
-                        <input id="output_dir" name="output_dir" type="text" value="{{ form_values.output_dir }}" required placeholder="/path/to/output">
-                        <span class="help">Pipeline CSV files and extracted images will be written here.</span>
+                        <label for="input_dir">Scanner date</label>
+                        <select id="input_dir" name="input_dir" required>
+                            <option value="">Choose scanner/date</option>
+                            {% for option in date_options %}
+                                <option value="{{ option.value }}" {% if form_values.input_dir == option.value %}selected{% endif %}>{{ option.label }}</option>
+                            {% endfor %}
+                        </select>
+                        <span class="help">Options come from scanner inventories and must be available in the mounted GT450 images.</span>
                     </div>
                 </div>
 
@@ -179,7 +180,7 @@
                     </div>
                 </details>
                 <div class="actions">
-                    <button type="submit" {% if pipeline_busy %}disabled{% endif %}>Run Label-Check</button>
+                    <button type="submit" {% if pipeline_busy or not date_options %}disabled{% endif %}>Run Label-Check</button>
                     {% if pipeline_busy and not job %}<span class="busy-note">Another pipeline is currently running.</span>{% endif %}
                 </div>
             </form>

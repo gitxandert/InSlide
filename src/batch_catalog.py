@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 QUEUE_STATUSES = {"pending", "leased", "completed"}
 
 
@@ -94,6 +94,8 @@ class BatchCatalog:
                         relative_path TEXT NOT NULL COLLATE NOCASE UNIQUE,
                         scanner_name TEXT NOT NULL,
                         batch_name TEXT NOT NULL,
+                        run_type TEXT NOT NULL DEFAULT 'nightly'
+                            CHECK(run_type IN ('nightly','on_demand')),
                         qc_complete INTEGER NOT NULL DEFAULT 0 CHECK(qc_complete IN (0,1)),
                         renamed_complete INTEGER NOT NULL DEFAULT 0 CHECK(renamed_complete IN (0,1)),
                         validity TEXT NOT NULL DEFAULT 'ready'
@@ -183,6 +185,19 @@ class BatchCatalog:
                 ).fetchone()[0]
                 if int(version) == 1:
                     connection.execute(
+                        "UPDATE catalog_metadata SET value='2' WHERE key='schema_version'",
+                    )
+                    version = "2"
+                if int(version) == 2:
+                    columns = {
+                        row[1] for row in connection.execute("PRAGMA table_info(batches)")
+                    }
+                    if "run_type" not in columns:
+                        connection.execute(
+                            "ALTER TABLE batches ADD COLUMN run_type TEXT NOT NULL "
+                            "DEFAULT 'nightly' CHECK(run_type IN ('nightly','on_demand'))"
+                        )
+                    connection.execute(
                         "UPDATE catalog_metadata SET value=? WHERE key='schema_version'",
                         (str(SCHEMA_VERSION),),
                     )
@@ -248,6 +263,7 @@ class BatchCatalog:
         instance_dir: str | Path,
         relative_path: str,
         *,
+        run_type: str = "nightly",
         qc_complete: bool = False,
         renamed_complete: bool = False,
         validity: str = "ready",
@@ -261,6 +277,8 @@ class BatchCatalog:
         preserve_stages: bool = True,
     ) -> str:
         relative_path = normalize_relative_path(relative_path)
+        if run_type not in {"nightly", "on_demand"}:
+            raise ValueError(f"invalid run type: {run_type}")
         scanner_name, batch_name = PurePosixPath(relative_path).parts
         public_id = public_batch_id(relative_path)
         now = utc_now()
@@ -277,15 +295,16 @@ class BatchCatalog:
             connection.execute(
                 """
                 INSERT INTO batches(
-                    public_id,relative_path,scanner_name,batch_name,qc_complete,
+                    public_id,relative_path,scanner_name,batch_name,run_type,qc_complete,
                     renamed_complete,validity,validation_error,slide_count,
                     enriched_mtime_ns,mapping_mtime_ns,history_mtime_ns,renaming_status,history_status,
                     first_seen_at,last_seen_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(relative_path) DO UPDATE SET
                     public_id=excluded.public_id,
                     scanner_name=excluded.scanner_name,
                     batch_name=excluded.batch_name,
+                    run_type=excluded.run_type,
                     qc_complete=excluded.qc_complete,
                     renamed_complete=excluded.renamed_complete,
                     validity=excluded.validity,
@@ -301,7 +320,7 @@ class BatchCatalog:
                 """,
                 (
                     public_id, relative_path, scanner_name, batch_name,
-                    int(qc_complete), int(renamed_complete), validity,
+                    run_type, int(qc_complete), int(renamed_complete), validity,
                     validation_error, int(slide_count), enriched_mtime_ns,
                     mapping_mtime_ns, history_mtime_ns, renaming_status, history_status,
                     now, now, now,
