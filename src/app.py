@@ -4278,6 +4278,7 @@ def _save_tq_config(contents: str) -> TQConfigResult:
 # 9. PIPELINE LAUNCHER
 # ==============================================================================
 PIPELINE_FORM_DEFAULTS = {
+    "scanner": "",
     "input_dir": "",
     "output_dir": "",
     "start_from": "1",
@@ -4438,10 +4439,18 @@ def _pipeline_date_options() -> Tuple[List[Dict[str, str]], List[str]]:
 def _pipeline_web_paths(
     values: Dict[str, str], options: Sequence[Dict[str, str]]
 ) -> List[str]:
+    selected_scanner = values["scanner"].strip()
     selected = values["input_dir"].strip()
-    option = next((item for item in options if item["value"] == selected), None)
+    option = next(
+        (
+            item for item in options
+            if item["scanner"] == selected_scanner and item["value"] == selected
+        ),
+        None,
+    )
     if option is None:
-        return ["Choose an available scanner/date directory."]
+        return ["Choose an available scanner and date directory."]
+    values["scanner"] = option["scanner"]
     values["input_dir"] = option["value"]
     values["output_dir"] = str(
         Path(Config.INSLIDE_BATCHES) / option["scanner"] / option["date"]

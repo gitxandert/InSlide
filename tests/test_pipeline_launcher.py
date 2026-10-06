@@ -170,12 +170,21 @@ class PipelineLauncherTests(unittest.TestCase):
         app_module.Config.INSLIDE_BATCHES = str(batches)
         try:
             options, warnings = app_module._pipeline_date_options()
-            values = app_module._pipeline_form_values({"input_dir": str(newest)})
+            values = app_module._pipeline_form_values(
+                {"scanner": "SS100", "input_dir": str(newest)}
+            )
             errors = app_module._pipeline_web_paths(values, options)
             forged = app_module._pipeline_form_values(
-                {"input_dir": str(gt450 / "SS100" / "2026-10-03")}
+                {
+                    "scanner": "SS100",
+                    "input_dir": str(gt450 / "SS100" / "2026-10-03"),
+                }
             )
             forged_errors = app_module._pipeline_web_paths(forged, options)
+            mismatched = app_module._pipeline_form_values(
+                {"scanner": "SS999", "input_dir": str(newest)}
+            )
+            mismatched_errors = app_module._pipeline_web_paths(mismatched, options)
         finally:
             (
                 app_module.Config.GT450_IMAGES,
@@ -186,7 +195,8 @@ class PipelineLauncherTests(unittest.TestCase):
         self.assertEqual([], warnings)
         self.assertEqual(["SS100/2026-10-02", "SS100/2026-09-30"], [item["label"] for item in options])
         self.assertEqual([], errors)
-        self.assertEqual(["Choose an available scanner/date directory."], forged_errors)
+        self.assertEqual(["Choose an available scanner and date directory."], forged_errors)
+        self.assertEqual(["Choose an available scanner and date directory."], mismatched_errors)
         self.assertEqual(str(batches / "SS100" / "2026-10-02"), values["output_dir"])
 
     def test_starting_later_requires_the_previous_stage_file(self):
@@ -295,6 +305,31 @@ class PipelineLauncherTests(unittest.TestCase):
         self.assertEqual("failed", job.status)
         self.assertEqual(7, job.return_code)
 
+    def test_page_filters_dates_and_streams_pipeline_output(self):
+        user = app_module.User("operator", "", is_admin=False)
+        job = app_module.PipelineJob("visible-job", user.id, FakeProcess())
+        job.output = "first line\nsecond line\n"
+        with app_module._pipeline_jobs_lock:
+            app_module._pipeline_jobs[job.id] = job
+        client = app_module.app.test_client()
+
+        with mock.patch.object(app_module.user_manager, "get", return_value=user), mock.patch.object(
+            app_module, "_pipeline_date_options", return_value=([], [])
+        ):
+            with client.session_transaction() as flask_session:
+                flask_session["_user_id"] = user.id
+                flask_session["_fresh"] = True
+                flask_session["pipeline_job_id"] = job.id
+            page = client.get("/pipeline")
+            output = client.get(f"/pipeline/jobs/{job.id}/output?offset=11")
+
+        self.assertIn(b'id="scanner"', page.data)
+        self.assertIn(b'id="input_dir"', page.data)
+        self.assertIn(b'aria-label="Pipeline output"', page.data)
+        self.assertIn(b"function updateDateOptions(", page.data)
+        self.assertEqual("second line\n", output.get_json()["output"])
+        self.assertEqual(len(job.output), output.get_json()["next_offset"])
+
     def test_authenticated_page_and_launch(self):
         user = app_module.User("operator", "", is_admin=False)
         fake_job = SimpleNamespace(id="new-job", status="running")
@@ -321,7 +356,7 @@ class PipelineLauncherTests(unittest.TestCase):
                 ):
                     launch_response = client.post(
                         "/pipeline/run",
-                        data={"input_dir": str(input_dir)},
+                        data={"scanner": "SS100", "input_dir": str(input_dir)},
                     )
 
         self.assertEqual(200, response.status_code)

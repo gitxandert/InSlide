@@ -81,20 +81,26 @@
 
         <section class="card">
             <h2>Pipeline settings</h2>
-            <p class="lead">Choose a scanner date from the current inventories. Results use the matching scanner/date batch directory.</p>
+            <p class="lead">Choose a scanner, then a date directory from its current inventory. Results use the matching scanner/date batch directory.</p>
             <form method="POST" action="{{ url_for('run_pipeline') }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <div class="grid">
-                    <div class="field full">
-                        <label for="input_dir">Scanner date</label>
-                        <select id="input_dir" name="input_dir" required>
-                            <option value="">Choose scanner/date</option>
-                            {% for option in date_options %}
-                                <option value="{{ option.value }}" {% if form_values.input_dir == option.value %}selected{% endif %}>{{ option.label }}</option>
+                    <div class="field">
+                        <label for="scanner">Scanner</label>
+                        <select id="scanner" name="scanner" required>
+                            <option value="">Choose scanner</option>
+                            {% for scanner in date_options|map(attribute='scanner')|unique|sort %}
+                                <option value="{{ scanner }}" {% if form_values.scanner == scanner %}selected{% endif %}>{{ scanner }}</option>
                             {% endfor %}
                         </select>
-                        <span class="help">Options come from scanner inventories and must be available in the mounted GT450 images.</span>
                     </div>
+                    <div class="field">
+                        <label for="input_dir">Date directory</label>
+                        <select id="input_dir" name="input_dir" required disabled>
+                            <option value="">Choose date</option>
+                        </select>
+                    </div>
+                    <span class="help field full">Options come from scanner inventories and must be available in the mounted GT450 images.</span>
                 </div>
 
                 <details {% if messages and request.method == 'POST' %}open{% endif %}>
@@ -200,6 +206,20 @@
     <script nonce="{{ csp_nonce() }}">
         const startSelect = document.getElementById('start_from');
         const endSelect = document.getElementById('end_at');
+        const scannerSelect = document.getElementById('scanner');
+        const dateSelect = document.getElementById('input_dir');
+        const dateOptions = {{ date_options|tojson }};
+        const selectedInputDir = {{ form_values.input_dir|tojson }};
+        function updateDateOptions(selectedValue = '') {
+            dateSelect.replaceChildren(new Option('Choose date', ''));
+            for (const option of dateOptions) {
+                if (option.scanner !== scannerSelect.value) continue;
+                dateSelect.add(new Option(option.date, option.value, false, option.value === selectedValue));
+            }
+            dateSelect.disabled = !scannerSelect.value;
+        }
+        scannerSelect.addEventListener('change', () => updateDateOptions());
+        updateDateOptions(selectedInputDir);
         function updateStageRange() {
             const start = Number(startSelect.value);
             for (const option of endSelect.options) option.disabled = Number(option.value) < start;
