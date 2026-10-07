@@ -154,6 +154,7 @@ class PipelineLauncherTests(unittest.TestCase):
         newest.mkdir(parents=True)
         older.mkdir(parents=True)
         inventories.mkdir()
+        batches.mkdir()
         (inventories / "SS100_inventory.csv").write_text(
             "directory\n"
             f"{older}\n{newest}\n{newest}\n"
@@ -198,6 +199,33 @@ class PipelineLauncherTests(unittest.TestCase):
         self.assertEqual(["Choose an available scanner and date directory."], forged_errors)
         self.assertEqual(["Choose an available scanner and date directory."], mismatched_errors)
         self.assertEqual(str(batches / "SS100" / "2026-10-02"), values["output_dir"])
+
+    def test_web_paths_report_unavailable_batch_storage_once(self):
+        root = Path(self.temporary_directory.name)
+        gt450 = root / "gt450"
+        input_dir = gt450 / "SS100" / "2026-10-02"
+        input_dir.mkdir(parents=True)
+        previous = app_module.Config.GT450_IMAGES, app_module.Config.INSLIDE_BATCHES
+        app_module.Config.GT450_IMAGES = str(gt450)
+        app_module.Config.INSLIDE_BATCHES = str(root / "missing-batches")
+        try:
+            values = app_module._pipeline_form_values(
+                {"scanner": "SS100", "input_dir": str(input_dir)}
+            )
+            errors = app_module._pipeline_web_paths(
+                values,
+                [
+                    {
+                        "scanner": "SS100",
+                        "date": "2026-10-02",
+                        "value": str(input_dir),
+                    }
+                ],
+            )
+        finally:
+            app_module.Config.GT450_IMAGES, app_module.Config.INSLIDE_BATCHES = previous
+
+        self.assertEqual(["Label-Check batch storage is unavailable."], errors)
 
     def test_starting_later_requires_the_previous_stage_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -349,9 +377,15 @@ class PipelineLauncherTests(unittest.TestCase):
                     "value": str(input_dir), "label": "SS100/2026-10-02",
                     "scanner": "SS100", "date": "2026-10-02",
                 }
+                app_module.app.config.update(
+                    PIPELINE_INPUT_ROOTS=(str(root / "missing-input-root"),),
+                    PIPELINE_OUTPUT_ROOTS=(str(root / "missing-output-root"),),
+                )
                 with mock.patch.object(app_module, "_pipeline_date_options", return_value=([option], [])), mock.patch.object(
                     app_module, "_start_pipeline_job", return_value=fake_job
                 ) as start_job, mock.patch.object(
+                    app_module.Config, "GT450_IMAGES", str(root)
+                ), mock.patch.object(
                     app_module.Config, "INSLIDE_BATCHES", str(root)
                 ):
                     launch_response = client.post(
@@ -363,6 +397,12 @@ class PipelineLauncherTests(unittest.TestCase):
         self.assertIn(b"Run Label-Check", response.data)
         self.assertEqual(302, launch_response.status_code)
         self.assertTrue(start_job.called)
+        command = start_job.call_args.args[0]
+        self.assertEqual(str(input_dir), command[command.index("--input-dir") + 1])
+        self.assertEqual(
+            str(root / "SS100" / "2026-10-02"),
+            command[command.index("--output-dir") + 1],
+        )
 
 
 if __name__ == "__main__":

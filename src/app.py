@@ -4439,6 +4439,16 @@ def _pipeline_date_options() -> Tuple[List[Dict[str, str]], List[str]]:
 def _pipeline_web_paths(
     values: Dict[str, str], options: Sequence[Dict[str, str]]
 ) -> List[str]:
+    input_root = runtime_path(Config.GT450_IMAGES).expanduser().resolve()
+    output_root = runtime_path(Config.INSLIDE_BATCHES).expanduser().resolve()
+    unavailable = []
+    if not input_root.is_dir():
+        unavailable.append("Scanner image storage is unavailable.")
+    if not output_root.is_dir():
+        unavailable.append("Label-Check batch storage is unavailable.")
+    if unavailable:
+        return unavailable
+
     selected_scanner = values["scanner"].strip()
     selected = values["input_dir"].strip()
     option = next(
@@ -4452,9 +4462,7 @@ def _pipeline_web_paths(
         return ["Choose an available scanner and date directory."]
     values["scanner"] = option["scanner"]
     values["input_dir"] = option["value"]
-    values["output_dir"] = str(
-        Path(Config.INSLIDE_BATCHES) / option["scanner"] / option["date"]
-    )
+    values["output_dir"] = str(output_root / option["scanner"] / option["date"])
     return []
 
 
@@ -4467,7 +4475,12 @@ def _pipeline_extensions(value: str, label: str, errors: List[str]) -> List[str]
     return extensions
 
 
-def _pipeline_command(values: Dict[str, str]) -> Tuple[Optional[List[str]], List[str]]:
+def _pipeline_command(
+    values: Dict[str, str],
+    *,
+    input_roots: Optional[Sequence[Path]] = None,
+    output_roots: Optional[Sequence[Path]] = None,
+) -> Tuple[Optional[List[str]], List[str]]:
     errors: List[str] = []
     input_text = values["input_dir"].strip()
     output_text = values["output_dir"].strip()
@@ -4478,8 +4491,16 @@ def _pipeline_command(values: Dict[str, str]) -> Tuple[Optional[List[str]], List
 
     input_dir = runtime_path(input_text).expanduser().resolve() if input_text else None
     output_dir = runtime_path(output_text).expanduser().resolve() if output_text else None
-    input_roots = _pipeline_allowed_roots("PIPELINE_INPUT_ROOTS")
-    output_roots = _pipeline_allowed_roots("PIPELINE_OUTPUT_ROOTS")
+    input_roots = (
+        list(input_roots)
+        if input_roots is not None
+        else _pipeline_allowed_roots("PIPELINE_INPUT_ROOTS")
+    )
+    output_roots = (
+        list(output_roots)
+        if output_roots is not None
+        else _pipeline_allowed_roots("PIPELINE_OUTPUT_ROOTS")
+    )
     if not input_roots:
         errors.append("Pipeline input roots are not configured.")
     elif any(not root.is_dir() for root in input_roots):
@@ -6046,7 +6067,11 @@ def run_pipeline():
     errors = _pipeline_web_paths(values, date_options)
     command = None
     if not errors:
-        command, errors = _pipeline_command(values)
+        command, errors = _pipeline_command(
+            values,
+            input_roots=(runtime_path(Config.GT450_IMAGES).expanduser().resolve(),),
+            output_roots=(runtime_path(Config.INSLIDE_BATCHES).expanduser().resolve(),),
+        )
     if errors:
         for error in errors:
             flash(error, "error")
