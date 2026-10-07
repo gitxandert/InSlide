@@ -325,6 +325,7 @@ class PipelineLauncherTests(unittest.TestCase):
         self.assertNotIn("shell", popen.call_args.kwargs)
         self.assertIs(app_module.subprocess.PIPE, popen.call_args.kwargs["stdout"])
         self.assertIs(app_module.subprocess.STDOUT, popen.call_args.kwargs["stderr"])
+        self.assertNotIn("bufsize", popen.call_args.kwargs)
         reader_thread.start.assert_called_once_with()
 
     def test_reader_marks_nonzero_exit_as_failed(self):

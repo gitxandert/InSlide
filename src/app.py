@@ -4627,8 +4627,9 @@ def _read_pipeline_output(job: PipelineJob) -> None:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     try:
         if job.process.stdout is not None:
+            read_chunk = getattr(job.process.stdout, "read1", job.process.stdout.read)
             while True:
-                chunk = job.process.stdout.read(4096)
+                chunk = read_chunk(4096)
                 if not chunk:
                     break
                 text = decoder.decode(chunk)
@@ -4716,7 +4717,6 @@ def _start_pipeline_job(
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                bufsize=0,
                 env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
         except OSError:
