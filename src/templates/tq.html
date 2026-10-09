@@ -132,28 +132,33 @@
     </section>
     {% else %}
     <section class="card">
-        <div class="filter-heading">
-            <div><h2>Filter slides</h2><span class="muted">Filters apply to complete catalog.</span></div>
-            <button id="clear-filters" class="secondary" type="button">Clear filters</button>
-        </div>
-        <div class="filters" id="slide-filters">
-            <div class="filter-row exact-filter-row" role="group" aria-label="List filters">
-                <div class="field"><label for="filter-batch">Batch</label><select id="filter-batch" data-exact="batch_name"><option value="">All batches</option></select></div>
-                <div class="field"><label for="filter-type">Type</label><select id="filter-type" data-exact="sdl_types"><option value="">All types</option></select></div>
-                <div class="field"><label for="filter-organ">Organ</label><select id="filter-organ" data-exact="organ"><option value="">All organs</option></select></div>
-                <div class="field"><label for="filter-image">Image type</label><select id="filter-image" data-exact="image_type"><option value="">All image types</option></select></div>
-                <div class="field"><label for="filter-sample">Sample acquisition type</label><select id="filter-sample" data-exact="samp_acq_type"><option value="">All sample types</option></select></div>
+        <form id="search-form">
+            <div class="filter-heading">
+                <div><h2>Filter slides</h2><span class="muted">Choose filters, then search the catalog.</span></div>
+                <div class="actions">
+                    <button id="search-button" type="submit" disabled>Search</button>
+                    <button id="clear-filters" class="secondary" type="button">Clear filters</button>
+                </div>
             </div>
-            <div class="filter-row date-filter-row" role="group" aria-label="Date filters">
-                <div class="field"><span class="field-label">Accession date</span><div class="date-fields"><input type="date" id="accession-start" aria-label="Accession date start"><input type="date" id="accession-end" aria-label="Accession date end"></div></div>
-                <div class="field"><span class="field-label">Digitization date</span><div class="date-fields"><input type="date" id="digitization-start" aria-label="Digitization date start"><input type="date" id="digitization-end" aria-label="Digitization date end"></div></div>
+            <div class="filters" id="slide-filters">
+                <div class="filter-row exact-filter-row" role="group" aria-label="List filters">
+                    <div class="field"><label for="filter-batch">Batch</label><select id="filter-batch" data-exact="batch_name"><option value="">All batches</option></select></div>
+                    <div class="field"><label for="filter-type">Type</label><select id="filter-type" data-exact="sdl_types"><option value="">All types</option></select></div>
+                    <div class="field"><label for="filter-organ">Organ</label><select id="filter-organ" data-exact="organ"><option value="">All organs</option></select></div>
+                    <div class="field"><label for="filter-image">Image type</label><select id="filter-image" data-exact="image_type"><option value="">All image types</option></select></div>
+                    <div class="field"><label for="filter-sample">Sample acquisition type</label><select id="filter-sample" data-exact="samp_acq_type"><option value="">All sample types</option></select></div>
+                </div>
+                <div class="filter-row date-filter-row" role="group" aria-label="Date filters">
+                    <div class="field"><span class="field-label">Accession date</span><div class="date-fields"><input type="date" id="accession-start" aria-label="Accession date start"><input type="date" id="accession-end" aria-label="Accession date end"></div></div>
+                    <div class="field"><span class="field-label">Digitization date</span><div class="date-fields"><input type="date" id="digitization-start" aria-label="Digitization date start"><input type="date" id="digitization-end" aria-label="Digitization date end"></div></div>
+                </div>
+                <div class="filter-row text-filter-groups" id="text-filter-groups" aria-label="Text filters"></div>
             </div>
-            <div class="filter-row text-filter-groups" id="text-filter-groups" aria-label="Text filters"></div>
-        </div>
+        </form>
     </section>
     <section class="card">
         <div class="result-heading">
-            <div><h2>Available slides</h2><span id="result-count" class="muted">Loading catalog…</span></div>
+            <div><h2>Available slides</h2><span id="result-count" class="muted">Choose filters, then Search.</span></div>
         </div>
         <form id="review-form" method="POST" action="{{ url_for('tq_review') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -178,7 +183,7 @@
                     {% endfor %}
                 </div>
                 <div id="virtual-scroll" class="virtual-scroll" tabindex="0">
-                    <div id="virtual-spacer" class="virtual-spacer"><div class="loading">Loading complete transfer catalog…</div></div>
+                    <div id="virtual-spacer" class="virtual-spacer"><div class="loading">Choose filters, then Search.</div></div>
                 </div>
             </div>
         </div>
@@ -196,7 +201,8 @@
 const csrfToken = {{ csrf_token()|tojson }};
 const reviewMode = {{ review|tojson }};
 const draftSelectedIds = new Set({{ selected_ids|list|tojson }});
-const catalogUrl = {{ url_for('tq_catalog_data')|tojson }};
+const catalogOptionsUrl = {{ url_for('tq_catalog_options')|tojson }};
+const catalogSearchUrl = {{ url_for('tq_catalog_search')|tojson }};
 const draftUrl = {{ url_for('tq_save_draft')|tojson }};
 const rowHeight = 58;
 const overscan = 8;
@@ -205,6 +211,9 @@ let filteredSlides = [];
 let sortKey = '';
 let sortDirection = 'asc';
 let draftTimer;
+let searchRequest;
+let hasSearched = false;
+let filtersChanged = false;
 const scrollElement = document.getElementById('virtual-scroll');
 const spacerElement = document.getElementById('virtual-spacer');
 const resultCount = document.getElementById('result-count');
@@ -223,27 +232,12 @@ function displayValue(slide,key) {
     }
     return slide[key] || '';
 }
-function uniqueValues(key) {
-    const values = new Set();
-    allSlides.forEach((slide) => {
-        const candidates = Array.isArray(slide[key]) ? slide[key] : [slide[key]];
-        candidates.forEach((value) => { if (value) values.add(value); });
-    });
-    return Array.from(values).sort((left,right) => left.localeCompare(right,undefined,{sensitivity:'base'}));
-}
-function populateExactFilters() {
+function populateExactFilters(options) {
     document.querySelectorAll('[data-exact]').forEach((select) => {
-        uniqueValues(select.dataset.exact).forEach((value) => {
+        (options[select.dataset.exact] || []).forEach((value) => {
             const option = document.createElement('option'); option.value = value; option.textContent = value; select.appendChild(option);
         });
     });
-}
-function dateInRange(value,start,end,isCompact=false) {
-    if (!start && !end) return true;
-    if (!value) return false;
-    const comparable = isCompact ? value : value.replaceAll('-','');
-    const lower = start.replaceAll('-',''); const upper = end.replaceAll('-','');
-    return (!lower || comparable >= lower) && (!upper || comparable <= upper);
 }
 function createTextCondition(operator='') {
     const condition = document.createElement('div'); condition.className = 'text-filter-condition';
@@ -254,11 +248,11 @@ function createTextCondition(operator='') {
     const field = document.createElement('select'); field.className = 'text-filter-field'; field.setAttribute('aria-label','Text field');
     textFilterFields.forEach(([value,label]) => { const option = document.createElement('option'); option.value = value; option.textContent = label; field.appendChild(option); });
     const contains = document.createElement('span'); contains.className = 'contains-label'; contains.textContent = 'contains';
-    const input = document.createElement('input'); input.type = 'search'; input.className = 'text-filter-value'; input.setAttribute('aria-label','Text to find'); input.autocomplete = 'off';
+    const input = document.createElement('input'); input.type = 'search'; input.className = 'text-filter-value'; input.maxLength = 200; input.setAttribute('aria-label','Text to find'); input.autocomplete = 'off';
     condition.append(field,contains,input);
     if (operator) {
         const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'text-filter-button remove'; remove.textContent = '×'; remove.setAttribute('aria-label',`Remove ${operator.toUpperCase()} condition`);
-        remove.addEventListener('click',() => { condition.remove(); applyFilters(); }); condition.appendChild(remove);
+        remove.addEventListener('click',() => { condition.remove(); markFiltersChanged(); }); condition.appendChild(remove);
     }
     return condition;
 }
@@ -278,7 +272,7 @@ function createTextFilterGroup(operator='') {
     line.append(conditions,conditionActions);
     if (operator) {
         const removeGroup = document.createElement('button'); removeGroup.type = 'button'; removeGroup.className = 'text-filter-button remove'; removeGroup.textContent = 'Remove row';
-        removeGroup.addEventListener('click',() => { group.remove(); applyFilters(); }); line.appendChild(removeGroup);
+        removeGroup.addEventListener('click',() => { group.remove(); markFiltersChanged(); }); line.appendChild(removeGroup);
     }
     const rowActions = document.createElement('div'); rowActions.className = 'row-actions';
     ['and','or'].forEach((nextOperator) => {
@@ -290,49 +284,30 @@ function createTextFilterGroup(operator='') {
 function resetTextFilters() {
     if (textFilterGroups) textFilterGroups.replaceChildren(createTextFilterGroup());
 }
-function evaluateTextGroup(slide,group) {
-    const activeConditions = Array.from(group.querySelectorAll('.text-filter-condition')).map((condition) => ({
+function textFilterPayload() {
+    const groups = Array.from(textFilterGroups?.querySelectorAll('.text-filter-group') || []).map((group) => ({
+        operator: group.dataset.operator,
+        conditions: Array.from(group.querySelectorAll('.text-filter-condition')).map((condition) => ({
             operator: condition.dataset.operator,
             field: condition.querySelector('.text-filter-field').value,
             term: condition.querySelector('.text-filter-value').value.trim()
-        })).filter(({term}) => term);
-    if (!activeConditions.length) return null;
-    let matches = normalized(slide[activeConditions[0].field]).includes(normalized(activeConditions[0].term));
-    activeConditions.slice(1).forEach(({operator,field,term}) => {
-        const conditionMatches = normalized(slide[field]).includes(normalized(term));
-        matches = operator === 'and' ? matches && conditionMatches : matches || conditionMatches;
+        })).filter(({term}) => term)
+    })).filter(({conditions}) => conditions.length);
+    groups.forEach((group,groupIndex) => {
+        group.operator = groupIndex ? group.operator : '';
+        group.conditions.forEach((condition,conditionIndex) => { condition.operator = conditionIndex ? condition.operator : ''; });
     });
-    return matches;
+    return groups;
 }
-function textFiltersMatch(slide) {
-    if (!textFilterGroups) return true;
-    const activeGroups = Array.from(textFilterGroups.querySelectorAll('.text-filter-group')).map((group) => ({
-        operator: group.dataset.operator,
-        matches: evaluateTextGroup(slide,group)
-    })).filter(({matches}) => matches !== null);
-    if (!activeGroups.length) return true;
-    let matches = activeGroups[0].matches;
-    activeGroups.slice(1).forEach((group) => { matches = group.operator === 'and' ? matches && group.matches : matches || group.matches; });
-    return matches;
-}
-function applyFilters() {
-    const exactFilters = Array.from(document.querySelectorAll('[data-exact]'));
-    const accessionStart = document.getElementById('accession-start')?.value || '';
-    const accessionEnd = document.getElementById('accession-end')?.value || '';
-    const digitizationStart = document.getElementById('digitization-start')?.value || '';
-    const digitizationEnd = document.getElementById('digitization-end')?.value || '';
-    const source = reviewMode ? allSlides.filter((slide) => draftSelectedIds.has(slide.id)) : allSlides;
-    filteredSlides = source.filter((slide) => {
-        const exactMatch = exactFilters.every((select) => {
-            if (!select.value) return true;
-            const candidate = slide[select.dataset.exact];
-            return Array.isArray(candidate) ? candidate.includes(select.value) : candidate === select.value;
-        });
-        return exactMatch && textFiltersMatch(slide)
-            && dateInRange(slide.accession_date || '',accessionStart,accessionEnd,true)
-            && dateInRange(slide.digitization_date || '',digitizationStart,digitizationEnd);
-    });
-    sortSlides(); scrollElement.scrollTop = 0; renderRows(); updateCounts();
+function filterPayload() {
+    const exact = {};
+    document.querySelectorAll('[data-exact]').forEach((select) => { exact[select.dataset.exact] = select.value; });
+    return {exact,dates:{
+        accession_start:document.getElementById('accession-start')?.value || '',
+        accession_end:document.getElementById('accession-end')?.value || '',
+        digitization_start:document.getElementById('digitization-start')?.value || '',
+        digitization_end:document.getElementById('digitization-end')?.value || ''
+    },text_groups:textFilterPayload()};
 }
 function sortSlides() {
     if (!sortKey) return;
@@ -348,7 +323,9 @@ function makeCell(value,className='') {
 function renderRows() {
     spacerElement.replaceChildren(); spacerElement.style.height = `${filteredSlides.length * rowHeight}px`;
     if (!filteredSlides.length) {
-        const empty = document.createElement('div'); empty.className = 'loading'; empty.textContent = allSlides.length ? 'No slides match current filters.' : 'No completed slides are available.'; spacerElement.appendChild(empty); return;
+        const empty = document.createElement('div'); empty.className = 'loading';
+        empty.textContent = !hasSearched ? 'Choose filters, then Search.' : (reviewMode ? 'No selected slides remain available.' : 'No slides match current filters.');
+        spacerElement.appendChild(empty); return;
     }
     const first = Math.max(0,Math.floor(scrollElement.scrollTop / rowHeight) - overscan);
     const visibleCount = Math.ceil(scrollElement.clientHeight / rowHeight) + overscan * 2;
@@ -371,9 +348,9 @@ function renderRows() {
     }
 }
 function updateCounts() {
-    const availableIds = new Set(allSlides.map((slide) => slide.id));
-    const selectedCount = Array.from(draftSelectedIds).filter((id) => availableIds.has(id)).length;
-    resultCount.textContent = reviewMode ? `${filteredSlides.length} selected slide(s)` : `${filteredSlides.length} matching slide(s) · ${selectedCount} selected`;
+    const selectedCount = draftSelectedIds.size;
+    if (!hasSearched && !reviewMode) resultCount.textContent = 'Choose filters, then Search.';
+    else resultCount.textContent = reviewMode ? `${filteredSlides.length} selected slide(s)` : `${filteredSlides.length} matching slide(s) · ${selectedCount} selected${filtersChanged ? ' · Filters changed; Search to refresh' : ''}`;
     const header = document.getElementById('select-filtered');
     if (header) { const checked = filteredSlides.filter((slide) => draftSelectedIds.has(slide.id)).length; header.checked = filteredSlides.length > 0 && checked === filteredSlides.length; header.indeterminate = checked > 0 && checked < filteredSlides.length; }
     const reviewButton = document.getElementById('review-button'); if (reviewButton) reviewButton.disabled = selectedCount === 0;
@@ -387,15 +364,40 @@ function scheduleDraftSave(phase='select') { window.clearTimeout(draftTimer); dr
 function showCatalogError(error) { const notice = document.getElementById('catalog-error'); notice.textContent = error.message || String(error); notice.hidden = false; }
 function showWarnings(warnings) {
     if (!warnings?.length) return;
-    const list = document.getElementById('messages'); warnings.forEach((warning) => { const item = document.createElement('li'); item.textContent = warning; list.appendChild(item); }); list.hidden = false;
+    const list = document.getElementById('messages'); const existing = new Set(Array.from(list.children,(item) => item.textContent));
+    warnings.forEach((warning) => { if (!existing.has(warning)) { const item = document.createElement('li'); item.textContent = warning; list.appendChild(item); existing.add(warning); } }); list.hidden = false;
+}
+function markFiltersChanged() { if (hasSearched) { filtersChanged = true; updateCounts(); } }
+async function loadSlides(payload) {
+    searchRequest?.abort(); const controller = new AbortController(); searchRequest = controller;
+    const searchButton = document.getElementById('search-button'); if (searchButton) searchButton.disabled = true;
+    document.getElementById('catalog-error').hidden = true;
+    resultCount.textContent = reviewMode ? 'Loading selected slides…' : 'Searching…';
+    try {
+        const response = await fetch(catalogSearchUrl,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},body:JSON.stringify(payload),signal:controller.signal});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || `Catalog search failed (${response.status})`);
+        allSlides = data.slides || []; filteredSlides = allSlides.slice(); hasSearched = true; filtersChanged = false;
+        if (reviewMode) {
+            const availableIds = new Set(allSlides.map((slide) => slide.id)); let removed = false;
+            draftSelectedIds.forEach((id) => { if (!availableIds.has(id)) { draftSelectedIds.delete(id); removed = true; } });
+            if (removed) scheduleDraftSave('review');
+        }
+        sortSlides(); scrollElement.scrollTop = 0; renderRows(); updateCounts(); showWarnings(data.warnings);
+    } catch (error) {
+        if (error.name !== 'AbortError') { showCatalogError(error); if (!hasSearched) resultCount.textContent = 'Search failed.'; }
+    } finally {
+        if (searchButton && searchRequest === controller) searchButton.disabled = false;
+    }
 }
 
 scrollElement.addEventListener('scroll',renderRows,{passive:true});
 resetTextFilters();
-document.querySelectorAll('[data-exact],input[type="date"]').forEach((control) => control.addEventListener('change',applyFilters));
-textFilterGroups?.addEventListener('input',(event) => { if (event.target.matches('.text-filter-value')) applyFilters(); });
-textFilterGroups?.addEventListener('change',(event) => { if (event.target.matches('.text-filter-field')) applyFilters(); });
-document.getElementById('clear-filters')?.addEventListener('click',() => { document.querySelectorAll('[data-exact],input[type="date"]').forEach((control) => { control.value = ''; }); resetTextFilters(); applyFilters(); });
+document.querySelectorAll('[data-exact],input[type="date"]').forEach((control) => control.addEventListener('change',markFiltersChanged));
+textFilterGroups?.addEventListener('input',(event) => { if (event.target.matches('.text-filter-value')) markFiltersChanged(); });
+textFilterGroups?.addEventListener('change',(event) => { if (event.target.matches('.text-filter-field')) markFiltersChanged(); });
+document.getElementById('clear-filters')?.addEventListener('click',() => { document.querySelectorAll('[data-exact],input[type="date"]').forEach((control) => { control.value = ''; }); resetTextFilters(); markFiltersChanged(); });
+document.getElementById('search-form')?.addEventListener('submit',(event) => { event.preventDefault(); loadSlides({filters:filterPayload()}); });
 document.querySelectorAll('[data-sort]').forEach((button) => {
     button.addEventListener('click',() => { const nextKey = button.dataset.sort; sortDirection = sortKey === nextKey && sortDirection === 'asc' ? 'desc' : 'asc'; sortKey = nextKey; document.querySelectorAll('[data-sort]').forEach((item) => item.removeAttribute('data-direction')); button.dataset.direction = sortDirection; sortSlides(); renderRows(); });
 });
@@ -409,14 +411,10 @@ function saveReviewDraft() {
 }
 destinationDir?.addEventListener('input',saveReviewDraft); includeCopath?.addEventListener('change',saveReviewDraft);
 
-fetch(catalogUrl,{cache:'no-store'})
-    .then((response) => { if (!response.ok) throw new Error(`Catalog request failed (${response.status})`); return response.json(); })
-    .then((data) => {
-        allSlides = data.slides || [];
-        const availableIds = new Set(allSlides.map((slide) => slide.id)); let removed = false;
-        draftSelectedIds.forEach((id) => { if (!availableIds.has(id)) { draftSelectedIds.delete(id); removed = true; } });
-        populateExactFilters(); applyFilters(); showWarnings(data.warnings); if (removed) scheduleDraftSave(reviewMode ? 'review' : 'select');
-    })
+if (reviewMode) loadSlides({selected_ids:Array.from(draftSelectedIds)});
+else fetch(catalogOptionsUrl,{cache:'no-store'})
+    .then((response) => { if (!response.ok) throw new Error(`Catalog options request failed (${response.status})`); return response.json(); })
+    .then((data) => { populateExactFilters(data.options || {}); showWarnings(data.warnings); updateCounts(); document.getElementById('search-button').disabled = false; })
     .catch(showCatalogError);
 
 {% if job %}

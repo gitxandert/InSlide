@@ -202,6 +202,14 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(2, len(slides))
         return slides
 
+    def search(self, filters=None, selected_ids=None):
+        payload = (
+            {"selected_ids": selected_ids}
+            if selected_ids is not None
+            else {"filters": filters or {}}
+        )
+        return self.client.post("/tq/catalog/search", json=payload)
+
     def write_copath_record(self, **values):
         row = {field: "" for field in renaming.COPATH_FIELDS}
         row.update(
@@ -263,7 +271,7 @@ class TQTransferTests(unittest.TestCase):
         self.assertTrue(
             all(slide["sdl_types"] == ["NONE"] for slide in missing_slides)
         )
-        response = self.client.get("/tq/catalog")
+        response = self.search()
         self.assertEqual(200, response.status_code)
         self.assertTrue(
             all(
@@ -286,7 +294,7 @@ class TQTransferTests(unittest.TestCase):
         workbook.close()
 
         slides, warnings = app_module._tq_catalog()
-        response = self.client.get("/tq/catalog")
+        response = self.search()
 
         self.assertEqual(["PROSP"], slides[0]["sdl_types"])
         self.assertIn("contrasting Types", warnings[0])
@@ -353,7 +361,8 @@ class TQTransferTests(unittest.TestCase):
     def test_page_contains_client_filters_and_transfer_navigation(self):
         self.catalog()
         response = self.client.get("/tq")
-        catalog = self.client.get("/tq/catalog")
+        options = self.client.get("/tq/catalog/options")
+        catalog = self.search()
 
         self.assertEqual(200, response.status_code)
         self.assertIn(b"Transfers", response.data)
@@ -362,12 +371,60 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b'class="filter-row exact-filter-row"', response.data)
         self.assertIn(b'class="filter-row date-filter-row"', response.data)
         self.assertIn(b'id="text-filter-groups"', response.data)
+        self.assertIn(b'id="search-button"', response.data)
+        self.assertIn(b"All batches", response.data)
+        self.assertIn(b"All types", response.data)
+        self.assertIn(b"Choose filters, then Search.", response.data)
         self.assertIn(b"conditionActions", response.data)
         self.assertIn(b"rowActions", response.data)
         self.assertEqual(2, response.data.count(b"['and','or'].forEach"))
-        self.assertIn(b"evaluateTextGroup", response.data)
+        self.assertIn(b"textFilterPayload", response.data)
+        self.assertEqual("no-store", options.headers["Cache-Control"])
+        self.assertEqual(["BRAIN"], options.get_json()["options"]["organ"])
         self.assertEqual("no-store", catalog.headers["Cache-Control"])
         self.assertEqual("AAAAAA", catalog.get_json()["slides"][0]["pid"])
+
+    def test_catalog_search_applies_server_side_filters(self):
+        self.catalog()
+        response = self.search(
+            {
+                "exact": {"organ": "BRAIN", "sdl_types": "PROSP"},
+                "dates": {
+                    "accession_start": "2025-01-01",
+                    "accession_end": "2025-01-01",
+                    "digitization_start": "2026-07-20",
+                    "digitization_end": "2026-07-20",
+                },
+                "text_groups": [
+                    {
+                        "operator": "",
+                        "conditions": [
+                            {"operator": "", "field": "stain", "term": "missing"},
+                            {"operator": "or", "field": "section_count", "term": "002"},
+                        ],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(200, response.status_code)
+        slides = response.get_json()["slides"]
+        self.assertEqual(["002"], [slide["section_count"] for slide in slides])
+
+        all_slides = self.search()
+        self.assertEqual(2, len(all_slides.get_json()["slides"]))
+
+    def test_catalog_search_rejects_invalid_filters(self):
+        self.catalog()
+
+        backwards = self.search(
+            {"dates": {"accession_start": "2025-02-01", "accession_end": "2025-01-01"}}
+        )
+        unknown = self.search({"exact": {"unknown": "value"}})
+
+        self.assertEqual(400, backwards.status_code)
+        self.assertIn("must not be after", backwards.get_json()["message"])
+        self.assertEqual(400, unknown.status_code)
 
     def test_unchanged_catalog_is_served_without_reparsing_mapping(self):
         self.catalog()
@@ -390,7 +447,7 @@ class TQTransferTests(unittest.TestCase):
         )
         (self.batch / "name_mapping.csv").unlink()
 
-        response = self.client.get("/tq/catalog")
+        response = self.search()
 
         self.assertEqual(200, response.status_code)
         self.assertEqual(2, len(response.get_json()["slides"]))
@@ -411,7 +468,7 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual([], hidden)
         self.assertEqual(2, len(visible))
 
-    def test_large_transfer_catalog_loads_all_rows_into_virtual_table(self):
+    def test_large_transfer_catalog_loads_rows_only_after_search(self):
         prototype = self.catalog()[0]
         slides = []
         for index in range(7000):
@@ -423,9 +480,10 @@ class TQTransferTests(unittest.TestCase):
 
         with mock.patch.object(
             app_module.batch_catalog, "list_transfer_slides", return_value=slides
-        ):
+        ) as list_slides:
             page = self.client.get("/tq")
-            catalog = self.client.get("/tq/catalog")
+            self.assertEqual(0, list_slides.call_count)
+            catalog = self.search()
 
         self.assertEqual(200, page.status_code)
         self.assertEqual(7000, len(catalog.get_json()["slides"]))
@@ -515,8 +573,10 @@ class TQTransferTests(unittest.TestCase):
 
     def test_catalog_endpoint_requires_login(self):
         anonymous = app_module.app.test_client()
-        response = anonymous.get("/tq/catalog")
-        self.assertEqual(302, response.status_code)
+        options = anonymous.get("/tq/catalog/options")
+        search = anonymous.post("/tq/catalog/search", json={"filters": {}})
+        self.assertEqual(302, options.status_code)
+        self.assertEqual(302, search.status_code)
 
     def test_review_and_transfer_route_use_authoritative_mapping_values(self):
         slides = self.catalog()

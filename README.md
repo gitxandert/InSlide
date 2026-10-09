@@ -109,11 +109,13 @@ page requests. Unexpected external edits are reported as conflicts and are
 not imported.
 
 The same database stores a derived transfer-slide catalog populated from each
-batch's `name_mapping.csv` and the Slide Digitization Log. Transfer pages load
-every catalog row for batches whose existing `renamed_complete` state is true,
-then filter, sort, select, and virtually render those rows in the browser.
-Background reconciliation rebuilds changed sources; slides without an SDL type
-appear under `NONE`. CSV and SDL files remain the authoritative source data.
+batch's `name_mapping.csv` and the Slide Digitization Log. Transfer pages first
+load distinct filter choices, then query and virtually render matching slides
+when the operator selects **Search**. A search with every filter set to **All**
+returns the complete catalog for batches whose existing `renamed_complete`
+state is true. Background reconciliation rebuilds changed sources; slides
+without an SDL type appear under `NONE`. CSV and SDL files remain the
+authoritative source data.
 
 Before the first catalog-aware deployment, stop the InSlide container and
 validate legacy state from a PowerShell prompt:

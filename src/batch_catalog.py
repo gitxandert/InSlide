@@ -1274,11 +1274,102 @@ class BatchCatalog:
                 (signature,),
             )
 
-    def list_transfer_slides(self, instance_dir: str | Path) -> list[dict]:
-        """Return transfer rows belonging to healthy, finalized batches."""
+    def list_transfer_slides(
+        self,
+        instance_dir: str | Path,
+        filters: Optional[Mapping[str, object]] = None,
+        slide_ids: Optional[Iterable[str]] = None,
+    ) -> list[dict]:
+        """Return matching transfer rows from healthy, finalized batches."""
+        exact_columns = {
+            "batch_name": "b.scanner_name || '/' || b.batch_name",
+            "organ": "s.organ",
+            "image_type": "s.image_type",
+            "samp_acq_type": "s.samp_acq_type",
+        }
+        text_columns = {
+            "stain": "s.stain",
+            "accession": "s.accession",
+            "pid": "s.pid",
+            "block_number": "s.block_number",
+            "section_count": "s.section_count",
+            "original_path": "s.original_path",
+            "destination_name": "s.destination_name",
+        }
+        conditions = [
+            "b.renamed_complete=1",
+            "b.validity='ready'",
+            "source.status='ready'",
+        ]
+        parameters: list[object] = []
+        selected_ids = None if slide_ids is None else list(slide_ids)
+        if selected_ids is not None:
+            if not selected_ids:
+                return []
+            conditions.append(
+                f"s.slide_id IN ({','.join('?' for _ in selected_ids)})"
+            )
+            parameters.extend(selected_ids)
+
+        active_filters = filters or {}
+        exact = active_filters.get("exact", {})
+        if isinstance(exact, Mapping):
+            for key, column in exact_columns.items():
+                value = exact.get(key)
+                if value:
+                    conditions.append(f"{column}=?")
+                    parameters.append(value)
+            slide_type = exact.get("sdl_types")
+            if slide_type:
+                conditions.append(
+                    "EXISTS (SELECT 1 FROM transfer_slide_types selected_type "
+                    "WHERE selected_type.slide_id=s.slide_id "
+                    "AND selected_type.slide_type=?)"
+                )
+                parameters.append(slide_type)
+
+        dates = active_filters.get("dates", {})
+        if isinstance(dates, Mapping):
+            for key, column, operator, compact in (
+                ("accession_start", "s.accession_date", ">=", True),
+                ("accession_end", "s.accession_date", "<=", True),
+                ("digitization_start", "s.digitization_date", ">=", False),
+                ("digitization_end", "s.digitization_date", "<=", False),
+            ):
+                value = dates.get(key)
+                if value:
+                    conditions.append(f"{column}<>'' AND {column}{operator}?")
+                    parameters.append(str(value).replace("-", "") if compact else value)
+
+        text_sql = ""
+        text_parameters: list[object] = []
+        for group in active_filters.get("text_groups", []):
+            group_sql = ""
+            group_parameters: list[object] = []
+            for condition in group.get("conditions", []):
+                column = text_columns[condition["field"]]
+                term_sql = f"instr(lower(COALESCE({column},'')),lower(?))>0"
+                if not group_sql:
+                    group_sql = term_sql
+                else:
+                    operator = "AND" if condition["operator"] == "and" else "OR"
+                    group_sql = f"({group_sql} {operator} {term_sql})"
+                group_parameters.append(condition["term"])
+            if not group_sql:
+                continue
+            if text_sql:
+                operator = "AND" if group["operator"] == "and" else "OR"
+                text_sql = f"({text_sql} {operator} ({group_sql}))"
+            else:
+                text_sql = group_sql
+            text_parameters.extend(group_parameters)
+        if text_sql:
+            conditions.append(text_sql)
+            parameters.extend(text_parameters)
+
         with self.connection(instance_dir) as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT s.*, b.public_id AS batch_public_id,
                        b.scanner_name || '/' || b.batch_name AS batch_name,
                        GROUP_CONCAT(t.slide_type, char(31)) AS sdl_types
@@ -1287,11 +1378,11 @@ class BatchCatalog:
                 JOIN transfer_sources source
                   ON source.batch_id=b.id AND source.source_kind='mapping'
                 LEFT JOIN transfer_slide_types t ON t.slide_id=s.slide_id
-                WHERE b.renamed_complete=1 AND b.validity='ready'
-                  AND source.status='ready'
+                WHERE {' AND '.join(f'({item})' for item in conditions)}
                 GROUP BY s.slide_id
                 ORDER BY s.rowid
-                """
+                """,
+                parameters,
             ).fetchall()
         result = []
         for raw in rows:
@@ -1303,6 +1394,46 @@ class BatchCatalog:
             row.pop("accession_key", None)
             row.pop("raw_original_path", None)
             result.append(row)
+        return result
+
+    def transfer_filter_options(self, instance_dir: str | Path) -> dict[str, list[str]]:
+        """Return distinct categorical values without loading transfer rows."""
+        columns = {
+            "batch_name": "b.scanner_name || '/' || b.batch_name",
+            "organ": "s.organ",
+            "image_type": "s.image_type",
+            "samp_acq_type": "s.samp_acq_type",
+        }
+        result: dict[str, list[str]] = {}
+        with self.connection(instance_dir) as connection:
+            for key, column in columns.items():
+                rows = connection.execute(
+                    f"""
+                    SELECT DISTINCT {column} AS value
+                    FROM transfer_slides s
+                    JOIN batches b ON b.id=s.batch_id
+                    JOIN transfer_sources source
+                      ON source.batch_id=b.id AND source.source_kind='mapping'
+                    WHERE b.renamed_complete=1 AND b.validity='ready'
+                      AND source.status='ready' AND {column}<>''
+                    ORDER BY value COLLATE NOCASE
+                    """
+                ).fetchall()
+                result[key] = [str(row["value"]) for row in rows]
+            rows = connection.execute(
+                """
+                SELECT DISTINCT t.slide_type AS value
+                FROM transfer_slide_types t
+                JOIN transfer_slides s ON s.slide_id=t.slide_id
+                JOIN batches b ON b.id=s.batch_id
+                JOIN transfer_sources source
+                  ON source.batch_id=b.id AND source.source_kind='mapping'
+                WHERE b.renamed_complete=1 AND b.validity='ready'
+                  AND source.status='ready' AND t.slide_type<>''
+                ORDER BY value COLLATE NOCASE
+                """
+            ).fetchall()
+            result["sdl_types"] = [str(row["value"]) for row in rows]
         return result
 
     def list_transfer_warnings(self, instance_dir: str | Path) -> list[str]:

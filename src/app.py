@@ -46,7 +46,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path, PureWindowsPath
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import urlsplit
 
 import click
@@ -2260,7 +2260,7 @@ def _catalog_reconciler() -> None:
                         )
             _refresh_pipeline_date_options()
             _refresh_copath_report_index()
-            _tq_catalog()
+            _tq_prepare_catalog()
             app.logger.info(
                 "CATALOG_RECONCILE status=succeeded duration_ms=%d",
                 round((time.monotonic() - started) * 1000),
@@ -3819,7 +3819,7 @@ def _tq_rebuild_catalog(
     return warnings
 
 
-def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
+def _tq_prepare_catalog() -> Tuple[List[BatchContext], List[str]]:
     batches, warnings = discover_batches()
     signature = _tq_catalog_signature(batches)
     with _tq_catalog_lock:
@@ -3828,10 +3828,20 @@ def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
         )
         if stored_signature != signature:
             warnings.extend(_tq_rebuild_catalog(batches, signature))
-    slides = batch_catalog.list_transfer_slides(Config.INSTANCE_DIR)
     for warning in batch_catalog.list_transfer_warnings(Config.INSTANCE_DIR):
         if warning and warning not in warnings:
             warnings.append(warning)
+    return batches, warnings
+
+
+def _tq_catalog(
+    filters: Optional[Mapping[str, object]] = None,
+    slide_ids: Optional[Iterable[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    batches, warnings = _tq_prepare_catalog()
+    slides = batch_catalog.list_transfer_slides(
+        Config.INSTANCE_DIR, filters=filters, slide_ids=slide_ids
+    )
     roots = {context.id: context.root for context in batches}
     for slide in slides:
         slide["batch_root"] = str(roots.get(slide["batch_id"], ""))
@@ -5842,11 +5852,134 @@ def tq_page():
     )
 
 
-@app.route("/tq/catalog", methods=["GET"])
+_TQ_EXACT_FILTERS = {
+    "batch_name",
+    "sdl_types",
+    "organ",
+    "image_type",
+    "samp_acq_type",
+}
+_TQ_TEXT_FILTERS = {
+    "stain",
+    "accession",
+    "pid",
+    "block_number",
+    "section_count",
+    "original_path",
+    "destination_name",
+}
+_TQ_DATE_FILTERS = {
+    "accession_start",
+    "accession_end",
+    "digitization_start",
+    "digitization_end",
+}
+
+
+def _tq_search_payload(payload: object) -> Tuple[Dict[str, object], Optional[List[str]]]:
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid search request.")
+    if "selected_ids" in payload:
+        selected_ids = payload["selected_ids"]
+        if (
+            not isinstance(selected_ids, list)
+            or any(
+                not isinstance(value, str)
+                or not re.fullmatch(r"[a-f0-9]{24}", value)
+                for value in selected_ids
+            )
+        ):
+            raise ValueError("Invalid slide selection.")
+        return {}, selected_ids
+
+    raw_filters = payload.get("filters", {})
+    if not isinstance(raw_filters, dict):
+        raise ValueError("Invalid filters.")
+    raw_exact = raw_filters.get("exact", {})
+    raw_dates = raw_filters.get("dates", {})
+    raw_groups = raw_filters.get("text_groups", [])
+    if not isinstance(raw_exact, dict) or set(raw_exact) - _TQ_EXACT_FILTERS:
+        raise ValueError("Invalid list filter.")
+    if not isinstance(raw_dates, dict) or set(raw_dates) - _TQ_DATE_FILTERS:
+        raise ValueError("Invalid date filter.")
+    if not isinstance(raw_groups, list) or len(raw_groups) > 20:
+        raise ValueError("Invalid text filters.")
+
+    exact: Dict[str, str] = {}
+    for key, value in raw_exact.items():
+        if not isinstance(value, str) or len(value) > 200:
+            raise ValueError("Invalid list filter.")
+        if value:
+            exact[key] = value
+
+    dates: Dict[str, str] = {}
+    for key, value in raw_dates.items():
+        if not isinstance(value, str):
+            raise ValueError("Invalid date filter.")
+        if value:
+            try:
+                datetime.date.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError("Invalid date filter.") from exc
+            dates[key] = value
+    for prefix in ("accession", "digitization"):
+        start = dates.get(f"{prefix}_start")
+        end = dates.get(f"{prefix}_end")
+        if start and end and start > end:
+            raise ValueError("Date filter start must not be after its end.")
+
+    text_groups: List[Dict[str, object]] = []
+    for group_index, raw_group in enumerate(raw_groups):
+        if not isinstance(raw_group, dict):
+            raise ValueError("Invalid text filters.")
+        group_operator = raw_group.get("operator", "")
+        if group_operator not in ({""} if group_index == 0 else {"and", "or"}):
+            raise ValueError("Invalid text filter operator.")
+        raw_conditions = raw_group.get("conditions", [])
+        if not isinstance(raw_conditions, list) or len(raw_conditions) > 20:
+            raise ValueError("Invalid text filters.")
+        conditions: List[Dict[str, str]] = []
+        for condition_index, raw_condition in enumerate(raw_conditions):
+            if not isinstance(raw_condition, dict):
+                raise ValueError("Invalid text filters.")
+            operator = raw_condition.get("operator", "")
+            if operator not in ({""} if condition_index == 0 else {"and", "or"}):
+                raise ValueError("Invalid text filter operator.")
+            field = raw_condition.get("field")
+            term = raw_condition.get("term")
+            if field not in _TQ_TEXT_FILTERS or not isinstance(term, str) or len(term) > 200:
+                raise ValueError("Invalid text filter.")
+            if term.strip():
+                conditions.append(
+                    {"operator": operator, "field": field, "term": term.strip()}
+                )
+        if conditions:
+            text_groups.append(
+                {"operator": group_operator, "conditions": conditions}
+            )
+    return {"exact": exact, "dates": dates, "text_groups": text_groups}, None
+
+
+@app.route("/tq/catalog/options", methods=["GET"])
 @login_required
-def tq_catalog_data():
-    """Return one complete client-side record for every transferable slide."""
-    slides, warnings = _tq_catalog()
+def tq_catalog_options():
+    """Return categorical filter choices without loading slide records."""
+    _, warnings = _tq_prepare_catalog()
+    options = batch_catalog.transfer_filter_options(Config.INSTANCE_DIR)
+    response = jsonify({"options": options, "warnings": warnings})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/tq/catalog/search", methods=["POST"])
+@login_required
+def tq_catalog_search():
+    """Return slides matching submitted filters or selected IDs."""
+    try:
+        filters, selected_ids = _tq_search_payload(request.get_json(silent=True))
+    except ValueError as exc:
+        return jsonify({"success": False, "message": str(exc)}), 400
+    slides, warnings = _tq_catalog(filters=filters, slide_ids=selected_ids)
     response = jsonify({"slides": slides, "warnings": warnings})
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -5860,7 +5993,7 @@ def tq_review():
         with _tq_state_lock:
             draft = _tq_drafts.get(str(current_user.id))
             requested_ids = set(draft["selected_ids"]) if draft else set()
-    all_slides, _ = _tq_catalog()
+    all_slides, _ = _tq_catalog(slide_ids=requested_ids)
     valid_ids = {slide["id"] for slide in all_slides}
     selected_ids = requested_ids.intersection(valid_ids)
     if not selected_ids:
@@ -5944,7 +6077,7 @@ def tq_transfer():
     with _tq_state_lock:
         draft = _tq_drafts.get(owner_id)
         selected_ids = set(draft["selected_ids"]) if draft else set()
-    all_slides, _ = _tq_catalog()
+    all_slides, _ = _tq_catalog(slide_ids=selected_ids)
     by_id = {slide["id"]: slide for slide in all_slides}
     selected = [
         dict(by_id[slide_id])
@@ -6528,7 +6661,7 @@ def renaming_approve(batch_id: str):
                 _update_sdl_after_renaming(context.root)
                 context.mark_renamed_complete()
             try:
-                _tq_catalog()
+                _tq_prepare_catalog()
             except Exception:
                 app.logger.exception(
                     "Could not refresh transfer catalog after finalizing batch %s",
