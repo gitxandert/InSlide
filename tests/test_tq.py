@@ -145,6 +145,8 @@ class TQTransferTests(unittest.TestCase):
         }
         app_module.Config.INSLIDE_BATCHES = str(self.batch_base)
         app_module.Config.INSTANCE_DIR = str(self.root / "instance")
+        self.old_testing = app_module.app.config["TESTING"]
+        app_module.app.config.update(TESTING=True, SECRET_KEY="tq-test")
         app_module.batch_contexts.clear()
         catalog_batches, _ = app_module.discover_batches()
         app_module.batch_catalog.update_stages(
@@ -172,7 +174,6 @@ class TQTransferTests(unittest.TestCase):
         self.admin = app_module.User("tq-admin", "", is_admin=True)
         app_module.user_manager.users[self.user.id] = self.user
         app_module.user_manager.users[self.admin.id] = self.admin
-        app_module.app.config.update(TESTING=True, SECRET_KEY="tq-test")
         self.client = app_module.app.test_client()
         with self.client.session_transaction() as session:
             session["_user_id"] = self.user.id
@@ -192,6 +193,7 @@ class TQTransferTests(unittest.TestCase):
             app_module._tq_jobs.clear()
             app_module._tq_active_job_id = None
         app_module.user_manager.users = self.old_users
+        app_module.app.config["TESTING"] = self.old_testing
         self.temporary.cleanup()
 
     def catalog(self):
@@ -828,6 +830,7 @@ class TQTransferTests(unittest.TestCase):
 
     def test_copath_export_rejects_conflicting_batch_records(self):
         first = self.write_copath_record()
+        slides = [dict(self.catalog()[0])]
         other_batch = self.batch_base / "SS12798" / "2026-07-21"
         second = dict(first, report="Different diagnosis text")
         write_csv(
@@ -835,7 +838,6 @@ class TQTransferTests(unittest.TestCase):
             renaming.COPATH_FIELDS,
             [second],
         )
-        slides = [dict(self.catalog()[0])]
         other_slide = dict(slides[0], batch_root=str(other_batch))
 
         with self.assertRaisesRegex(app_module.TQError, "Conflicting CoPath"):

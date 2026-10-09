@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -12,8 +13,9 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 QUEUE_STATUSES = {"pending", "leased", "completed"}
+DOCUMENT_KINDS = {"enriched", "name_mapping"}
 
 
 def utc_now() -> str:
@@ -102,6 +104,9 @@ class BatchCatalog:
                             CHECK(validity IN ('ready','invalid','missing')),
                         validation_error TEXT NOT NULL DEFAULT '',
                         slide_count INTEGER NOT NULL DEFAULT 0 CHECK(slide_count >= 0),
+                        pending_count INTEGER NOT NULL DEFAULT 0 CHECK(pending_count >= 0),
+                        leased_count INTEGER NOT NULL DEFAULT 0 CHECK(leased_count >= 0),
+                        completed_count INTEGER NOT NULL DEFAULT 0 CHECK(completed_count >= 0),
                         enriched_mtime_ns INTEGER,
                         mapping_mtime_ns INTEGER,
                         history_mtime_ns INTEGER,
@@ -127,6 +132,60 @@ class BatchCatalog:
                         ON queue_items(leased_by_id, status);
                     CREATE INDEX IF NOT EXISTS queue_completion_owner
                         ON queue_items(completed_by_id, completed_at);
+                    CREATE INDEX IF NOT EXISTS queue_batch_completion_owner
+                        ON queue_items(batch_id, completed_by_id, completed_at DESC);
+                    CREATE TABLE IF NOT EXISTS batch_documents (
+                        batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+                        kind TEXT NOT NULL CHECK(kind IN ('enriched','name_mapping')),
+                        fields_json TEXT NOT NULL,
+                        source_hash TEXT NOT NULL,
+                        desired_version INTEGER NOT NULL DEFAULT 1,
+                        exported_version INTEGER NOT NULL DEFAULT 1,
+                        status TEXT NOT NULL DEFAULT 'current'
+                            CHECK(status IN ('current','pending','exporting','failed','conflict')),
+                        error TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(batch_id,kind)
+                    );
+                    CREATE TABLE IF NOT EXISTS batch_document_rows (
+                        batch_id INTEGER NOT NULL,
+                        kind TEXT NOT NULL,
+                        row_index INTEGER NOT NULL CHECK(row_index >= 0),
+                        data_json TEXT NOT NULL,
+                        PRIMARY KEY(batch_id,kind,row_index),
+                        FOREIGN KEY(batch_id,kind) REFERENCES batch_documents(batch_id,kind)
+                            ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS file_exports (
+                        batch_id INTEGER NOT NULL,
+                        kind TEXT NOT NULL,
+                        desired_version INTEGER NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK(status IN ('pending','exporting','failed')),
+                        leased_at TEXT,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(batch_id,kind),
+                        FOREIGN KEY(batch_id,kind) REFERENCES batch_documents(batch_id,kind)
+                            ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS copath_sources (
+                        source_key TEXT PRIMARY KEY,
+                        path TEXT NOT NULL,
+                        size INTEGER,
+                        mtime_ns INTEGER,
+                        indexed_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS copath_report_rows (
+                        source_key TEXT NOT NULL REFERENCES copath_sources(source_key)
+                            ON DELETE CASCADE,
+                        accession_key TEXT NOT NULL,
+                        data_json TEXT NOT NULL,
+                        PRIMARY KEY(source_key,accession_key)
+                    );
+                    CREATE INDEX IF NOT EXISTS copath_reports_accession
+                        ON copath_report_rows(accession_key);
                     CREATE TABLE IF NOT EXISTS transfer_sources (
                         source_key TEXT PRIMARY KEY,
                         source_kind TEXT NOT NULL CHECK(source_kind IN ('sdl','mapping')),
@@ -183,6 +242,17 @@ class BatchCatalog:
                 version = connection.execute(
                     "SELECT value FROM catalog_metadata WHERE key='schema_version'"
                 ).fetchone()[0]
+                if int(version) < SCHEMA_VERSION:
+                    connection.commit()
+                    backup_path = path.with_name(
+                        f"{path.name}.pre-v{SCHEMA_VERSION}.backup"
+                    )
+                    if not backup_path.exists():
+                        backup = sqlite3.connect(backup_path)
+                        try:
+                            connection.backup(backup)
+                        finally:
+                            backup.close()
                 if int(version) == 1:
                     connection.execute(
                         "UPDATE catalog_metadata SET value='2' WHERE key='schema_version'",
@@ -199,11 +269,62 @@ class BatchCatalog:
                         )
                     connection.execute(
                         "UPDATE catalog_metadata SET value=? WHERE key='schema_version'",
+                        ("3",),
+                    )
+                    version = "3"
+                if int(version) == 3:
+                    columns = {
+                        row[1] for row in connection.execute("PRAGMA table_info(batches)")
+                    }
+                    for column in ("pending_count", "leased_count", "completed_count"):
+                        if column not in columns:
+                            connection.execute(
+                                f"ALTER TABLE batches ADD COLUMN {column} INTEGER NOT NULL "
+                                f"DEFAULT 0 CHECK({column} >= 0)"
+                            )
+                    connection.execute(
+                        """
+                        UPDATE batches SET
+                            pending_count=(SELECT COUNT(*) FROM queue_items q WHERE q.batch_id=batches.id AND q.status='pending'),
+                            leased_count=(SELECT COUNT(*) FROM queue_items q WHERE q.batch_id=batches.id AND q.status='leased'),
+                            completed_count=(SELECT COUNT(*) FROM queue_items q WHERE q.batch_id=batches.id AND q.status='completed')
+                        """
+                    )
+                    connection.execute(
+                        "UPDATE catalog_metadata SET value=? WHERE key='schema_version'",
                         (str(SCHEMA_VERSION),),
                     )
                     version = str(SCHEMA_VERSION)
                 if int(version) != SCHEMA_VERSION:
                     raise RuntimeError(f"Unsupported batch catalog schema version: {version}")
+                connection.executescript(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS queue_count_insert
+                    AFTER INSERT ON queue_items BEGIN
+                        UPDATE batches SET
+                            pending_count=pending_count+(NEW.status='pending'),
+                            leased_count=leased_count+(NEW.status='leased'),
+                            completed_count=completed_count+(NEW.status='completed')
+                        WHERE id=NEW.batch_id;
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS queue_count_delete
+                    AFTER DELETE ON queue_items BEGIN
+                        UPDATE batches SET
+                            pending_count=pending_count-(OLD.status='pending'),
+                            leased_count=leased_count-(OLD.status='leased'),
+                            completed_count=completed_count-(OLD.status='completed')
+                        WHERE id=OLD.batch_id;
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS queue_count_update
+                    AFTER UPDATE OF status ON queue_items WHEN OLD.status<>NEW.status BEGIN
+                        UPDATE batches SET
+                            pending_count=pending_count-(OLD.status='pending')+(NEW.status='pending'),
+                            leased_count=leased_count-(OLD.status='leased')+(NEW.status='leased'),
+                            completed_count=completed_count-(OLD.status='completed')+(NEW.status='completed')
+                        WHERE id=NEW.batch_id;
+                    END;
+                    """
+                )
                 connection.commit()
                 if os.name != "nt":
                     try:
@@ -231,13 +352,8 @@ class BatchCatalog:
         with self.connection(instance_dir) as connection:
             rows = connection.execute(
                 """
-                SELECT b.*,
-                       COUNT(q.original_index) AS queue_total,
-                       COALESCE(SUM(q.status='pending'),0) AS pending_count,
-                       COALESCE(SUM(q.status='leased'),0) AS leased_count,
-                       COALESCE(SUM(q.status='completed'),0) AS completed_count
-                FROM batches b LEFT JOIN queue_items q ON q.batch_id=b.id
-                GROUP BY b.id ORDER BY b.relative_path COLLATE NOCASE
+                SELECT b.*, pending_count+leased_count+completed_count AS queue_total
+                FROM batches b ORDER BY b.relative_path COLLATE NOCASE
                 """
             ).fetchall()
             return [dict(row) for row in rows]
@@ -246,17 +362,461 @@ class BatchCatalog:
         with self.connection(instance_dir) as connection:
             row = connection.execute(
                 """
-                SELECT b.*,
-                       COUNT(q.original_index) AS queue_total,
-                       COALESCE(SUM(q.status='pending'),0) AS pending_count,
-                       COALESCE(SUM(q.status='leased'),0) AS leased_count,
-                       COALESCE(SUM(q.status='completed'),0) AS completed_count
-                FROM batches b LEFT JOIN queue_items q ON q.batch_id=b.id
-                WHERE b.public_id=? GROUP BY b.id
+                SELECT b.*, pending_count+leased_count+completed_count AS queue_total
+                FROM batches b WHERE b.public_id=?
                 """,
                 (public_id,),
             ).fetchone()
             return dict(row) if row is not None else None
+
+    @staticmethod
+    def _document_kind(kind: str) -> str:
+        if kind not in DOCUMENT_KINDS:
+            raise ValueError(f"unsupported batch document: {kind}")
+        return kind
+
+    @staticmethod
+    def _document_values(
+        fields: Sequence[str], rows: Iterable[Mapping[str, object]]
+    ) -> tuple[list[str], list[dict[str, str]]]:
+        headers = list(dict.fromkeys(str(field) for field in fields))
+        if not headers:
+            raise ValueError("batch document must have at least one field")
+        values = [
+            {field: str(row.get(field) or "") for field in headers}
+            for row in rows
+        ]
+        return headers, values
+
+    def import_document(
+        self,
+        instance_dir: str | Path,
+        public_id: str,
+        kind: str,
+        fields: Sequence[str],
+        rows: Iterable[Mapping[str, object]],
+        source_hash: str,
+    ) -> bool:
+        """Import one existing file once; never replace central edits."""
+        kind = self._document_kind(kind)
+        headers, values = self._document_values(fields, rows)
+        with self.connection(instance_dir) as connection:
+            batch = self._batch_row(connection, public_id)
+            existing = connection.execute(
+                "SELECT 1 FROM batch_documents WHERE batch_id=? AND kind=?",
+                (batch["id"], kind),
+            ).fetchone()
+            if existing is not None:
+                return False
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO batch_documents(
+                    batch_id,kind,fields_json,source_hash,desired_version,
+                    exported_version,status,error,updated_at
+                ) VALUES(?,?,?,?,1,1,'current','',?)
+                """,
+                (batch["id"], kind, json.dumps(headers), source_hash, now),
+            )
+            connection.executemany(
+                "INSERT INTO batch_document_rows(batch_id,kind,row_index,data_json) "
+                "VALUES(?,?,?,?)",
+                [
+                    (batch["id"], kind, index, json.dumps(row, separators=(",", ":")))
+                    for index, row in enumerate(values)
+                ],
+            )
+            return True
+
+    def document_state(
+        self, instance_dir: str | Path, public_id: str, kind: str
+    ) -> Optional[dict]:
+        kind = self._document_kind(kind)
+        with self.connection(instance_dir) as connection:
+            batch = self._batch_row(connection, public_id)
+            row = connection.execute(
+                "SELECT * FROM batch_documents WHERE batch_id=? AND kind=?",
+                (batch["id"], kind),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def load_document(
+        self, instance_dir: str | Path, public_id: str, kind: str
+    ) -> tuple[list[str], list[dict[str, str]], dict]:
+        kind = self._document_kind(kind)
+        with self.connection(instance_dir) as connection:
+            batch = self._batch_row(connection, public_id)
+            state = connection.execute(
+                "SELECT * FROM batch_documents WHERE batch_id=? AND kind=?",
+                (batch["id"], kind),
+            ).fetchone()
+            if state is None:
+                raise KeyError(f"{kind} is not imported for batch {public_id}")
+            rows = connection.execute(
+                "SELECT data_json FROM batch_document_rows "
+                "WHERE batch_id=? AND kind=? ORDER BY row_index",
+                (batch["id"], kind),
+            ).fetchall()
+            return (
+                list(json.loads(state["fields_json"])),
+                [dict(json.loads(row[0])) for row in rows],
+                dict(state),
+            )
+
+    def replace_document(
+        self,
+        instance_dir: str | Path,
+        public_id: str,
+        kind: str,
+        fields: Sequence[str],
+        rows: Iterable[Mapping[str, object]],
+    ) -> int:
+        """Replace central rows and durably request one latest-version export."""
+        kind = self._document_kind(kind)
+        headers, values = self._document_values(fields, rows)
+        with self.connection(instance_dir) as connection:
+            batch = self._batch_row(connection, public_id)
+            state = connection.execute(
+                "SELECT desired_version FROM batch_documents WHERE batch_id=? AND kind=?",
+                (batch["id"], kind),
+            ).fetchone()
+            if state is None:
+                raise KeyError(f"{kind} is not imported for batch {public_id}")
+            version = int(state[0]) + 1
+            now = utc_now()
+            connection.execute(
+                "DELETE FROM batch_document_rows WHERE batch_id=? AND kind=?",
+                (batch["id"], kind),
+            )
+            connection.executemany(
+                "INSERT INTO batch_document_rows(batch_id,kind,row_index,data_json) "
+                "VALUES(?,?,?,?)",
+                [
+                    (batch["id"], kind, index, json.dumps(row, separators=(",", ":")))
+                    for index, row in enumerate(values)
+                ],
+            )
+            connection.execute(
+                """
+                UPDATE batch_documents SET fields_json=?,desired_version=?,status='pending',
+                    error='',updated_at=? WHERE batch_id=? AND kind=?
+                """,
+                (json.dumps(headers), version, now, batch["id"], kind),
+            )
+            connection.execute(
+                """
+                INSERT INTO file_exports(
+                    batch_id,kind,desired_version,status,leased_at,attempts,last_error,updated_at
+                ) VALUES(?,?,?,'pending',NULL,0,'',?)
+                ON CONFLICT(batch_id,kind) DO UPDATE SET
+                    desired_version=excluded.desired_version,status='pending',leased_at=NULL,
+                    last_error='',updated_at=excluded.updated_at
+                """,
+                (batch["id"], kind, version, now),
+            )
+            return version
+
+    def update_document_rows(
+        self,
+        instance_dir: str | Path,
+        public_id: str,
+        kind: str,
+        updates: Mapping[int, Mapping[str, object]],
+    ) -> int:
+        """Update selected central rows and enqueue one coalesced export."""
+        kind = self._document_kind(kind)
+        with self.connection(instance_dir) as connection:
+            batch = self._batch_row(connection, public_id)
+            state = connection.execute(
+                "SELECT fields_json,desired_version,status,error FROM batch_documents "
+                "WHERE batch_id=? AND kind=?",
+                (batch["id"], kind),
+            ).fetchone()
+            if state is None:
+                raise KeyError(f"{kind} is not imported for batch {public_id}")
+            if state["status"] == "conflict":
+                raise RuntimeError(str(state["error"]))
+            fields = list(json.loads(state["fields_json"]))
+            for index, changes in updates.items():
+                stored = connection.execute(
+                    "SELECT data_json FROM batch_document_rows "
+                    "WHERE batch_id=? AND kind=? AND row_index=?",
+                    (batch["id"], kind, int(index)),
+                ).fetchone()
+                if stored is None:
+                    raise KeyError(f"unknown {kind} row: {index}")
+                row = dict(json.loads(stored[0]))
+                for field, value in changes.items():
+                    if field not in fields:
+                        raise ValueError(f"unknown {kind} field: {field}")
+                    row[field] = str(value or "")
+                connection.execute(
+                    "UPDATE batch_document_rows SET data_json=? "
+                    "WHERE batch_id=? AND kind=? AND row_index=?",
+                    (
+                        json.dumps(row, separators=(",", ":")),
+                        batch["id"], kind, int(index),
+                    ),
+                )
+            version = int(state["desired_version"]) + 1
+            now = utc_now()
+            connection.execute(
+                "UPDATE batch_documents SET desired_version=?,status='pending',error='',updated_at=? "
+                "WHERE batch_id=? AND kind=?",
+                (version, now, batch["id"], kind),
+            )
+            connection.execute(
+                """
+                INSERT INTO file_exports(
+                    batch_id,kind,desired_version,status,leased_at,attempts,last_error,updated_at
+                ) VALUES(?,?,?,'pending',NULL,0,'',?)
+                ON CONFLICT(batch_id,kind) DO UPDATE SET
+                    desired_version=excluded.desired_version,status='pending',leased_at=NULL,
+                    last_error='',updated_at=excluded.updated_at
+                """,
+                (batch["id"], kind, version, now),
+            )
+            return version
+
+    def adopt_document(
+        self,
+        instance_dir: str | Path,
+        public_id: str,
+        kind: str,
+        fields: Sequence[str],
+        rows: Iterable[Mapping[str, object]],
+        source_hash: str,
+    ) -> int:
+        """Adopt a file written by an internal pipeline job as current central data."""
+        kind = self._document_kind(kind)
+        headers, values = self._document_values(fields, rows)
+        with self.connection(instance_dir) as connection:
+            batch = self._batch_row(connection, public_id)
+            state = connection.execute(
+                "SELECT desired_version FROM batch_documents WHERE batch_id=? AND kind=?",
+                (batch["id"], kind),
+            ).fetchone()
+            if state is None:
+                version = 1
+                connection.execute(
+                    """
+                    INSERT INTO batch_documents(
+                        batch_id,kind,fields_json,source_hash,desired_version,
+                        exported_version,status,error,updated_at
+                    ) VALUES(?,?,?,?,?,?,'current','',?)
+                    """,
+                    (
+                        batch["id"], kind, json.dumps(headers), source_hash,
+                        version, version, utc_now(),
+                    ),
+                )
+            else:
+                version = int(state[0]) + 1
+                connection.execute(
+                    """
+                    UPDATE batch_documents SET fields_json=?,source_hash=?,desired_version=?,
+                        exported_version=?,status='current',error='',updated_at=?
+                    WHERE batch_id=? AND kind=?
+                    """,
+                    (
+                        json.dumps(headers), source_hash, version, version, utc_now(),
+                        batch["id"], kind,
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM batch_document_rows WHERE batch_id=? AND kind=?",
+                    (batch["id"], kind),
+                )
+            connection.executemany(
+                "INSERT INTO batch_document_rows(batch_id,kind,row_index,data_json) "
+                "VALUES(?,?,?,?)",
+                [
+                    (batch["id"], kind, index, json.dumps(row, separators=(",", ":")))
+                    for index, row in enumerate(values)
+                ],
+            )
+            connection.execute(
+                "DELETE FROM file_exports WHERE batch_id=? AND kind=?",
+                (batch["id"], kind),
+            )
+            return version
+
+    def claim_export(
+        self, instance_dir: str | Path, stale_before: str
+    ) -> Optional[dict]:
+        connection = self._connect(instance_dir)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT e.batch_id,e.kind,e.desired_version,b.public_id,b.relative_path
+                FROM file_exports e JOIN batches b ON b.id=e.batch_id
+                WHERE e.status='pending'
+                   OR (e.status='failed' AND e.updated_at<?)
+                   OR (e.status='exporting' AND e.leased_at<?)
+                ORDER BY e.updated_at LIMIT 1
+                """,
+                (stale_before, stale_before),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            now = utc_now()
+            connection.execute(
+                "UPDATE file_exports SET status='exporting',leased_at=?,attempts=attempts+1,updated_at=? "
+                "WHERE batch_id=? AND kind=?",
+                (now, now, row["batch_id"], row["kind"]),
+            )
+            connection.execute(
+                "UPDATE batch_documents SET status='exporting',updated_at=? "
+                "WHERE batch_id=? AND kind=?",
+                (now, row["batch_id"], row["kind"]),
+            )
+            connection.commit()
+            return dict(row)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def export_snapshot(
+        self, instance_dir: str | Path, public_id: str, kind: str, version: int
+    ) -> Optional[tuple[list[str], list[dict[str, str]]]]:
+        fields, rows, state = self.load_document(instance_dir, public_id, kind)
+        if int(state["desired_version"]) != int(version) or state["status"] == "conflict":
+            return None
+        return fields, rows
+
+    def finish_export(
+        self,
+        instance_dir: str | Path,
+        public_id: str,
+        kind: str,
+        version: int,
+        source_hash: str,
+    ) -> bool:
+        kind = self._document_kind(kind)
+        with self.connection(instance_dir) as connection:
+            batch = self._batch_row(connection, public_id)
+            state = connection.execute(
+                "SELECT desired_version FROM batch_documents WHERE batch_id=? AND kind=?",
+                (batch["id"], kind),
+            ).fetchone()
+            if state is None or int(state[0]) != int(version):
+                connection.execute(
+                    "UPDATE file_exports SET status='pending',leased_at=NULL,updated_at=? "
+                    "WHERE batch_id=? AND kind=?",
+                    (utc_now(), batch["id"], kind),
+                )
+                return False
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE batch_documents SET source_hash=?,exported_version=?,status='current',
+                    error='',updated_at=? WHERE batch_id=? AND kind=?
+                """,
+                (source_hash, version, now, batch["id"], kind),
+            )
+            connection.execute(
+                "DELETE FROM file_exports WHERE batch_id=? AND kind=?",
+                (batch["id"], kind),
+            )
+            return True
+
+    def fail_export(
+        self, instance_dir: str | Path, public_id: str, kind: str, error: str
+    ) -> None:
+        kind = self._document_kind(kind)
+        with self.connection(instance_dir) as connection:
+            batch = self._batch_row(connection, public_id)
+            now = utc_now()
+            connection.execute(
+                "UPDATE file_exports SET status='failed',leased_at=NULL,last_error=?,updated_at=? "
+                "WHERE batch_id=? AND kind=?",
+                (error, now, batch["id"], kind),
+            )
+            connection.execute(
+                "UPDATE batch_documents SET status='failed',error=?,updated_at=? "
+                "WHERE batch_id=? AND kind=?",
+                (error, now, batch["id"], kind),
+            )
+
+    def mark_document_conflict(
+        self, instance_dir: str | Path, public_id: str, kind: str, error: str
+    ) -> None:
+        kind = self._document_kind(kind)
+        with self.connection(instance_dir) as connection:
+            batch = self._batch_row(connection, public_id)
+            connection.execute(
+                "UPDATE batch_documents SET status='conflict',error=?,updated_at=? "
+                "WHERE batch_id=? AND kind=?",
+                (error, utc_now(), batch["id"], kind),
+            )
+            connection.execute(
+                "DELETE FROM file_exports WHERE batch_id=? AND kind=?",
+                (batch["id"], kind),
+            )
+
+    def copath_source_state(
+        self, instance_dir: str | Path, source_key: str
+    ) -> Optional[dict]:
+        with self.connection(instance_dir) as connection:
+            row = connection.execute(
+                "SELECT * FROM copath_sources WHERE source_key=?", (source_key,)
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def replace_copath_source(
+        self,
+        instance_dir: str | Path,
+        source_key: str,
+        path: str,
+        size: Optional[int],
+        mtime_ns: Optional[int],
+        rows: Iterable[Mapping[str, object]],
+    ) -> None:
+        values = []
+        for row in rows:
+            accession = str(row.get("accession_id") or row.get("AccessionID") or "")
+            key = accession.strip().casefold()
+            if key:
+                values.append(
+                    (source_key, key, json.dumps(dict(row), separators=(",", ":")))
+                )
+        with self.connection(instance_dir) as connection:
+            connection.execute(
+                """
+                INSERT INTO copath_sources(source_key,path,size,mtime_ns,indexed_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET
+                    path=excluded.path,size=excluded.size,mtime_ns=excluded.mtime_ns,
+                    indexed_at=excluded.indexed_at
+                """,
+                (source_key, path, size, mtime_ns, utc_now()),
+            )
+            connection.execute(
+                "DELETE FROM copath_report_rows WHERE source_key=?", (source_key,)
+            )
+            connection.executemany(
+                "INSERT INTO copath_report_rows(source_key,accession_key,data_json) "
+                "VALUES(?,?,?)",
+                values,
+            )
+
+    def copath_reports(
+        self, instance_dir: str | Path, accession_keys: Sequence[str]
+    ) -> dict[str, dict]:
+        keys = list(dict.fromkeys(str(key) for key in accession_keys if key))
+        if not keys:
+            return {}
+        placeholders = ",".join("?" for _ in keys)
+        with self.connection(instance_dir) as connection:
+            rows = connection.execute(
+                f"SELECT accession_key,data_json FROM copath_report_rows "
+                f"WHERE accession_key IN ({placeholders})",
+                keys,
+            ).fetchall()
+            return {str(row["accession_key"]): dict(json.loads(row["data_json"])) for row in rows}
 
     def upsert_batch(
         self,
@@ -429,12 +989,13 @@ class BatchCatalog:
                     f"DELETE FROM queue_items WHERE batch_id=? AND original_index IN ({placeholders})",
                     (batch["id"], *deleted),
                 )
-            total = connection.execute(
-                "SELECT COUNT(*) FROM queue_items WHERE batch_id=?", (batch["id"],)
-            ).fetchone()[0]
+            counts = connection.execute(
+                "SELECT pending_count+leased_count+completed_count FROM batches WHERE id=?",
+                (batch["id"],),
+            ).fetchone()
             connection.execute(
                 "UPDATE batches SET slide_count=?,updated_at=? WHERE id=?",
-                (total, utc_now(), batch["id"]),
+                (int(counts[0]), utc_now(), batch["id"]),
             )
 
     def load_queue(self, instance_dir: str | Path, public_id: str) -> list[dict]:
@@ -446,6 +1007,27 @@ class BatchCatalog:
                 (batch["id"],),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def queue_dashboard(
+        self, instance_dir: str | Path, public_id: str, user_id: str, limit: int = 5
+    ) -> tuple[dict[str, int], list[dict]]:
+        with self.connection(instance_dir) as connection:
+            batch = self._batch_row(connection, public_id)
+            counts = {
+                "pending": int(batch["pending_count"]),
+                "leased": int(batch["leased_count"]),
+                "completed": int(batch["completed_count"]),
+            }
+            rows = connection.execute(
+                """
+                SELECT original_index,status,leased_by_id,leased_at,completed_by_id,completed_at
+                FROM queue_items
+                WHERE batch_id=? AND completed_by_id=?
+                ORDER BY completed_at DESC LIMIT ?
+                """,
+                (batch["id"], user_id, max(0, int(limit))),
+            ).fetchall()
+            return counts, [dict(row) for row in rows]
 
     def claim_item(
         self,
@@ -589,14 +1171,12 @@ class BatchCatalog:
             connection.execute("BEGIN IMMEDIATE")
             batch = self._batch_row(connection, public_id)
             counts = connection.execute(
-                """
-                SELECT COUNT(*) AS total,
-                       COALESCE(SUM(status<>'completed'),0) AS unfinished
-                FROM queue_items WHERE batch_id=?
-                """,
+                "SELECT pending_count,leased_count,completed_count FROM batches WHERE id=?",
                 (batch["id"],),
             ).fetchone()
-            if counts["total"] == 0 or counts["unfinished"] != 0:
+            if counts["completed_count"] == 0 or (
+                counts["pending_count"] + counts["leased_count"]
+            ) != 0:
                 connection.rollback()
                 return False
             connection.execute(

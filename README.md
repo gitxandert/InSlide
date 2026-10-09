@@ -92,11 +92,21 @@ conda run -n label_check python src/audit_sdl_type_conflicts.py --workbook "D:\p
 The command is read-only. Exit status `0` means no conflicts, `1` means
 conflicts were found, and `2` means the workbook could not be audited.
 
-Batch workflow stages, queues, and leases are stored in
-`INSLIDE_STATE_HOST\instance\batch_catalog.sqlite3`. Batch list pages query
-this catalog and load `enriched.csv` only after a batch is selected. A
-background reconciliation scans for externally-created batches at startup and
-every `BATCH_CATALOG_RECONCILE_SECONDS` seconds (60 by default).
+Batch workflow stages, slide rows, renaming mappings, queues, and leases are
+stored in `INSLIDE_STATE_HOST\instance\batch_catalog.sqlite3`. This database is
+the application source of truth. Per-batch `enriched.csv` and
+`name_mapping.csv` files are read-only compatibility exports written from a
+durable database outbox; pipeline intermediates such as `slide_mapping.csv`
+and `ocr.csv` are sealed after ingestion. Pending exports survive restarts and
+stage transitions wait for required exports. `FILE_EXPORT_WORKERS` controls
+the small export pool (2 by default). If a Docker Desktop bind mount does not
+support POSIX modes, apply equivalent read-only Windows ACLs to these files.
+
+Batch list pages query stored counters instead of aggregating every slide. A
+background reconciliation scans for new batches at startup and every
+`BATCH_CATALOG_RECONCILE_SECONDS` seconds (60 by default), without blocking
+page requests. Unexpected external edits are reported as conflicts and are
+not imported.
 
 The same database stores a derived transfer-slide catalog populated from each
 batch's `name_mapping.csv` and the Slide Digitization Log. Transfer pages load

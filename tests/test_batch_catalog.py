@@ -121,9 +121,13 @@ class BatchCatalogTests(unittest.TestCase):
             }
         finally:
             connection.close()
-        self.assertEqual("3", version)
+        self.assertEqual("4", version)
         self.assertIn("transfer_slides", tables)
         self.assertIn("transfer_sources", tables)
+        self.assertIn("batch_documents", tables)
+        self.assertTrue(
+            (legacy_instance / "batch_catalog.sqlite3.pre-v4.backup").is_file()
+        )
 
     def test_schema_version_two_adds_nightly_run_type(self):
         legacy_instance = self.root / "version-two-instance"
@@ -141,6 +145,105 @@ class BatchCatalogTests(unittest.TestCase):
         upgraded = BatchCatalog().get_batch(legacy_instance, batch_id)
 
         self.assertEqual("nightly", upgraded["run_type"])
+
+    def test_queue_counts_follow_status_changes_without_list_aggregation(self):
+        self.catalog.apply_queue_changes(
+            self.instance,
+            self.batch_id,
+            [{"original_index": 0, "status": "completed"}],
+        )
+
+        batch = self.catalog.list_batches(self.instance)[0]
+
+        self.assertEqual(0, batch["pending_count"])
+        self.assertEqual(1, batch["completed_count"])
+        self.assertEqual(1, batch["queue_total"])
+
+    def test_document_edits_coalesce_into_one_durable_export(self):
+        imported = self.catalog.import_document(
+            self.instance,
+            self.batch_id,
+            "enriched",
+            ["AccessionID", "ParsingQCPassed"],
+            [{"AccessionID": "NP1", "ParsingQCPassed": ""}],
+            "original-hash",
+        )
+        self.assertTrue(imported)
+        first_version = self.catalog.replace_document(
+            self.instance,
+            self.batch_id,
+            "enriched",
+            ["AccessionID", "ParsingQCPassed"],
+            [{"AccessionID": "NP2", "ParsingQCPassed": ""}],
+        )
+        latest_version = self.catalog.replace_document(
+            self.instance,
+            self.batch_id,
+            "enriched",
+            ["AccessionID", "ParsingQCPassed"],
+            [{"AccessionID": "NP3", "ParsingQCPassed": "TRUE"}],
+        )
+
+        job = self.catalog.claim_export(self.instance, "2000-01-01T00:00:00Z")
+        snapshot = self.catalog.export_snapshot(
+            self.instance, self.batch_id, "enriched", latest_version
+        )
+
+        self.assertEqual(first_version + 1, latest_version)
+        self.assertEqual(latest_version, job["desired_version"])
+        self.assertEqual("NP3", snapshot[1][0]["AccessionID"])
+        self.assertTrue(
+            self.catalog.finish_export(
+                self.instance, self.batch_id, "enriched", latest_version, "new-hash"
+            )
+        )
+        state = self.catalog.document_state(self.instance, self.batch_id, "enriched")
+        self.assertEqual("current", state["status"])
+        self.assertEqual("new-hash", state["source_hash"])
+
+    def test_partial_document_update_preserves_other_rows(self):
+        self.catalog.import_document(
+            self.instance,
+            self.batch_id,
+            "enriched",
+            ["AccessionID", "ParsingQCPassed"],
+            [
+                {"AccessionID": "NP1", "ParsingQCPassed": ""},
+                {"AccessionID": "NP2", "ParsingQCPassed": ""},
+            ],
+            "original-hash",
+        )
+
+        version = self.catalog.update_document_rows(
+            self.instance,
+            self.batch_id,
+            "enriched",
+            {1: {"ParsingQCPassed": "TRUE"}},
+        )
+        _, rows, state = self.catalog.load_document(
+            self.instance, self.batch_id, "enriched"
+        )
+
+        self.assertEqual("", rows[0]["ParsingQCPassed"])
+        self.assertEqual("TRUE", rows[1]["ParsingQCPassed"])
+        self.assertEqual(version, state["desired_version"])
+
+    def test_copath_reports_are_selected_by_accession(self):
+        self.catalog.replace_copath_source(
+            self.instance,
+            "organ:Breast",
+            "/clone/Breast/copath_data.csv",
+            10,
+            20,
+            [
+                {"accession_id": "NP1", "report": "one"},
+                {"accession_id": "NP2", "report": "two"},
+            ],
+        )
+
+        reports = self.catalog.copath_reports(self.instance, ["np2"])
+
+        self.assertEqual({"np2": {"accession_id": "NP2", "report": "two"}}, reports)
 
 
 class BatchCatalogMigrationTests(unittest.TestCase):

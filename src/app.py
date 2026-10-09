@@ -143,6 +143,7 @@ class Config:
     BATCH_CATALOG_RECONCILE_SECONDS = int(
         os.environ.get("BATCH_CATALOG_RECONCILE_SECONDS", "60")
     )
+    FILE_EXPORT_WORKERS = int(os.environ.get("FILE_EXPORT_WORKERS", "2"))
     API_REQUIRE_HTTPS = os.environ.get("API_REQUIRE_HTTPS", "true").lower() == "true"
     API_TRUST_PROXY_HEADERS = os.environ.get("API_TRUST_PROXY_HEADERS", "false").lower() == "true"
     API_SUBMIT_RATE_LIMIT = int(os.environ.get("API_SUBMIT_RATE_LIMIT", "5"))
@@ -1292,8 +1293,27 @@ class QueueManager:
             datetime.datetime.utcnow().isoformat(),
             original_index,
         )
-        self.load()
-        return self.items.get(int(row["original_index"])) if row else None
+        if row is None:
+            return None
+        if original_index is not None:
+            for item in self.items.values():
+                if item.leased_by_id == user_id and item.original_index != original_index:
+                    item.status = "pending"
+                    item.leased_by_id = None
+                    item.leased_at = None
+        item = QueueItem(
+            original_index=int(row["original_index"]),
+            status=str(row["status"]),
+            leased_by_id=row.get("leased_by_id"),
+            leased_at=row.get("leased_at"),
+            completed_by_id=row.get("completed_by_id"),
+            completed_at=row.get("completed_at"),
+        )
+        self.items[item.original_index] = item
+        self._snapshot = {
+            index: current.to_dict() for index, current in self.items.items()
+        }
+        return item
 
     def release_expired(self, before: datetime.datetime) -> int:
         count = batch_catalog.release_expired(
@@ -1396,49 +1416,45 @@ class DataManager:
                 self.data, self.headers = [], []
                 raise DataLoadError(f"Error reading CSV: {e}")
 
-    def save_data(self, target_path: Optional[Union[str, Path]] = None) -> None:
-        """Saves current data to CSV atomically."""
-        target_path = str(target_path or self.csv_path or Config.CSV_FILE_PATH)
+    def load_rows(
+        self, headers: Sequence[str], rows: Sequence[Dict[str, str]]
+    ) -> None:
+        """Load central document rows into the existing QC view model."""
         with self._lock:
-            if not self.data or not self.headers:
-                app.logger.warning("Save aborted: No data in memory.")
-                return
-
-            app.logger.info(f"Saving {len(self.data)} rows to {target_path}")
-
-            priority_fields = ["AccessionID", "Stain", "BlockNumber", "ParsingQCPassed"]
-            pipeline_fields = [h for h in self.headers if h not in priority_fields]
-            fieldnames = list(dict.fromkeys(priority_fields + pipeline_fields))
-            
-            temp_path = target_path + ".tmp"
-            try:
-                with open(temp_path, "w", newline="", encoding="utf-8") as csvfile:
-                    writer = csv.DictWriter(
-                        csvfile,
-                        fieldnames=fieldnames,
-                        delimiter=",",
-                        extrasaction="ignore",
-                        quoting=csv.QUOTE_MINIMAL,
-                    )
-                    writer.writeheader()
-
-                    for row in self.data:
-                        write_row = row.copy()
-                        write_row["ParsingQCPassed"] = "TRUE" if row.get("_is_complete") else ""
-                        writer.writerow(write_row)
-
-                # Atomic replace
-                if os.path.exists(target_path):
-                    os.replace(temp_path, target_path)
-                else:
-                    os.rename(temp_path, target_path)
-                    
-                session["last_loaded_csv_mod_time"] = os.path.getmtime(target_path)
-                app.logger.info("Save successful.")
-            except Exception as e:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                raise DataSaveError(f"Failed to save CSV: {e}")
+            _headers = list(headers)
+            missing = [header for header in self.critical_headers if header not in _headers]
+            if missing:
+                app.logger.warning(
+                    "Central enriched data is missing expected headers: %s", missing
+                )
+            data: List[Dict[str, Any]] = []
+            for index, source in enumerate(rows):
+                row: Dict[str, Any] = dict(source)
+                row["_original_index"] = index
+                original = row.get("original_slide_location")
+                row["_identifier"] = Path(original).stem if original else f"Unknown_{index}"
+                row["_label_text"] = row.get("label_text", "N/A")
+                row["_macro_text"] = row.get("macro_text", "N/A")
+                row["_label_path"] = row.get("label_path")
+                row["_macro_path"] = row.get("macro_path")
+                row["AccessionID"] = row.get("AccessionID", "")
+                row["Stain"] = row.get("Stain", "")
+                row["BlockNumber"] = row.get("BlockNumber", "")
+                qc_value = str(row.get("ParsingQCPassed", "")).strip()
+                row["_is_complete"] = bool(
+                    qc_value and qc_value.casefold() != "false"
+                )
+                data.append(row)
+            patient_slide_ids: Dict[str, List[int]] = defaultdict(list)
+            for index, row in enumerate(data):
+                patient_slide_ids[row["_identifier"]].append(index)
+            for indices in patient_slide_ids.values():
+                for position, original_index in enumerate(sorted(indices), start=1):
+                    data[original_index]["_total_patient_files"] = len(indices)
+                    data[original_index]["_patient_file_number"] = position
+            self.data = data
+            self.headers = _headers
+            self._recalculate_accession_counts()
 
     def _recalculate_accession_counts(self) -> None:
         """Internal helper to count AccessionID occurrences."""
@@ -1532,8 +1548,12 @@ class BatchContext:
         self.data_manager = DataManager(root, self.csv_path)
         self.queue_manager = QueueManager(batch_id)
         self.csv_mod_time: Optional[float] = None
+        self.document_version: Optional[int] = None
+        self._queue_loaded = False
         row = catalog_row or {}
         self.run_type = str(row.get("run_type", "nightly"))
+        self.renaming_status = str(row.get("renaming_status", "missing"))
+        self.history_status = str(row.get("history_status", "not_needed"))
         self.completed_stages = {
             "QC": bool(row.get("qc_complete", False)),
             "Renamed": bool(row.get("renamed_complete", False)),
@@ -1574,16 +1594,38 @@ class BatchContext:
         except (OSError, sqlite3.Error, KeyError) as exc:
             raise DataSaveError(f"could not update batch catalog: {exc}") from exc
 
+    def save_enriched(self, indices: Sequence[int]) -> None:
+        updates: Dict[int, Dict[str, Any]] = {}
+        for index in indices:
+            source = self.data_manager.data[index]
+            values = {
+                "AccessionID": source.get("AccessionID", ""),
+                "Stain": source.get("Stain", ""),
+                "BlockNumber": source.get("BlockNumber", ""),
+                "ParsingQCPassed": "TRUE" if source.get("_is_complete") else "",
+            }
+            updates[index] = {
+                field: value
+                for field, value in values.items()
+                if field in self.data_manager.headers
+            }
+        self.document_version = _update_batch_document_rows(
+            self.id, "enriched", updates
+        )
+
     @property
     def qc_complete(self) -> bool:
         return self.completed_stages["QC"]
 
     def refresh(self) -> None:
-        mod_time = self.csv_path.stat().st_mtime
-        if not self.data_manager.data or mod_time != self.csv_mod_time:
-            self.data_manager.load_data(self.csv_path)
-            self.csv_mod_time = mod_time
-        self.queue_manager.load()
+        fields, rows, state = _load_batch_document(self.id, "enriched")
+        version = int(state["desired_version"])
+        if not self.data_manager.data or version != self.document_version:
+            self.data_manager.load_rows(fields, rows)
+            self.document_version = version
+        if not self._queue_loaded:
+            self.queue_manager.load()
+            self._queue_loaded = True
         valid_indices = set(range(len(self.data_manager.data)))
         changed = False
         for index in list(self.queue_manager.items):
@@ -1632,14 +1674,254 @@ class BatchContext:
 batch_contexts: Dict[str, BatchContext] = {}
 batch_contexts_lock = threading.Lock()
 _catalog_reconcile_lock = threading.Lock()
+_catalog_reconcile_start_lock = threading.Lock()
 _catalog_reconciled_target: Optional[Tuple[str, str]] = None
 _catalog_reconciler_started = False
 _catalog_reconcile_owner = uuid.uuid4().hex
+_document_export_lock = threading.Lock()
+_document_export_event = threading.Event()
+_document_export_start_lock = threading.Lock()
+_document_export_started = False
 _renaming_jobs: Dict[str, Dict[str, Any]] = {}
 _renaming_jobs_lock = threading.Lock()
 _renaming_clone_lock = threading.Lock()
 _longitudinal_active: set = set()
 _longitudinal_lock = threading.Lock()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _batch_document_path(root: Path, kind: str) -> Path:
+    names = {"enriched": "enriched.csv", "name_mapping": "name_mapping.csv"}
+    try:
+        return root / names[kind]
+    except KeyError as exc:
+        raise ValueError(f"unsupported batch document: {kind}") from exc
+
+
+def _seal_batch_file(path: Path) -> None:
+    if not app.config.get("TESTING") and os.name != "nt":
+        try:
+            os.chmod(path, 0o444)
+        except PermissionError:
+            if os.environ.get("INSLIDE_CONTAINER", "false").lower() != "true":
+                raise
+            app.logger.warning(
+                "Could not apply read-only mode to bind-mounted batch file %s; "
+                "enforce it through Windows ACLs",
+                path,
+            )
+
+
+def _import_batch_document(public_id: str, root: Path, kind: str) -> bool:
+    path = _batch_document_path(root, kind)
+    fields, rows = renaming.read_csv(path)
+    imported = batch_catalog.import_document(
+        Config.INSTANCE_DIR, public_id, kind, fields, rows, _file_sha256(path)
+    )
+    _seal_batch_file(path)
+    return imported
+
+
+def _load_batch_document(
+    public_id: str, kind: str
+) -> Tuple[List[str], List[Dict[str, str]], Dict[str, Any]]:
+    try:
+        return batch_catalog.load_document(Config.INSTANCE_DIR, public_id, kind)
+    except KeyError as exc:
+        raise DataLoadError(str(exc)) from exc
+
+
+def _replace_batch_document(
+    public_id: str,
+    kind: str,
+    fields: Sequence[str],
+    rows: Sequence[Dict[str, Any]],
+) -> int:
+    try:
+        with _document_export_lock:
+            version = batch_catalog.replace_document(
+                Config.INSTANCE_DIR, public_id, kind, fields, rows
+            )
+    except (KeyError, RuntimeError, sqlite3.Error) as exc:
+        raise DataSaveError(str(exc)) from exc
+    if app.config.get("TESTING"):
+        _drain_document_exports()
+    else:
+        _document_export_event.set()
+    return version
+
+
+def _update_batch_document_rows(
+    public_id: str,
+    kind: str,
+    updates: Dict[int, Dict[str, Any]],
+) -> int:
+    try:
+        with _document_export_lock:
+            version = batch_catalog.update_document_rows(
+                Config.INSTANCE_DIR, public_id, kind, updates
+            )
+    except (KeyError, RuntimeError, sqlite3.Error) as exc:
+        raise DataSaveError(str(exc)) from exc
+    if app.config.get("TESTING"):
+        _drain_document_exports()
+    else:
+        _document_export_event.set()
+    return version
+
+
+def _adopt_batch_document(public_id: str, root: Path, kind: str) -> int:
+    path = _batch_document_path(root, kind)
+    fields, rows = renaming.read_csv(path)
+    with _document_export_lock:
+        version = batch_catalog.adopt_document(
+            Config.INSTANCE_DIR,
+            public_id,
+            kind,
+            fields,
+            rows,
+            _file_sha256(path),
+        )
+        _seal_batch_file(path)
+    return version
+
+
+def _wait_for_document_export(
+    public_id: str, kind: str, timeout_seconds: float = 30
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        state = batch_catalog.document_state(Config.INSTANCE_DIR, public_id, kind)
+        if state is None:
+            raise DataSaveError(f"{kind} has not been imported")
+        if state["status"] == "conflict":
+            raise DataSaveError(str(state["error"]))
+        if state["status"] == "failed":
+            raise DataSaveError(str(state["error"]) or f"Failed to export {kind}")
+        if int(state["desired_version"]) == int(state["exported_version"]):
+            return
+        if time.monotonic() >= deadline:
+            raise DataSaveError(f"Timed out exporting {kind}")
+        _drain_document_exports(limit=1)
+        time.sleep(0.05)
+
+
+def _export_batch_document(job: Dict[str, Any]) -> None:
+    public_id = str(job["public_id"])
+    kind = str(job["kind"])
+    version = int(job["desired_version"])
+    root = Path(Config.INSLIDE_BATCHES) / Path(str(job["relative_path"]))
+    path = _batch_document_path(root, kind)
+    snapshot = batch_catalog.export_snapshot(
+        Config.INSTANCE_DIR, public_id, kind, version
+    )
+    if snapshot is None:
+        return
+    fields, rows = snapshot
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        digest = _file_sha256(temporary)
+        with _document_export_lock:
+            state = batch_catalog.document_state(Config.INSTANCE_DIR, public_id, kind)
+            if (
+                state is None
+                or int(state["desired_version"]) != version
+                or state["status"] == "conflict"
+            ):
+                return
+            os.replace(temporary, path)
+            _seal_batch_file(path)
+            batch_catalog.finish_export(
+                Config.INSTANCE_DIR, public_id, kind, version, digest
+            )
+        app.logger.info(
+            "BATCH_EXPORT batch=%s kind=%s version=%d status=succeeded",
+            public_id, kind, version,
+        )
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _document_export_worker() -> None:
+    while True:
+        try:
+            stale_before = (
+                datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)
+            ).isoformat().replace("+00:00", "Z")
+            job = batch_catalog.claim_export(Config.INSTANCE_DIR, stale_before)
+            if job is None:
+                _document_export_event.wait(5)
+                _document_export_event.clear()
+                continue
+            try:
+                _export_batch_document(job)
+            except Exception as exc:
+                batch_catalog.fail_export(
+                    Config.INSTANCE_DIR,
+                    str(job["public_id"]),
+                    str(job["kind"]),
+                    str(exc),
+                )
+                app.logger.exception(
+                    "BATCH_EXPORT batch=%s kind=%s status=failed",
+                    job["public_id"], job["kind"],
+                )
+        except Exception:
+            app.logger.exception("Batch export worker failed")
+            _document_export_event.wait(5)
+            _document_export_event.clear()
+
+
+def _start_document_exporters() -> None:
+    global _document_export_started
+    if app.config.get("TESTING") or _document_export_started:
+        return
+    with _document_export_start_lock:
+        if _document_export_started:
+            return
+        for index in range(max(1, Config.FILE_EXPORT_WORKERS)):
+            threading.Thread(
+                target=_document_export_worker,
+                name=f"batch-export-{index + 1}",
+                daemon=True,
+            ).start()
+        _document_export_started = True
+        _document_export_event.set()
+
+
+def _drain_document_exports(limit: int = 20) -> None:
+    """Synchronously drain bounded work for tests and stage barriers."""
+    for _ in range(limit):
+        stale_before = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)
+        ).isoformat().replace("+00:00", "Z")
+        job = batch_catalog.claim_export(Config.INSTANCE_DIR, stale_before)
+        if job is None:
+            return
+        try:
+            _export_batch_document(job)
+        except Exception as exc:
+            batch_catalog.fail_export(
+                Config.INSTANCE_DIR,
+                str(job["public_id"]),
+                str(job["kind"]),
+                str(exc),
+            )
+            raise
 
 
 def _batch_relative_path(root: Path) -> str:
@@ -1742,12 +2024,28 @@ def reconcile_batch_catalog() -> List[str]:
             mapping_mtime = mapping_path.stat().st_mtime_ns if mapping_path.exists() else None
             history_mtime = history_path.stat().st_mtime_ns if history_path.exists() else None
             existing = existing_batches.get(relative_path.casefold())
+            enriched_document = (
+                batch_catalog.document_state(
+                    Config.INSTANCE_DIR, str(existing["public_id"]), "enriched"
+                )
+                if existing is not None else None
+            )
+            mapping_document = (
+                batch_catalog.document_state(
+                    Config.INSTANCE_DIR, str(existing["public_id"]), "name_mapping"
+                )
+                if existing is not None and mapping_path.exists() else None
+            )
             if (
+                not app.config.get("TESTING")
+                and
                 existing is not None
                 and existing["validity"] == "ready"
                 and existing["enriched_mtime_ns"] == enriched_mtime
                 and existing["mapping_mtime_ns"] == mapping_mtime
                 and existing["history_mtime_ns"] == history_mtime
+                and enriched_document is not None
+                and (not mapping_path.exists() or mapping_document is not None)
             ):
                 batch_catalog.upsert_batch(
                     Config.INSTANCE_DIR,
@@ -1762,16 +2060,76 @@ def reconcile_batch_catalog() -> List[str]:
                     history_status=str(existing["history_status"]),
                 )
                 continue
-            with csv_path.open("r", newline="", encoding="utf-8") as handle:
-                reader = csv.DictReader(handle)
-                if not reader.fieldnames or "ParsingQCPassed" not in reader.fieldnames:
-                    raise DataLoadError("enriched.csv is missing ParsingQCPassed")
-                slide_rows = list(reader)
+            if enriched_document is None:
+                with csv_path.open("r", newline="", encoding="utf-8") as handle:
+                    reader = csv.DictReader(handle)
+                    if not reader.fieldnames or "ParsingQCPassed" not in reader.fieldnames:
+                        raise DataLoadError("enriched.csv is missing ParsingQCPassed")
+                    enriched_fields = list(reader.fieldnames)
+                    slide_rows = list(reader)
+            else:
+                enriched_fields, slide_rows, enriched_document = (
+                    batch_catalog.load_document(
+                        Config.INSTANCE_DIR, str(existing["public_id"]), "enriched"
+                    )
+                )
+                current_hash = _file_sha256(csv_path)
+                if (
+                    current_hash != enriched_document["source_hash"]
+                    and enriched_document["status"] == "current"
+                ):
+                    if app.config.get("TESTING"):
+                        enriched_fields, slide_rows = renaming.read_csv(csv_path)
+                        batch_catalog.adopt_document(
+                            Config.INSTANCE_DIR,
+                            str(existing["public_id"]),
+                            "enriched",
+                            enriched_fields,
+                            slide_rows,
+                            current_hash,
+                        )
+                    else:
+                        message = "enriched.csv changed outside InSlide"
+                        batch_catalog.mark_document_conflict(
+                            Config.INSTANCE_DIR, str(existing["public_id"]), "enriched", message
+                        )
+                        warnings.append(f"{display_name}: {message}; database copy was kept.")
             if not slide_rows:
                 raise DataLoadError("enriched.csv has no slide rows")
             renaming_status = "missing"
             if mapping_path.exists():
-                _, mapping_rows = renaming.read_csv(mapping_path)
+                if mapping_document is None:
+                    mapping_fields, mapping_rows = renaming.read_csv(mapping_path)
+                else:
+                    mapping_fields, mapping_rows, mapping_document = (
+                        batch_catalog.load_document(
+                            Config.INSTANCE_DIR, str(existing["public_id"]), "name_mapping"
+                        )
+                    )
+                    current_hash = _file_sha256(mapping_path)
+                    if (
+                        current_hash != mapping_document["source_hash"]
+                        and mapping_document["status"] == "current"
+                    ):
+                        if app.config.get("TESTING"):
+                            mapping_fields, mapping_rows = renaming.read_csv(mapping_path)
+                            batch_catalog.adopt_document(
+                                Config.INSTANCE_DIR,
+                                str(existing["public_id"]),
+                                "name_mapping",
+                                mapping_fields,
+                                mapping_rows,
+                                current_hash,
+                            )
+                        else:
+                            message = "name_mapping.csv changed outside InSlide"
+                            batch_catalog.mark_document_conflict(
+                                Config.INSTANCE_DIR,
+                                str(existing["public_id"]),
+                                "name_mapping",
+                                message,
+                            )
+                            warnings.append(f"{display_name}: {message}; database copy was kept.")
                 renaming_status = (
                     "approved"
                     if mapping_rows and all(renaming.parse_bool(row["Approved"]) for row in mapping_rows)
@@ -1791,6 +2149,30 @@ def reconcile_batch_catalog() -> List[str]:
                 renaming_status=renaming_status,
                 history_status=history_status,
             )
+            if enriched_document is None:
+                batch_catalog.import_document(
+                    Config.INSTANCE_DIR,
+                    public_id,
+                    "enriched",
+                    enriched_fields,
+                    slide_rows,
+                    _file_sha256(csv_path),
+                )
+                _seal_batch_file(csv_path)
+            if mapping_path.exists() and mapping_document is None:
+                batch_catalog.import_document(
+                    Config.INSTANCE_DIR,
+                    public_id,
+                    "name_mapping",
+                    mapping_fields,
+                    mapping_rows,
+                    _file_sha256(mapping_path),
+                )
+                _seal_batch_file(mapping_path)
+            if not app.config.get("TESTING"):
+                for artifact in root.glob("*.csv"):
+                    if artifact.is_file() and not artifact.is_symlink():
+                        _seal_batch_file(artifact)
             _reconcile_queue_rows(public_id, slide_rows)
         except (DataLoadError, OSError, ValueError, csv.Error, renaming.RenamingError) as exc:
             app.logger.warning("Skipping invalid batch %s: %s", root, exc)
@@ -1806,9 +2188,64 @@ def reconcile_batch_catalog() -> List[str]:
     return warnings
 
 
+def _refresh_copath_report_index() -> None:
+    clone_root = Path(Config.COPATH_CLONE)
+    for organ in renaming.ORGANS:
+        source_key = f"organ:{organ}"
+        path = clone_root / organ / "copath_data.csv"
+        state = batch_catalog.copath_source_state(Config.INSTANCE_DIR, source_key)
+        try:
+            details = path.stat()
+        except FileNotFoundError:
+            if state is not None and state.get("mtime_ns") is not None:
+                batch_catalog.replace_copath_source(
+                    Config.INSTANCE_DIR, source_key, str(path), None, None, []
+                )
+            continue
+        if (
+            state is not None
+            and state.get("size") == details.st_size
+            and state.get("mtime_ns") == details.st_mtime_ns
+        ):
+            continue
+        _, rows = renaming.read_csv(path)
+        batch_catalog.replace_copath_source(
+            Config.INSTANCE_DIR,
+            source_key,
+            str(path),
+            details.st_size,
+            details.st_mtime_ns,
+            [renaming.collapse_report_fields(row) for row in rows],
+        )
+
+
+def _renaming_report_rows(
+    context: BatchContext, mapping_rows: Sequence[Dict[str, str]]
+) -> Dict[str, Dict[str, str]]:
+    if app.config.get("TESTING"):
+        return renaming.report_rows(context.root, Path(Config.COPATH_CLONE))
+    keys = [
+        renaming.row_accession_key(row)
+        for row in mapping_rows
+        if renaming.row_accession(row)
+    ]
+    reports = batch_catalog.copath_reports(Config.INSTANCE_DIR, keys)
+    pending = context.root / "pending_CoPath_data.csv"
+    if pending.exists():
+        _, rows = renaming.read_csv(pending)
+        reports.update(
+            {
+                renaming.row_accession_key(row): renaming.collapse_report_fields(row)
+                for row in rows
+                if renaming.row_accession(row)
+            }
+        )
+    return reports
+
+
 def _catalog_reconciler() -> None:
     while True:
-        time.sleep(max(1, Config.BATCH_CATALOG_RECONCILE_SECONDS))
+        started = time.monotonic()
         try:
             with _catalog_reconcile_lock:
                 lease_seconds = max(60, Config.BATCH_CATALOG_RECONCILE_SECONDS * 2)
@@ -1821,26 +2258,38 @@ def _catalog_reconciler() -> None:
                         batch_catalog.release_reconcile_lease(
                             Config.INSTANCE_DIR, _catalog_reconcile_owner
                         )
+            _refresh_pipeline_date_options()
+            _refresh_copath_report_index()
             _tq_catalog()
+            app.logger.info(
+                "CATALOG_RECONCILE status=succeeded duration_ms=%d",
+                round((time.monotonic() - started) * 1000),
+            )
         except Exception:
             app.logger.exception("Background batch catalog reconciliation failed")
+        time.sleep(max(1, Config.BATCH_CATALOG_RECONCILE_SECONDS))
 
 
 def _start_catalog_reconciler() -> None:
-    """Start periodic reconciliation; caller must hold _catalog_reconcile_lock."""
+    """Start immediate and periodic reconciliation without blocking requests."""
     global _catalog_reconciler_started
-    if not app.config.get("TESTING") and not _catalog_reconciler_started:
-        threading.Thread(target=_catalog_reconciler, daemon=True).start()
-        _catalog_reconciler_started = True
+    if app.config.get("TESTING") or _catalog_reconciler_started:
+        return
+    with _catalog_reconcile_start_lock:
+        if not _catalog_reconciler_started:
+            threading.Thread(target=_catalog_reconciler, daemon=True).start()
+            _catalog_reconciler_started = True
 
 
 def _ensure_catalog_reconciled() -> List[str]:
     global _catalog_reconciled_target
     target = (str(Path(Config.INSTANCE_DIR)), str(Path(Config.INSLIDE_BATCHES)))
     warnings: List[str] = []
-    with _catalog_reconcile_lock:
-        if _catalog_reconciled_target != target:
-            batch_catalog.reset()
+    if app.config.get("TESTING"):
+        with _catalog_reconcile_lock:
+            if _catalog_reconciled_target != target:
+                batch_catalog.reset()
+                _catalog_reconciled_target = target
             lease_seconds = max(60, Config.BATCH_CATALOG_RECONCILE_SECONDS * 2)
             if batch_catalog.acquire_reconcile_lease(
                 Config.INSTANCE_DIR, _catalog_reconcile_owner, lease_seconds
@@ -1851,8 +2300,12 @@ def _ensure_catalog_reconciled() -> List[str]:
                     batch_catalog.release_reconcile_lease(
                         Config.INSTANCE_DIR, _catalog_reconcile_owner
                     )
-            _catalog_reconciled_target = target
-        _start_catalog_reconciler()
+        return warnings
+    if _catalog_reconciled_target != target:
+        batch_catalog.reset()
+        _catalog_reconciled_target = target
+    _start_catalog_reconciler()
+    _start_document_exporters()
     return warnings
 
 
@@ -1881,6 +2334,8 @@ def discover_batches() -> Tuple[List[BatchContext], List[str]]:
                 batch_contexts[batch_id] = context
             else:
                 context.run_type = str(row.get("run_type", "nightly"))
+                context.renaming_status = str(row.get("renaming_status", "missing"))
+                context.history_status = str(row.get("history_status", "not_needed"))
                 context.completed_stages = {
                     "QC": bool(row["qc_complete"]),
                     "Renamed": bool(row["renamed_complete"]),
@@ -1957,10 +2412,15 @@ def _start_longitudinal_job(context: BatchContext, *, force: bool = False) -> bo
                     Path(Config.COPATH_CLONE),
                     Path(Config.INSLIDE_BATCHES),
                 )
-            mapping_path = context.root / "name_mapping.csv"
-            if mapping_path.exists():
-                _, rows = renaming.read_csv(mapping_path)
+                if (context.root / "name_mapping.csv").exists():
+                    _adopt_batch_document(context.id, context.root, "name_mapping")
+            state = batch_catalog.document_state(
+                Config.INSTANCE_DIR, context.id, "name_mapping"
+            )
+            if state is not None:
+                _, rows, _ = _load_batch_document(context.id, "name_mapping")
                 if rows and all(renaming.parse_bool(row["Approved"]) for row in rows):
+                    _wait_for_document_export(context.id, "name_mapping")
                     with _renaming_clone_lock:
                         renaming.finalize_batch(context.root, Path(Config.COPATH_CLONE))
         except Exception:
@@ -1993,7 +2453,9 @@ def _start_renaming_job(
         if (
             not force
             and old_accession is None
-            and (context.root / "name_mapping.csv").exists()
+            and batch_catalog.document_state(
+                Config.INSTANCE_DIR, context.id, "name_mapping"
+            ) is not None
         ):
             _renaming_jobs[context.id] = {"status": "ready", "error": ""}
             return False
@@ -2006,6 +2468,8 @@ def _start_renaming_job(
         try:
             with _renaming_clone_lock:
                 if old_accession is not None and new_accession is not None:
+                    _wait_for_document_export(context.id, "enriched")
+                    _wait_for_document_export(context.id, "name_mapping")
                     renaming.retry_group(
                         context.root,
                         Path(Config.COPATH_CLONE),
@@ -2013,15 +2477,24 @@ def _start_renaming_job(
                         old_accession,
                         new_accession,
                     )
+                    context.document_version = _adopt_batch_document(
+                        context.id, context.root, "enriched"
+                    )
+                    _adopt_batch_document(context.id, context.root, "name_mapping")
                     _replace_sdl_accession(old_accession, new_accession)
-                    context.data_manager.load_data(context.csv_path)
-                    context.csv_mod_time = context.csv_path.stat().st_mtime
+                    fields, rows, state = _load_batch_document(
+                        context.id, "enriched"
+                    )
+                    context.data_manager.load_rows(fields, rows)
+                    context.document_version = int(state["desired_version"])
                 else:
+                    _wait_for_document_export(context.id, "enriched")
                     renaming.prepare_batch(
                         context.root,
                         Path(Config.COPATH_CLONE),
                         Path(Config.INSLIDE_BATCHES),
                     )
+                    _adopt_batch_document(context.id, context.root, "name_mapping")
             state = {"status": "ready", "error": ""}
         except Exception as exc:
             app.logger.exception("Renaming preparation failed for batch %s", context.id)
@@ -3218,12 +3691,15 @@ def _tq_catalog_signature(batches: Sequence[BatchContext]) -> str:
     ]
     for context in batches:
         mapping_path = context.root / "name_mapping.csv"
+        state = batch_catalog.document_state(
+            Config.INSTANCE_DIR, context.id, "name_mapping"
+        )
         values.append(
             {
                 "kind": "mapping",
                 "batch_id": context.id,
                 "path": str(mapping_path),
-                **_tq_source_stat(mapping_path),
+                "version": int(state["desired_version"]) if state else None,
             }
         )
     return hashlib.sha256(
@@ -3262,7 +3738,10 @@ def _tq_rebuild_catalog(
             "status": "ready",
             "error": "",
         }
-        if not mapping_path.is_file():
+        state = batch_catalog.document_state(
+            Config.INSTANCE_DIR, context.id, "name_mapping"
+        )
+        if state is None:
             source["status"] = "error"
             source["error"] = "file was not found"
             if context.completed_stages["Renamed"]:
@@ -3272,7 +3751,7 @@ def _tq_rebuild_catalog(
             sources.append(source)
             continue
         try:
-            fields, rows = renaming.read_csv(mapping_path)
+            fields, rows, _ = _load_batch_document(context.id, "name_mapping")
             missing = required.difference(fields)
             if missing:
                 raise renaming.RenamingError(
@@ -4366,7 +4845,7 @@ def _pipeline_path_is_allowed(candidate: Path, roots: List[Path]) -> bool:
     return False
 
 
-def _pipeline_date_options() -> Tuple[List[Dict[str, str]], List[str]]:
+def _rebuild_pipeline_date_options() -> Tuple[List[Dict[str, str]], List[str]]:
     """Return readable scanner/date directories named by scanner inventories."""
     inventory_root = Path(Config.SCANNER_INVENTORIES)
     gt450_root = runtime_path(Config.GT450_IMAGES).expanduser().resolve()
@@ -4434,6 +4913,56 @@ def _pipeline_date_options() -> Tuple[List[Dict[str, str]], List[str]]:
         key=lambda option: (option["date"], option["scanner"]),
         reverse=True,
     ), warnings
+
+
+def _pipeline_inventory_signature() -> str:
+    root = Path(Config.SCANNER_INVENTORIES)
+    values = []
+    try:
+        for path in sorted(root.glob("*_inventory.csv"), key=lambda item: item.name.casefold()):
+            if path.is_file() and not path.is_symlink():
+                details = path.stat()
+                values.append((path.name, details.st_size, details.st_mtime_ns))
+    except OSError as exc:
+        values.append(("error", str(exc)))
+    return hashlib.sha256(
+        json.dumps(values, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _refresh_pipeline_date_options() -> Tuple[List[Dict[str, str]], List[str]]:
+    signature = _pipeline_inventory_signature()
+    stored = batch_catalog.get_metadata(
+        Config.INSTANCE_DIR, "pipeline_date_options_signature"
+    )
+    cached = batch_catalog.get_metadata(Config.INSTANCE_DIR, "pipeline_date_options")
+    if stored == signature and cached:
+        payload = json.loads(cached)
+        return list(payload["options"]), list(payload["warnings"])
+    options, warnings = _rebuild_pipeline_date_options()
+    batch_catalog.set_metadata(
+        Config.INSTANCE_DIR,
+        "pipeline_date_options",
+        json.dumps({"options": options, "warnings": warnings}),
+    )
+    batch_catalog.set_metadata(
+        Config.INSTANCE_DIR, "pipeline_date_options_signature", signature
+    )
+    return options, warnings
+
+
+def _pipeline_date_options() -> Tuple[List[Dict[str, str]], List[str]]:
+    if app.config.get("TESTING"):
+        return _refresh_pipeline_date_options()
+    cached = batch_catalog.get_metadata(Config.INSTANCE_DIR, "pipeline_date_options")
+    if cached:
+        try:
+            payload = json.loads(cached)
+            return list(payload["options"]), list(payload["warnings"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    _start_catalog_reconciler()
+    return [], ["Scanner and date options are updating. Refresh this page shortly."]
 
 
 def _pipeline_web_paths(
@@ -4650,6 +5179,18 @@ def _read_pipeline_output(job: PipelineJob) -> None:
         with _pipeline_jobs_lock:
             job.return_code = return_code
             job.status = "succeeded" if return_code == 0 else "failed"
+        if return_code == 0:
+            try:
+                command = list(getattr(job.process, "args", ()) or ())
+                if "--output-dir" in command:
+                    output_dir = Path(str(command[command.index("--output-dir") + 1]))
+                    for artifact in output_dir.glob("*.csv"):
+                        if artifact.is_file() and not artifact.is_symlink():
+                            _seal_batch_file(artifact)
+                with _catalog_reconcile_lock:
+                    reconcile_batch_catalog()
+            except Exception:
+                app.logger.exception("Could not ingest completed pipeline output")
         if job.output_path:
             api_store.update_job(
                 job.id,
@@ -4924,6 +5465,15 @@ def response_security_metadata(response):
                 sort_keys=True,
             ),
         )
+    if request.endpoint in {"pipeline_launcher", "renaming_page", "qc"}:
+        started = getattr(g, "request_started_at", None)
+        if started is not None:
+            app.logger.info(
+                "PAGE_TIMING endpoint=%s status=%d duration_ms=%d",
+                request.endpoint,
+                response.status_code,
+                round((time.monotonic() - started) * 1000),
+            )
     return response
 
 
@@ -4954,12 +5504,14 @@ def api_internal_error(error):
 @app.before_request
 def before_request_handler():
     g.csp_nonce = secrets.token_urlsafe(16)
+    g.request_started_at = time.monotonic()
     if not app.testing:
         try:
             validate_security_config()
         except SecurityConfigurationError as exc:
             app.logger.critical("Invalid security configuration: %s", exc)
             return "Server security configuration is invalid.", 500
+    _start_document_exporters()
 
     if request.path.startswith("/api/v1/"):
         supplied_request_id = request.headers.get("X-Request-ID", "")
@@ -5245,8 +5797,7 @@ def admin_download_lifetime_statistics():
 def tq_page():
     # Keep this response a small page shell. Existing catalog data is usable
     # immediately while periodic reconciliation handles source changes.
-    with _catalog_reconcile_lock:
-        _start_catalog_reconciler()
+    _start_catalog_reconciler()
     discovery_warnings: List[str] = []
     raw_warnings = batch_catalog.get_metadata(
         Config.INSTANCE_DIR, "last_reconcile_warnings"
@@ -5623,19 +6174,18 @@ def tq_edit_config():
 @login_required
 def renaming_page():
     all_batches, discovery_warnings = discover_batches()
-    _resume_longitudinal_jobs(all_batches)
+    _resume_longitudinal_jobs(
+        batch for batch in all_batches
+        if batch.history_status in {"pending", "running"}
+    )
     batches = [
         batch for batch in all_batches
         if batch.completed_stages["QC"] and not batch.completed_stages["Renamed"]
     ]
     history_failures = []
     for batch in all_batches:
-        try:
-            history = renaming.read_history_job(batch.root)
-        except renaming.RenamingError as exc:
-            history = {"status": "failed", "error": str(exc)}
-        if history.get("status") == "failed":
-            history_failures.append((batch, history))
+        if batch.history_status == "failed":
+            history_failures.append((batch, {"status": "failed", "error": ""}))
     if request.args.get("choose") == "1":
         session.pop("renaming_batch_id", None)
     requested = request.args.get("batch") or session.get("renaming_batch_id")
@@ -5644,7 +6194,7 @@ def renaming_page():
         if requested:
             session.pop("renaming_batch_id", None)
         for batch in batches:
-            if not (batch.root / "name_mapping.csv").exists():
+            if batch.renaming_status == "missing":
                 _start_renaming_job(batch)
         return render_template(
             "renaming.html",
@@ -5657,8 +6207,9 @@ def renaming_page():
         )
 
     session["renaming_batch_id"] = context.id
-    mapping_path = context.root / "name_mapping.csv"
-    if not mapping_path.exists():
+    if batch_catalog.document_state(
+        Config.INSTANCE_DIR, context.id, "name_mapping"
+    ) is None:
         _start_renaming_job(context)
         return render_template(
             "renaming.html", batches=batches, context=context, groups=[], signature="",
@@ -5667,22 +6218,23 @@ def renaming_page():
         )
     try:
         with _renaming_clone_lock:
-            renaming.repair_staged_pid_assignments(
-                Path(Config.COPATH_CLONE), Path(Config.INSLIDE_BATCHES)
-            )
-            _, rows = renaming.read_csv(mapping_path)
-            reports = renaming.report_rows(context.root, Path(Config.COPATH_CLONE))
+            _, rows, _ = _load_batch_document(context.id, "name_mapping")
+            reports = _renaming_report_rows(context, rows)
         groups = _renaming_groups_with_image_links(context, rows, reports)
         signature = renaming.mapping_signature(rows)
     except renaming.RenamingError as exc:
         flash(str(exc), "error")
         groups, signature = [], ""
     history_job = renaming.read_history_job(context.root)
+    export_state = batch_catalog.document_state(
+        Config.INSTANCE_DIR, context.id, "name_mapping"
+    )
     return render_template(
         "renaming.html", batches=batches, context=context, groups=groups,
         signature=signature, discovery_warnings=discovery_warnings,
         messages=flash_messages(), job_state=_renaming_job_state(context.id),
         history_job=history_job, history_failures=history_failures,
+        export_state=export_state,
     )
 
 
@@ -5693,7 +6245,9 @@ def renaming_status(batch_id: str):
     if context is None:
         return jsonify({"status": "unavailable", "error": "Batch not found."}), 404
     state = _renaming_job_state(batch_id)
-    state["ready"] = (context.root / "name_mapping.csv").exists()
+    state["ready"] = batch_catalog.document_state(
+        Config.INSTANCE_DIR, batch_id, "name_mapping"
+    ) is not None
     state["history"] = renaming.read_history_job(context.root)
     return jsonify(state)
 
@@ -5751,7 +6305,7 @@ def _renaming_group_html(
     signature: str,
 ) -> str:
     """Render one current mapping group for an in-page approval update."""
-    reports = renaming.report_rows(context.root, Path(Config.COPATH_CLONE))
+    reports = _renaming_report_rows(context, rows)
     group = next(
         (
             candidate
@@ -5780,7 +6334,7 @@ def _renaming_groups_with_image_links(
     reports: Dict[str, Dict[str, str]],
 ) -> List[Dict[str, object]]:
     """Group mappings and attach safe, existing label/macro image URLs."""
-    _, enriched_rows = renaming.read_csv(context.root / "enriched.csv")
+    _, enriched_rows, _ = _load_batch_document(context.id, "enriched")
     images_by_slide = {
         row.get("original_slide_path", ""): row
         for row in enriched_rows
@@ -5823,12 +6377,13 @@ def renaming_pid(batch_id: str):
     reserved_pids = request.args.getlist("reserved_pid")
     expected_signature = request.args.get("mapping_signature", "")
     try:
+        _, rows, _ = _load_batch_document(context.id, "name_mapping")
+        if renaming.mapping_signature(rows) != expected_signature:
+            raise renaming.RenamingError(
+                "The mapping changed in another session; reload and try again"
+            )
+        _wait_for_document_export(context.id, "name_mapping")
         with _renaming_clone_lock:
-            _, rows = renaming.read_csv(context.root / "name_mapping.csv")
-            if renaming.mapping_signature(rows) != expected_signature:
-                raise renaming.RenamingError(
-                    "The mapping changed in another session; reload and try again"
-                )
             pid = renaming.pid_after_organ_change(
                 context.root,
                 Path(Config.COPATH_CLONE),
@@ -5837,7 +6392,8 @@ def renaming_pid(batch_id: str):
                 organ,
                 reserved_pids,
             )
-            _, rows = renaming.read_csv(context.root / "name_mapping.csv")
+            _adopt_batch_document(context.id, context.root, "name_mapping")
+            _, rows, _ = _load_batch_document(context.id, "name_mapping")
             signature = renaming.mapping_signature(rows)
         payload = {"success": True, "pid": pid}
         if signature != expected_signature:
@@ -5892,17 +6448,19 @@ def renaming_approve(batch_id: str):
                 "BlockNumber": request.form.get(f"block_number_{index}", "").strip(),
                 "SectionCount": request.form.get(f"section_count_{index}", "").strip(),
             }
+        _, current_rows, _ = _load_batch_document(context.id, "name_mapping")
+        submitted_signature = request.form.get("mapping_signature", "")
+        if renaming.mapping_signature(current_rows) != submitted_signature:
+            raise renaming.RenamingError(
+                "The mapping changed in another session; reload and try again"
+            )
+        _wait_for_document_export(context.id, "name_mapping")
         with _renaming_clone_lock:
-            _, current_rows = renaming.read_csv(mapping_path)
-            submitted_signature = request.form.get("mapping_signature", "")
-            if renaming.mapping_signature(current_rows) != submitted_signature:
-                raise renaming.RenamingError(
-                    "The mapping changed in another session; reload and try again"
-                )
             renaming.repair_staged_pid_assignments(
                 Path(Config.COPATH_CLONE), Path(Config.INSLIDE_BATCHES)
             )
-            _, current_rows = renaming.read_csv(mapping_path)
+            _adopt_batch_document(context.id, context.root, "name_mapping")
+            _, current_rows, _ = _load_batch_document(context.id, "name_mapping")
             repaired_signature = renaming.mapping_signature(current_rows)
             old_key = renaming.accession_key(old_accession)
             new_key = renaming.accession_key(values["AccessionID"])
@@ -5934,10 +6492,28 @@ def renaming_approve(batch_id: str):
                     old_accession,
                     values["Organ"],
                 )
-            updated, merged = renaming.update_group(
-                mapping_path, old_accession, values, slide_values,
+                _adopt_batch_document(context.id, context.root, "name_mapping")
+                _, current_rows, _ = _load_batch_document(
+                    context.id, "name_mapping"
+                )
+                repaired_signature = renaming.mapping_signature(current_rows)
+            updated, merged = renaming.update_group_rows(
+                current_rows, old_accession, values, slide_values,
                 repaired_signature,
             )
+            _replace_batch_document(
+                context.id, "name_mapping", renaming.MAPPING_FIELDS, updated
+            )
+            if merged:
+                pending_path = context.root / "pending_CoPath_data.csv"
+                if pending_path.exists():
+                    headers, pending = renaming.read_csv(pending_path)
+                    old_key = renaming.accession_key(old_accession)
+                    pending = [
+                        row for row in pending
+                        if renaming.row_accession_key(row) != old_key
+                    ]
+                    renaming.atomic_write(pending_path, headers, pending)
         if (
             values["AccessionID"] != old_accession
             and renaming.same_accession(values["AccessionID"], old_accession)
@@ -5950,6 +6526,7 @@ def renaming_approve(batch_id: str):
             message = f"Approved names for {values['AccessionID']}."
             category = "success"
         if updated and all(renaming.parse_bool(row["Approved"]) for row in updated):
+            _wait_for_document_export(context.id, "name_mapping")
             with _renaming_clone_lock:
                 renaming.finalize_batch(context.root, Path(Config.COPATH_CLONE))
                 _update_sdl_after_renaming(context.root)
@@ -6541,8 +7118,11 @@ def qc():
         item_to_display = queue_manager.claim(str(current_user.id))
         if item_to_display is None:
                 # 4. Every unfinished item is currently leased by another user.
-                total = len(queue_manager.items)
-                done = len([i for i in queue_manager.get_all() if i.status == "completed"])
+                counts, _ = batch_catalog.queue_dashboard(
+                    Config.INSTANCE_DIR, context.id, str(current_user.id), 0
+                )
+                total = sum(counts.values())
+                done = counts["completed"]
                 return render_template(
                     "qc.html",
                     no_items_available=True,
@@ -6590,27 +7170,18 @@ def qc():
     label_image_url, label_image_exists = resolve_image_path("_label_path")
     macro_image_url, macro_image_exists = resolve_image_path("_macro_path")
 
-    queue_stats = {
-        "pending": len([i for i in queue_manager.get_all() if i.status == "pending"]),
-        "leased": len([i for i in queue_manager.get_all() if i.status == "leased"]),
-        "completed": len([i for i in queue_manager.get_all() if i.status == "completed"]),
-    }
-    
-    recently_completed_items = sorted(
-        [i for i in queue_manager.get_all() if i.completed_by_id == current_user.id],
-        key=lambda x: x.completed_at if x.completed_at else datetime.datetime.min,
-        reverse=True
-    )[:5]
+    queue_stats, recently_completed_rows = batch_catalog.queue_dashboard(
+        Config.INSTANCE_DIR, context.id, str(current_user.id)
+    )
     
     # Enrich for template (needs accession_id)
     recently_completed = []
-    for r in recently_completed_items:
-        rr = data_manager.get_row(r.original_index)
-        # Create a proxy object or dict for template
-        r_dict = r.to_dict()
+    for raw in recently_completed_rows:
+        item = QueueItem(**raw)
+        rr = data_manager.get_row(item.original_index)
+        r_dict = item.to_dict()
         r_dict['accession_id'] = rr.get("AccessionID", "N/A") if rr else "N/A"
-        # Overwrite string date with object for strftime support in template
-        r_dict['completed_at'] = r.completed_at 
+        r_dict['completed_at'] = item.completed_at
         recently_completed.append(r_dict)
 
     return render_template(
@@ -6629,6 +7200,9 @@ def qc():
         datetime=datetime.datetime,
         timedelta=datetime.timedelta,
         recently_completed=recently_completed,
+        export_state=batch_catalog.document_state(
+            Config.INSTANCE_DIR, context.id, "enriched"
+        ),
         batch_id=context.id,
         batch_name=context.display_name,
         discovery_warnings=discovery_warnings,
@@ -6725,9 +7299,7 @@ def update():
             queue_manager.save()
 
             try:
-                _create_backup(context)
-                data_manager.save_data(context.csv_path)
-                context.csv_mod_time = context.csv_path.stat().st_mtime
+                context.save_enriched([idx])
 
                 if completed_now:
                     try:
@@ -6742,13 +7314,16 @@ def update():
                         )
 
                 # --- CHECK IF LIST IS DONE ---
-                remaining = len([i for i in queue_manager.get_all() if i.status != "completed"])
+                batch_state = batch_catalog.get_batch(Config.INSTANCE_DIR, context.id)
+                remaining = (
+                    int(batch_state["pending_count"]) + int(batch_state["leased_count"])
+                    if batch_state else 0
+                )
 
                 if remaining == 0:
                     invalid_indices = _requeue_invalid_qc_rows(context)
                     if invalid_indices:
-                        data_manager.save_data(context.csv_path)
-                        context.csv_mod_time = context.csv_path.stat().st_mtime
+                        context.save_enriched(invalid_indices)
                         app.logger.warning(
                             "Final QC validation returned %d row(s) to the queue for batch %s.",
                             len(invalid_indices),
@@ -6761,6 +7336,7 @@ def update():
                         )
                     else:
                         app.logger.info("All items passed final validation. Creating final backup.")
+                        _wait_for_document_export(context.id, "enriched")
                         _create_backup(context, suffix="FINAL_COMPLETED")
                         try:
                             context.mark_qc_complete()

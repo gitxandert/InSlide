@@ -61,6 +61,11 @@
     <ul class="messages" id="renaming-messages">
         {% for message in messages %}<li class="{{ message.category }}">{{ message.message }}</li>{% endfor %}
         {% for warning in discovery_warnings %}<li>{{ warning }}</li>{% endfor %}
+        {% if export_state and export_state.status != 'current' %}
+            <li class="{{ 'error' if export_state.status in ('failed', 'conflict') else 'info' }}">
+                Batch file export: {{ export_state.status }}{% if export_state.error %} — {{ export_state.error }}{% endif %}
+            </li>
+        {% endif %}
     </ul>
 
     {% if history_failures %}

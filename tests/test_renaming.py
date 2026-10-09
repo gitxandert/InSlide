@@ -678,6 +678,8 @@ class RenamingPageTests(unittest.TestCase):
         app_module.Config.COPATH_CLONE = str(self.clone)
         app_module.Config.INSTANCE_DIR = str(self.root / "instance")
         app_module.Config.SDL_FILE_PATH = str(self.root / "Slide_Digitization_Log.xlsx")
+        self.old_testing = app_module.app.config["TESTING"]
+        app_module.app.config.update(TESTING=True, SECRET_KEY="renaming-test")
         workbook = Workbook()
         worksheet = workbook.active
         worksheet.title = app_module.Config.SDL_SHEET_NAME
@@ -694,7 +696,6 @@ class RenamingPageTests(unittest.TestCase):
         )
         self.user = app_module.User("renamer", "", False)
         app_module.user_manager.users[self.user.id] = self.user
-        app_module.app.config.update(TESTING=True, SECRET_KEY="renaming-test")
         self.client = app_module.app.test_client()
         with self.client.session_transaction() as session:
             session["_user_id"] = self.user.id
@@ -739,6 +740,7 @@ class RenamingPageTests(unittest.TestCase):
         app_module.Config.COPATH_CLONE = self.old_clone
         app_module.Config.INSTANCE_DIR = self.old_instance
         app_module.Config.SDL_FILE_PATH = self.old_sdl
+        app_module.app.config["TESTING"] = self.old_testing
         app_module.user_manager.users = self.old_users
         app_module.batch_contexts.clear()
         app_module._renaming_jobs.clear()

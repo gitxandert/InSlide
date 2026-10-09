@@ -1109,6 +1109,28 @@ def update_group(
     expected_signature: str,
 ) -> Tuple[List[Dict[str, str]], bool]:
     _, rows = read_csv(mapping_path)
+    rows, target_exists = update_group_rows(
+        rows, old_accession, values, slide_values, expected_signature
+    )
+    atomic_write(mapping_path, MAPPING_FIELDS, rows)
+    if target_exists:
+        old_key = accession_key(old_accession)
+        pending_path = mapping_path.parent / "pending_CoPath_data.csv"
+        if pending_path.exists():
+            headers, pending = read_csv(pending_path)
+            pending = [row for row in pending if row_accession_key(row) != old_key]
+            atomic_write(pending_path, headers, pending)
+    return rows, target_exists
+
+
+def update_group_rows(
+    rows: List[Dict[str, str]],
+    old_accession: str,
+    values: Dict[str, str],
+    slide_values: Dict[str, Dict[str, str]],
+    expected_signature: str,
+) -> Tuple[List[Dict[str, str]], bool]:
+    """Apply one approval to central mapping rows without touching a file."""
     if mapping_signature(rows) != expected_signature:
         raise RenamingError("The mapping changed in another session; reload and try again")
     new_accession = clean_accession(values["AccessionID"])
@@ -1141,13 +1163,6 @@ def update_group(
     errors = validate_mapping_rows(rows)
     if errors:
         raise RenamingError("; ".join(errors))
-    atomic_write(mapping_path, MAPPING_FIELDS, rows)
-    if target_exists:
-        pending_path = mapping_path.parent / "pending_CoPath_data.csv"
-        if pending_path.exists():
-            headers, pending = read_csv(pending_path)
-            pending = [row for row in pending if row_accession_key(row) != old_key]
-            atomic_write(pending_path, headers, pending)
     return rows, target_exists
 
 
