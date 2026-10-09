@@ -5846,11 +5846,7 @@ def tq_page():
 @login_required
 def tq_catalog_data():
     """Return one complete client-side record for every transferable slide."""
-    if batch_catalog.get_metadata(Config.INSTANCE_DIR, "transfer_signature") is None:
-        slides, warnings = _tq_catalog()
-    else:
-        slides = batch_catalog.list_transfer_slides(Config.INSTANCE_DIR)
-        warnings = batch_catalog.list_transfer_warnings(Config.INSTANCE_DIR)
+    slides, warnings = _tq_catalog()
     response = jsonify({"slides": slides, "warnings": warnings})
     response.headers["Cache-Control"] = "no-store"
     return response

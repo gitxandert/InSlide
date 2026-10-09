@@ -383,6 +383,18 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(2, len(slides))
         read_csv.assert_not_called()
 
+    def test_catalog_endpoint_rebuilds_stale_rows_from_authoritative_document(self):
+        self.catalog()
+        app_module.batch_catalog.replace_transfer_catalog(
+            app_module.Config.INSTANCE_DIR, [], [], "stale"
+        )
+        (self.batch / "name_mapping.csv").unlink()
+
+        response = self.client.get("/tq/catalog")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, len(response.get_json()["slides"]))
+
     def test_transfer_catalog_uses_existing_renamed_complete_state(self):
         self.catalog()
         batch_id = app_module.discover_batches()[0][0].id
