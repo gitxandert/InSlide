@@ -272,6 +272,11 @@ slides remain in `IMAGE_STAGING_HOST` after every upload, whether it succeeds or
 fails. Size this directory for retained transfers and restrict it to the
 workstation operators and Docker Desktop service account.
 
+Failed transfers can be retried from the transfer output. A retry includes every
+failed or unreported slide and excludes successful slides. Upload failures reuse
+the deidentified staged copies; earlier failures restart staging and
+deidentification.
+
 ### Windows CoPath worker
 
 CoPath queries are delegated to a worker that you start after signing into

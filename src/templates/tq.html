@@ -191,7 +191,15 @@
 
     {% if job %}
     <section class="card" aria-live="polite">
-        <div class="console-heading"><h2>Transfer output</h2><span id="job-status" class="status {{ job.status }}">{{ job.status }}</span></div>
+        <div class="console-heading">
+            <h2>Transfer output</h2><span id="job-status" class="status {{ job.status }}">{{ job.status }}</span>
+            {% if job.status == 'failed' and retry_count %}
+            <form method="POST" action="{{ url_for('tq_retry', job_id=job.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit">Retry {{ retry_count }} failed slide(s)</button>
+            </form>
+            {% endif %}
+        </div>
         <pre id="console" aria-label="Transfer output"></pre>
         {% if job.log_path %}<p class="muted">Transfer log: <code>{{ job.log_path }}</code></p>{% endif %}
     </section>

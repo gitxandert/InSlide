@@ -650,6 +650,59 @@ class TQTransferTests(unittest.TestCase):
         finally:
             copath_path.unlink(missing_ok=True)
 
+    def test_retry_restarts_all_failures_and_excludes_successes(self):
+        slides = [dict(slide) for slide in self.catalog()]
+        successful = slides[0]
+        failed = slides[1]
+        missing = dict(failed)
+        missing["id"] = "missing-result"
+        missing["original_path"] = "missing.svs"
+        missing["destination_name"] = "missing.svs"
+        for slide in (successful, failed, missing):
+            slide["staging_dir"] = "StudyA"
+            slide["destination_dir"] = app_module._tq_destination_dir(
+                "StudyA", slide
+            )
+        previous = app_module.TQJob(
+            "failed-job",
+            self.user.id,
+            None,
+            [successful, failed, missing],
+            slides,
+            resume_upload=True,
+        )
+        previous.status = "failed"
+        previous.results = {
+            successful["original_path"]: {"success": True, "error": ""},
+            failed["original_path"]: {"success": False, "error": "network"},
+        }
+        with app_module._tq_state_lock:
+            app_module._tq_jobs[previous.id] = previous
+        with self.client.session_transaction() as session:
+            session["tq_job_id"] = previous.id
+
+        page = self.client.get("/tq")
+        self.assertIn(b"Retry 2 failed slide(s)", page.data)
+
+        replacement = SimpleNamespace(id="retry-job", status="running")
+        with mock.patch.object(
+            app_module, "_start_tq_job", return_value=replacement
+        ) as start:
+            response = self.client.post(f"/tq/jobs/{previous.id}/retry")
+
+        self.assertEqual(302, response.status_code)
+        retried = start.call_args.args[1]
+        self.assertEqual(
+            {failed["original_path"], missing["original_path"]},
+            {slide["original_path"] for slide in retried},
+        )
+        self.assertTrue(start.call_args.kwargs["resume_upload"])
+        self.assertIs(
+            previous.metadata_slides, start.call_args.kwargs["metadata_slides"]
+        )
+        with self.client.session_transaction() as session:
+            self.assertEqual("retry-job", session["tq_job_id"])
+
     def test_transfer_preflight_repairs_config_and_reports_backup(self):
         slides = self.catalog()
         self.client.post("/tq/review", data={"slide_id": slides[0]["id"]})

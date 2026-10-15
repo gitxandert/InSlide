@@ -3484,11 +3484,14 @@ class TQJob:
         metadata_path: Optional[Path] = None,
         copath_path: Optional[Path] = None,
         missing_copath_accessions: Sequence[str] = (),
+        resume_upload: bool = False,
+        metadata_slides: Optional[List[Dict[str, str]]] = None,
     ):
         self.id = job_id
         self.owner_id = owner_id
         self.process = process
         self.slides = slides
+        self.metadata_slides = metadata_slides or slides
         self.all_slides = all_slides
         self.manifest_path = manifest_path
         self.metadata_path = metadata_path
@@ -3504,6 +3507,7 @@ class TQJob:
         self.log_path: Optional[Path] = None
         self.config_result: Optional[TQConfigResult] = None
         self.tq_log_offsets: Dict[str, int] = {}
+        self.staging_complete = resume_upload
 
 
 def _tq_append_output(job: TQJob, message: str) -> None:
@@ -4551,10 +4555,16 @@ def _tq_fail_before_upload(job: TQJob, error: Exception) -> None:
 def _run_tq_job(job: TQJob) -> None:
     global _tq_active_job_id
     try:
-        _tq_download_slides(job)
-        _tq_deidentify_slides(job)
+        if job.staging_complete:
+            _tq_append_output(
+                job, f"Retrying upload for {len(job.slides)} failed slide(s).\n"
+            )
+        else:
+            _tq_download_slides(job)
+            _tq_deidentify_slides(job)
+            job.staging_complete = True
         _tq_append_output(job, "Starting TQ upload.\n")
-        job.metadata_path = _tq_write_metadata_csv(job.slides)
+        job.metadata_path = _tq_write_metadata_csv(job.metadata_slides)
         if job.missing_copath_accessions:
             _tq_append_output(
                 job,
@@ -4656,6 +4666,8 @@ def _start_tq_job(
     all_slides: List[Dict[str, str]],
     copath_path: Optional[Path] = None,
     missing_copath_accessions: Sequence[str] = (),
+    resume_upload: bool = False,
+    metadata_slides: Optional[List[Dict[str, str]]] = None,
 ) -> TQJob:
     global _tq_active_job_id
     config_result = _tq_config()
@@ -4674,6 +4686,8 @@ def _start_tq_job(
             all_slides,
             copath_path=copath_path,
             missing_copath_accessions=missing_copath_accessions,
+            resume_upload=resume_upload,
+            metadata_slides=metadata_slides,
         )
         job.config_result = config_result
         _tq_jobs[job.id] = job
@@ -4692,6 +4706,14 @@ def _tq_job_for_user(job_id: Optional[str]) -> Optional[TQJob]:
         if job.owner_id != str(current_user.id) and not current_user.is_admin:
             return None
         return job
+
+
+def _tq_failed_slides(job: TQJob) -> List[Dict[str, str]]:
+    return [
+        slide
+        for slide in job.slides
+        if not job.results.get(slide["original_path"], {}).get("success")
+    ]
 
 
 def _tq_safe_path(relative_path: str, expected: str = "any") -> Path:
@@ -5839,6 +5861,9 @@ def tq_page():
         include_copath=draft_snapshot["include_copath"],
         review=review,
         job=job,
+        retry_count=(
+            len(_tq_failed_slides(job)) if job and job.status == "failed" else 0
+        ),
         discovery_warnings=discovery_warnings,
         messages=flash_messages(),
     )
@@ -6138,6 +6163,49 @@ def tq_transfer():
             "warning",
         )
     flash(f"Transfer started for {len(selected)} slide(s).", "success")
+    return redirect(url_for("tq_page"))
+
+
+@app.route("/tq/jobs/<job_id>/retry", methods=["POST"])
+@login_required
+def tq_retry(job_id: str):
+    previous = _tq_job_for_user(job_id)
+    if previous is None:
+        flash("Transfer job not found.", "error")
+        return redirect(url_for("tq_page"))
+    if previous.status != "failed":
+        flash("Only failed transfers can be retried.", "error")
+        return redirect(url_for("tq_page"))
+
+    slides = [dict(slide) for slide in _tq_failed_slides(previous)]
+    if not slides:
+        flash("This transfer has no failed slides to retry.", "error")
+        return redirect(url_for("tq_page"))
+
+    copath_path = None
+    try:
+        missing_copath_accessions: List[str] = []
+        if previous.include_copath:
+            copath_path, missing_copath_accessions = _tq_write_copath_csv(
+                previous.metadata_slides
+            )
+        job = _start_tq_job(
+            str(current_user.id),
+            slides,
+            previous.all_slides,
+            copath_path=copath_path,
+            missing_copath_accessions=missing_copath_accessions,
+            resume_upload=previous.staging_complete,
+            metadata_slides=previous.metadata_slides,
+        )
+    except TQError as exc:
+        if copath_path is not None:
+            copath_path.unlink(missing_ok=True)
+        flash(str(exc), "error")
+        return redirect(url_for("tq_page"))
+
+    session["tq_job_id"] = job.id
+    flash(f"Retry started for {len(slides)} failed slide(s).", "success")
     return redirect(url_for("tq_page"))
 
 
