@@ -267,11 +267,10 @@ accession, including patient identifiers, clinical report text, and InSlide's
 derived fields. Missing accessions are reported in the transfer output while
 available CoPath rows and slides continue uploading; if none are available, the
 CoPath CSV contains only its header. A staging or
-deidentification failure prevents the whole selection from uploading. Files
-confirmed successful by TQ are removed; failed files remain for
-diagnosis and are replaced from GT450 on retry. Size this directory for the
-largest transfer selection and restrict it to the workstation operators and
-Docker Desktop service account.
+deidentification failure prevents the whole selection from uploading. Staged
+slides remain in `IMAGE_STAGING_HOST` after every upload, whether it succeeds or
+fails. Size this directory for retained transfers and restrict it to the
+workstation operators and Docker Desktop service account.
 
 ### Windows CoPath worker
 

@@ -230,6 +230,27 @@ class TQTransferTests(unittest.TestCase):
         )
         return row
 
+    def write_tq_result(self, local_path, status="SUCCESS"):
+        directory = self.tq_home / "pusher_logs" / "transfer" / "2026-07-20"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "2026-07-20_transfer.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                app_module.json.dumps(
+                    {
+                        "timestamp": "2026-07-20T12:00:00Z",
+                        "file_name": Path(local_path).name,
+                        "remote_path": f"/transfer/{Path(local_path).name}.ready",
+                        "local_path": str(local_path),
+                        "bytes_transferred": 1,
+                        "bitrate": 1.0,
+                        "status": status,
+                    }
+                )
+                + "\n"
+            )
+        return path
+
     def test_catalog_builds_complete_transfer_rows_and_destination(self):
         slides = self.catalog()
 
@@ -972,31 +993,53 @@ class TQTransferTests(unittest.TestCase):
         self.assertFalse(job.manifest_path.exists())
         self.assertFalse(job.copath_path.exists())
 
+    def test_jsonl_results_ignore_old_rows_and_keep_processing_after_failure(self):
+        slides = [dict(slide) for slide in self.catalog()]
+        for index, slide in enumerate(slides):
+            slide["destination_dir"] = app_module._tq_destination_dir(
+                "StudyA", slide
+            )
+            staged_path = self.root / "image_staging" / f"slide-{index}.svs"
+            staged_path.parent.mkdir(parents=True, exist_ok=True)
+            staged_path.write_bytes(b"staged")
+            slide["staged_path"] = str(staged_path)
+
+        self.write_tq_result(slides[0]["staged_path"])
+        job = app_module.TQJob(
+            "mixed-results",
+            self.user.id,
+            FakeProcess(b"Human-readable output only\n", return_code=1),
+            slides,
+            slides,
+        )
+        job.tq_log_offsets = app_module._tq_snapshot_pusher_logs()
+        self.write_tq_result(slides[0]["staged_path"], "ERR: missing local file")
+        self.write_tq_result(slides[1]["staged_path"])
+
+        app_module._read_tq_output(job)
+
+        self.assertFalse(job.results[slides[0]["original_path"]]["success"])
+        self.assertTrue(job.results[slides[1]["original_path"]]["success"])
+        self.assertEqual("failed", job.status)
+        self.assertTrue(all(Path(slide["staged_path"]).exists() for slide in slides))
+
     def run_result_job(self, slide, all_slides):
         slide = dict(slide)
         slide["destination_dir"] = app_module._tq_destination_dir(
             "destination", slide
         )
-        output = (
-            app_module.json.dumps(
-                {
-                    "original_path": slide["original_path"],
-                    "success": True,
-                    "error": None,
-                }
-            )
-            + "\n"
-        ).encode()
         manifest = self.root / f"{slide['id']}.csv"
         manifest.write_text("manifest\n", encoding="utf-8")
         job = app_module.TQJob(
             slide["id"],
             self.user.id,
-            FakeProcess(output),
+            FakeProcess(b"Uploaded slide\n"),
             [slide],
             all_slides,
             manifest,
         )
+        job.tq_log_offsets = app_module._tq_snapshot_pusher_logs()
+        self.write_tq_result(slide["original_path"])
         with app_module._tq_state_lock:
             app_module._tq_jobs[job.id] = job
             app_module._tq_active_job_id = job.id
@@ -1116,13 +1159,8 @@ class TQTransferTests(unittest.TestCase):
                 captured["metadata"] = list(csv.DictReader(handle))
             staged_path = captured["manifest"][1]["original_path"]
             self.assertEqual(b"deidentified-slide", Path(staged_path).read_bytes())
-            output = (
-                app_module.json.dumps(
-                    {"original_path": staged_path, "success": True, "error": None}
-                )
-                + "\n"
-            ).encode()
-            return FakeProcess(output)
+            self.write_tq_result(staged_path)
+            return FakeProcess(b"Uploaded slide\n")
 
         with mock.patch.object(app_module.subprocess, "Popen", side_effect=launch):
             app_module._run_tq_job(job)
@@ -1141,7 +1179,7 @@ class TQTransferTests(unittest.TestCase):
             captured["metadata"],
         )
         self.assertEqual("succeeded", job.status)
-        self.assertFalse(Path(slide["staged_path"]).exists())
+        self.assertTrue(Path(slide["staged_path"]).exists())
         self.assertFalse(job.metadata_path.exists())
         self.assertFalse(job.manifest_path.exists())
         output_markers = [

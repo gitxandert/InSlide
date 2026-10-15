@@ -3503,6 +3503,7 @@ class TQJob:
         self.started_at = datetime.datetime.now().astimezone()
         self.log_path: Optional[Path] = None
         self.config_result: Optional[TQConfigResult] = None
+        self.tq_log_offsets: Dict[str, int] = {}
 
 
 def _tq_append_output(job: TQJob, message: str) -> None:
@@ -4347,16 +4348,26 @@ def _tq_write_transfer_log(job: TQJob) -> Path:
     return target
 
 
-def _tq_parse_result_line(job: TQJob, line: str) -> None:
-    try:
-        result = json.loads(line)
-    except json.JSONDecodeError:
+def _tq_pusher_jsonl_paths() -> List[Path]:
+    root = Path(Config.TQ_HOME_DIR).expanduser() / "pusher_logs" / "transfer"
+    return sorted(root.glob("*/*_transfer.jsonl")) if root.is_dir() else []
+
+
+def _tq_snapshot_pusher_logs() -> Dict[str, int]:
+    offsets = {}
+    for path in _tq_pusher_jsonl_paths():
+        try:
+            offsets[str(path)] = path.stat().st_size
+        except OSError:
+            app.logger.warning("Could not inspect TQ transfer log %s", path)
+    return offsets
+
+
+def _tq_apply_transfer_result(job: TQJob, result: Any) -> None:
+    if not isinstance(result, dict):
         return
-    if not isinstance(result, dict) or "original_path" not in result:
-        return
-    reported_path = result.get("original_path")
-    success = result.get("success")
-    error = result.get("error")
+    reported_path = result.get("local_path")
+    status = result.get("status")
     expected = {
         slide.get("staged_path", slide["original_path"]): slide["original_path"]
         for slide in job.slides
@@ -4369,52 +4380,39 @@ def _tq_parse_result_line(job: TQJob, line: str) -> None:
                 "tq reported more than one result for this slide."
             )
             return
-        if not isinstance(success, bool) or (
-            not success and not isinstance(error, str)
-        ):
+        if not isinstance(status, str) or not status.strip():
             job.result_errors[original_path] = (
                 "tq reported a malformed result for this slide."
             )
             return
-    if (
-        original_path is None
-        or not isinstance(success, bool)
-        or (not success and not isinstance(error, str))
-    ):
+    if original_path is None or not isinstance(status, str) or not status.strip():
         return
+    success = status == "SUCCESS"
     job.results[original_path] = {
         "success": success,
-        "error": "" if success else error.strip() or "tq reported an unspecified error.",
+        "error": "" if success else status.strip(),
     }
 
 
-def _tq_prune_empty_staging_directories(path: Path) -> None:
-    root = _tq_staging_root()
-    current = path.parent
-    while current != root:
+def _tq_read_pusher_results(job: TQJob) -> None:
+    for path in _tq_pusher_jsonl_paths():
+        offset = job.tq_log_offsets.get(str(path), 0)
         try:
-            current.rmdir()
-        except OSError:
-            break
-        current = current.parent
-
-
-def _tq_cleanup_successful_staging(job: TQJob) -> None:
-    for slide in job.slides:
-        result = job.results.get(slide["original_path"])
-        staged_value = slide.get("staged_path")
-        if not staged_value or not result or not result["success"]:
+            with path.open("rb") as handle:
+                if offset > path.stat().st_size:
+                    offset = 0
+                handle.seek(offset)
+                contents = handle.read().decode("utf-8")
+        except (OSError, UnicodeError):
+            app.logger.warning("Could not read TQ transfer results from %s", path)
             continue
-        staged_path = Path(staged_value)
-        try:
-            staged_path.unlink(missing_ok=True)
-            _tq_prune_empty_staging_directories(staged_path)
-            _tq_append_output(job, f"\nRemoved staged file {staged_path}.\n")
-        except OSError as exc:
-            app.logger.warning("Could not remove staged slide %s: %s", staged_path, exc)
-            _tq_append_output(
-                job, f"\nUploaded successfully, but staged file could not be removed: {exc}\n"
-            )
+        for line in contents.splitlines():
+            try:
+                result = json.loads(line)
+            except json.JSONDecodeError:
+                app.logger.warning("Malformed TQ transfer result in %s", path)
+                continue
+            _tq_apply_transfer_result(job, result)
 
 
 def _tq_download_slides(job: TQJob) -> None:
@@ -4573,6 +4571,7 @@ def _run_tq_job(job: TQJob) -> None:
             "--paths",
             str(job.manifest_path),
         ]
+        job.tq_log_offsets = _tq_snapshot_pusher_logs()
         job.process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -4599,7 +4598,6 @@ def _tq_cleanup_job_files(job: TQJob) -> None:
 def _read_tq_output(job: TQJob) -> None:
     global _tq_active_job_id
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    pending = ""
     try:
         if job.process is None:
             raise TQError("The TQ process was not started.")
@@ -4611,18 +4609,12 @@ def _read_tq_output(job: TQJob) -> None:
                 text = decoder.decode(chunk)
                 with _tq_state_lock:
                     job.output += text
-                pending += text
-                lines = pending.splitlines(keepends=True)
-                pending = ""
-                if lines and not lines[-1].endswith(("\n", "\r")):
-                    pending = lines.pop()
-                for line in lines:
-                    _tq_parse_result_line(job, line.strip())
-        trailing = pending + decoder.decode(b"", final=True)
+        trailing = decoder.decode(b"", final=True)
         if trailing:
-            _tq_parse_result_line(job, trailing.strip())
+            with _tq_state_lock:
+                job.output += trailing
         job.return_code = job.process.wait()
-        _tq_cleanup_successful_staging(job)
+        _tq_read_pusher_results(job)
         job.log_path = _tq_write_transfer_log(job)
         try:
             updated_rows = _tq_update_sdl_push_status(job.all_slides)
