@@ -4015,7 +4015,52 @@ def _tq_prepare_catalog() -> Tuple[List[BatchContext], List[str]]:
     for warning in batch_catalog.list_transfer_warnings(Config.INSTANCE_DIR):
         if warning and warning not in warnings:
             warnings.append(warning)
+    batch_catalog.set_metadata(
+        Config.INSTANCE_DIR,
+        "transfer_filter_options",
+        json.dumps(
+            {
+                "options": batch_catalog.transfer_filter_options(
+                    Config.INSTANCE_DIR
+                ),
+                "warnings": warnings,
+            }
+        ),
+    )
     return batches, warnings
+
+
+def _tq_stored_filter_options() -> Tuple[Dict[str, List[str]], List[str]]:
+    cached = batch_catalog.get_metadata(
+        Config.INSTANCE_DIR, "transfer_filter_options"
+    )
+    if cached:
+        try:
+            payload = json.loads(cached)
+            return dict(payload["options"]), list(payload["warnings"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    _start_catalog_reconciler()
+    return {}, ["Transfer catalog is updating. Search can use stored slides now."]
+
+
+def _tq_stored_catalog(
+    filters: Optional[Mapping[str, object]] = None,
+    slide_ids: Optional[Iterable[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Return stored transfer rows without refreshing source files."""
+    _, warnings = _tq_stored_filter_options()
+    slides = batch_catalog.list_transfer_slides(
+        Config.INSTANCE_DIR, filters=filters, slide_ids=slide_ids
+    )
+    roots = {
+        str(row["public_id"]): Path(Config.INSLIDE_BATCHES)
+        / str(row["relative_path"])
+        for row in batch_catalog.list_batches(Config.INSTANCE_DIR)
+    }
+    for slide in slides:
+        slide["batch_root"] = str(roots.get(slide["batch_id"], ""))
+    return slides, warnings
 
 
 def _tq_catalog(
@@ -6317,9 +6362,8 @@ def _tq_search_payload(payload: object) -> Tuple[Dict[str, object], Optional[Lis
 @app.route("/tq/catalog/options", methods=["GET"])
 @login_required
 def tq_catalog_options():
-    """Return categorical filter choices without loading slide records."""
-    _, warnings = _tq_prepare_catalog()
-    options = batch_catalog.transfer_filter_options(Config.INSTANCE_DIR)
+    """Return stored categorical filter choices without refreshing sources."""
+    options, warnings = _tq_stored_filter_options()
     response = jsonify({"options": options, "warnings": warnings})
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -6333,7 +6377,9 @@ def tq_catalog_search():
         filters, selected_ids = _tq_search_payload(request.get_json(silent=True))
     except ValueError as exc:
         return jsonify({"success": False, "message": str(exc)}), 400
-    slides, warnings = _tq_catalog(filters=filters, slide_ids=selected_ids)
+    slides, warnings = _tq_stored_catalog(
+        filters=filters, slide_ids=selected_ids
+    )
     response = jsonify({"slides": slides, "warnings": warnings})
     response.headers["Cache-Control"] = "no-store"
     return response

@@ -143,9 +143,9 @@
     <section class="card">
         <form id="search-form">
             <div class="filter-heading">
-                <div><h2>Filter slides</h2><span class="muted">Choose filters, then search the catalog.</span></div>
+                <div><h2>Filter slides</h2><span class="muted">Leave every list set to All to load every slide.</span></div>
                 <div class="actions">
-                    <button id="search-button" type="submit" disabled>Search</button>
+                    <button id="search-button" type="submit">Search</button>
                     <button id="clear-filters" class="secondary" type="button">Clear filters</button>
                 </div>
             </div>
@@ -433,7 +433,7 @@ destinationDir?.addEventListener('input',saveReviewDraft); includeCopath?.addEve
 if (reviewMode) loadSlides({selected_ids:Array.from(draftSelectedIds)});
 else fetch(catalogOptionsUrl,{cache:'no-store'})
     .then((response) => { if (!response.ok) throw new Error(`Catalog options request failed (${response.status})`); return response.json(); })
-    .then((data) => { populateExactFilters(data.options || {}); showWarnings(data.warnings); updateCounts(); document.getElementById('search-button').disabled = false; })
+    .then((data) => { populateExactFilters(data.options || {}); showWarnings(data.warnings); updateCounts(); })
     .catch(showCatalogError);
 
 {% if job %}

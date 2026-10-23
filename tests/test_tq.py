@@ -392,9 +392,10 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b'class="filter-row exact-filter-row"', response.data)
         self.assertIn(b'class="filter-row date-filter-row"', response.data)
         self.assertIn(b'id="text-filter-groups"', response.data)
-        self.assertIn(b'id="search-button"', response.data)
+        self.assertIn(b'<button id="search-button" type="submit">', response.data)
         self.assertIn(b"All batches", response.data)
         self.assertIn(b"All types", response.data)
+        self.assertIn(b"All to load every slide", response.data)
         self.assertIn(b"Choose filters, then Search.", response.data)
         self.assertIn(b"conditionActions", response.data)
         self.assertIn(b"rowActions", response.data)
@@ -461,16 +462,32 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(2, len(slides))
         read_csv.assert_not_called()
 
-    def test_catalog_endpoint_rebuilds_stale_rows_from_authoritative_document(self):
+    def test_catalog_endpoints_only_read_stored_snapshot(self):
         self.catalog()
-        app_module.batch_catalog.replace_transfer_catalog(
-            app_module.Config.INSTANCE_DIR, [], [], "stale"
-        )
-        (self.batch / "name_mapping.csv").unlink()
+        with mock.patch.object(
+            app_module,
+            "_tq_prepare_catalog",
+            side_effect=AssertionError("request refreshed catalog"),
+        ):
+            options = self.client.get("/tq/catalog/options")
+            response = self.search()
 
+        self.assertEqual(200, options.status_code)
+        self.assertEqual(["BRAIN"], options.get_json()["options"]["organ"])
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, len(response.get_json()["slides"]))
+
+    def test_missing_filter_cache_does_not_block_unfiltered_search(self):
+        self.catalog()
+        app_module.batch_catalog.set_metadata(
+            app_module.Config.INSTANCE_DIR, "transfer_filter_options", "invalid"
+        )
+
+        options = self.client.get("/tq/catalog/options")
         response = self.search()
 
-        self.assertEqual(200, response.status_code)
+        self.assertEqual({}, options.get_json()["options"])
+        self.assertIn("updating", options.get_json()["warnings"][0])
         self.assertEqual(2, len(response.get_json()["slides"]))
 
     def test_transfer_catalog_uses_existing_renamed_complete_state(self):
