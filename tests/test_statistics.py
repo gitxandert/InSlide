@@ -143,6 +143,39 @@ class SDLStatisticsIntegrationTests(unittest.TestCase):
             1,
         )
 
+    def test_nonstandard_accession_warns_but_saves_and_links_metadata(self):
+        page = self.client.get("/sdl")
+        self.assertIn(b'id="accession-format-warning"', page.data)
+        self.assertNotIn(b'pattern="[A-Z]{1,3}[0-9]{2}-[0-9]+"', page.data)
+
+        form = self.form_data()
+        form["accession_id"] = "Custom / ID_7"
+        response = self.client.post("/sdl", data=form)
+
+        self.assertEqual(302, response.status_code)
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        columns = app_module._sdl_header_columns(worksheet)
+        self.assertEqual(
+            "Custom / ID_7",
+            worksheet.cell(row=2, column=columns["Accession ID"]).value,
+        )
+        workbook.close()
+
+        metadata, warning = app_module._tq_sdl_accession_metadata()
+        self.assertIsNone(warning)
+        self.assertEqual(
+            ["2026-08-25"], metadata["dates"]["custom / id_7"]
+        )
+        self.assertEqual(
+            "PROSP",
+            metadata["types"][
+                app_module.sdl_type_key(
+                    "custom / id_7", "RSCH1 (SS12797)", "2026-08-25"
+                )
+            ],
+        )
+
     def test_conflicting_type_is_not_saved_or_counted(self):
         first = self.client.post("/sdl", data=self.form_data())
         conflicting = self.form_data()

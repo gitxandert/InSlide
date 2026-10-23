@@ -368,6 +368,26 @@ class SDLPostQCTests(unittest.TestCase):
             app_module.SDL_UNKNOWN_DATE, normalized["Date Unloaded"]
         )
 
+    def test_blank_accession_is_rejected(self):
+        values = {
+            "Accession ID": "",
+            "Organ": "TESTIS",
+            "Type": "SEMINOMA",
+            "Slides Count": "1",
+            "Scanner": "-----",
+            "Carousel Rack": "1",
+            "Date Loaded": app_module.SDL_UNKNOWN_DATE,
+            "Time Loaded": "12:00",
+            "Date Unloaded": "",
+            "Time Unloaded": "",
+            "Notes": "",
+        }
+
+        with self.assertRaisesRegex(
+            app_module.SDLValidationError, "Accession ID is required"
+        ):
+            app_module._validate_sdl_form(values)
+
 
 if __name__ == "__main__":
     unittest.main()

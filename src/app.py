@@ -2659,7 +2659,6 @@ SDL_FORM_FIELDS = {
 SDL_UNKNOWN_DATE = "----------"
 
 _sdl_workbook_lock = threading.Lock()
-_accession_pattern = re.compile(r"^[A-Z]{1,3}[0-9]{2}-[0-9]+$")
 _rack_pattern = re.compile(r"^[0-9]+(?:\s*,\s*[0-9]+)*$")
 _time_pattern = re.compile(r"^[0-9]{2}:[0-9]{2}$")
 
@@ -2919,11 +2918,8 @@ def _submitted_sdl_form() -> Dict[str, str]:
 
 def _validate_sdl_form(values: Dict[str, str]) -> Dict[str, Any]:
     accession_id = values["Accession ID"]
-    if not _accession_pattern.fullmatch(accession_id):
-        raise SDLValidationError(
-            "Accession ID must match the format A12-123 (1-3 uppercase letters, "
-            "2 digits, a hyphen, and one or more digits)."
-        )
+    if not accession_id:
+        raise SDLValidationError("Accession ID is required.")
     if values["Organ"] not in Config.SDL_ORGANS:
         raise SDLValidationError("Select a valid Organ.")
     if not values["Type"]:
