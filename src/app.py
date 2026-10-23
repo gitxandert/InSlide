@@ -5865,7 +5865,9 @@ def response_security_metadata(response):
                 sort_keys=True,
             ),
         )
-    if request.endpoint in {"pipeline_launcher", "renaming_page", "qc"}:
+    if request.endpoint in {
+        "pipeline_launcher", "renaming_page", "renaming_approve", "renaming_pid", "qc",
+    }:
         started = getattr(g, "request_started_at", None)
         if started is not None:
             app.logger.info(
@@ -6909,13 +6911,16 @@ def _renaming_group_html(
     signature: str,
 ) -> str:
     """Render one current mapping group for an in-page approval update."""
-    reports = _renaming_report_rows(context, rows)
+    group_rows = [
+        row for row in rows
+        if renaming.same_accession(row.get("AccessionID", ""), accession)
+    ]
+    reports = _renaming_report_rows(context, group_rows)
+    groups = _renaming_groups_with_image_links(context, group_rows, reports)
     group = next(
-        (
-            candidate
-            for candidate in _renaming_groups_with_image_links(context, rows, reports)
-            if candidate["accession"] == accession
-        ),
+        (candidate for candidate in groups if renaming.same_accession(
+            candidate["accession"], accession
+        )),
         None,
     )
     if group is None:
@@ -6937,7 +6942,7 @@ def _renaming_groups_with_image_links(
     rows: List[Dict[str, str]],
     reports: Dict[str, Dict[str, str]],
 ) -> List[Dict[str, object]]:
-    """Group mappings and attach safe, existing label/macro image URLs."""
+    """Group mappings and attach safe label/macro image URLs."""
     _, enriched_rows, _ = _load_batch_document(context.id, "enriched")
     images_by_slide = {
         row.get("original_slide_path", ""): row
@@ -6952,18 +6957,20 @@ def _renaming_groups_with_image_links(
                 ("label_path", "LabelImageURL"),
                 ("macro_path", "MacroImageURL"),
             ):
-                image_path = context.data_manager.get_absolute_path(
-                    source.get(source_key, "")
+                value = str(source.get(source_key, "")).strip().replace("\\", "/")
+                relative_path = Path(value)
+                if (
+                    not value
+                    or relative_path.is_absolute()
+                    or PureWindowsPath(value).is_absolute()
+                    or ".." in relative_path.parts
+                ):
+                    continue
+                slide[destination_key] = url_for(
+                    "serve_relative_image",
+                    batch=context.id,
+                    filepath=relative_path.as_posix(),
                 )
-                if image_path and os.path.isfile(image_path):
-                    relative_path = os.path.relpath(
-                        image_path, context.root
-                    ).replace(os.sep, "/")
-                    slide[destination_key] = url_for(
-                        "serve_relative_image",
-                        batch=context.id,
-                        filepath=relative_path,
-                    )
     return groups
 
 
@@ -7021,7 +7028,6 @@ def renaming_approve(batch_id: str):
             }), 404
         flash("The batch is no longer available for renaming.", "warning")
         return redirect(url_for("renaming_page"))
-    mapping_path = context.root / "name_mapping.csv"
     old_accession = request.form.get("old_accession", "").strip()
     values = {
         "AccessionID": request.form.get("accession_id", "").strip(),
@@ -7052,20 +7058,14 @@ def renaming_approve(batch_id: str):
                 "BlockNumber": request.form.get(f"block_number_{index}", "").strip(),
                 "SectionCount": request.form.get(f"section_count_{index}", "").strip(),
             }
-        _, current_rows, _ = _load_batch_document(context.id, "name_mapping")
         submitted_signature = request.form.get("mapping_signature", "")
-        if renaming.mapping_signature(current_rows) != submitted_signature:
-            raise renaming.RenamingError(
-                "The mapping changed in another session; reload and try again"
-            )
-        _wait_for_document_export(context.id, "name_mapping")
         with _renaming_clone_lock:
-            renaming.repair_staged_pid_assignments(
-                Path(Config.COPATH_CLONE), Path(Config.INSLIDE_BATCHES)
-            )
-            _adopt_batch_document(context.id, context.root, "name_mapping")
             _, current_rows, _ = _load_batch_document(context.id, "name_mapping")
-            repaired_signature = renaming.mapping_signature(current_rows)
+            current_signature = renaming.mapping_signature(current_rows)
+            if current_signature != submitted_signature:
+                raise renaming.RenamingError(
+                    "The mapping changed in another session; reload and try again"
+                )
             old_key = renaming.accession_key(old_accession)
             new_key = renaming.accession_key(values["AccessionID"])
             target_exists = any(
@@ -7089,21 +7089,29 @@ def renaming_approve(batch_id: str):
                     "The accession is no longer available in this batch"
                 )
             if not target_exists:
-                values["PID"] = renaming.pid_after_organ_change(
-                    context.root,
-                    Path(Config.COPATH_CLONE),
-                    Path(Config.INSLIDE_BATCHES),
-                    old_accession,
-                    values["Organ"],
-                )
-                _adopt_batch_document(context.id, context.root, "name_mapping")
-                _, current_rows, _ = _load_batch_document(
-                    context.id, "name_mapping"
-                )
-                repaired_signature = renaming.mapping_signature(current_rows)
+                current_organ = current.get("Organ", "").strip().upper()
+                current_pid = current.get("PID", "").strip().upper()
+                if current_organ == values["Organ"] and renaming.PID_RE.fullmatch(
+                    current_pid
+                ):
+                    values["PID"] = current_pid
+                else:
+                    _wait_for_document_export(context.id, "name_mapping")
+                    values["PID"] = renaming.pid_after_organ_change(
+                        context.root,
+                        Path(Config.COPATH_CLONE),
+                        Path(Config.INSLIDE_BATCHES),
+                        old_accession,
+                        values["Organ"],
+                    )
+                    _adopt_batch_document(context.id, context.root, "name_mapping")
+                    _, current_rows, _ = _load_batch_document(
+                        context.id, "name_mapping"
+                    )
+                    current_signature = renaming.mapping_signature(current_rows)
             updated, merged = renaming.update_group_rows(
                 current_rows, old_accession, values, slide_values,
-                repaired_signature,
+                current_signature,
             )
             _replace_batch_document(
                 context.id, "name_mapping", renaming.MAPPING_FIELDS, updated

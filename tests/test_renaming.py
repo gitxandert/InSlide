@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from openpyxl import Workbook, load_workbook
 
@@ -784,7 +785,7 @@ class RenamingPageTests(unittest.TestCase):
         label.close()
         macro.close()
 
-    def test_page_omits_links_for_missing_images(self):
+    def test_page_links_missing_images_without_probing_and_omits_unsafe_paths(self):
         write_csv(
             self.batch / "enriched.csv",
             [
@@ -802,8 +803,36 @@ class RenamingPageTests(unittest.TestCase):
         response = self.client.get(f"/renaming?batch={batches[0].id}")
 
         self.assertEqual(200, response.status_code)
-        self.assertNotIn(b">Label</a>", response.data)
+        self.assertIn(b">Label</a>", response.data)
         self.assertNotIn(b">Macro</a>", response.data)
+        missing = self.client.get(
+            f"/data_images/{batches[0].id}/label/missing.png"
+        )
+        self.assertEqual(404, missing.status_code)
+
+    def test_image_links_do_not_probe_batch_files(self):
+        batches, _ = app_module._renaming_batches()
+        context = batches[0]
+        _, rows, _ = app_module._load_batch_document(
+            context.id, "name_mapping"
+        )
+
+        with app_module.app.test_request_context(), mock.patch.object(
+            context.data_manager,
+            "get_absolute_path",
+            side_effect=AssertionError("image path resolved during render"),
+        ), mock.patch.object(
+            app_module.os.path,
+            "isfile",
+            side_effect=AssertionError("image file probed during render"),
+        ):
+            groups = app_module._renaming_groups_with_image_links(
+                context, rows, {}
+            )
+
+        self.assertEqual(1, len(groups))
+        self.assertIn("LabelImageURL", groups[0]["slides"][0])
+        self.assertIn("MacroImageURL", groups[0]["slides"][0])
 
     def test_replace_sdl_accession_updates_existing_rows(self):
         workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
@@ -983,6 +1012,35 @@ class RenamingPageTests(unittest.TestCase):
         _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
         self.assertEqual("AAAAAA", saved[0]["PID"])
 
+    def test_nonfinal_approval_skips_pid_scan_and_export_wait(self):
+        rows = self.add_second_accession()
+        batches, _ = app_module._renaming_batches()
+
+        with mock.patch.object(
+            renaming,
+            "pid_after_organ_change",
+            side_effect=AssertionError("PID scan used for unchanged organ"),
+        ), mock.patch.object(
+            app_module,
+            "_adopt_batch_document",
+            side_effect=AssertionError("mapping file adopted during fast path"),
+        ), mock.patch.object(
+            app_module,
+            "_wait_for_document_export",
+            side_effect=AssertionError("export wait used for nonfinal approval"),
+        ):
+            response = self.client.post(
+                f"/renaming/approve/{batches[0].id}",
+                data=self.approval_data(rows, pid="ZZZZZZ"),
+                headers={"Accept": "application/json"},
+            )
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.get_json()["success"])
+        _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
+        first = next(row for row in saved if row["AccessionID"] == "NP25-100")
+        self.assertEqual("AAAAAA", first["PID"])
+
     def test_multiple_accessions_render_as_complete_rows_before_expansion(self):
         self.add_second_accession()
         batches, _ = app_module._renaming_batches()
@@ -1012,11 +1070,16 @@ class RenamingPageTests(unittest.TestCase):
         rows = self.add_second_accession()
         batches, _ = app_module._renaming_batches()
 
-        response = self.client.post(
-            f"/renaming/approve/{batches[0].id}",
-            data=self.approval_data(rows, stain_0="H&E"),
-            headers={"Accept": "application/json"},
-        )
+        with mock.patch.object(
+            app_module,
+            "_renaming_groups_with_image_links",
+            wraps=app_module._renaming_groups_with_image_links,
+        ) as render_groups:
+            response = self.client.post(
+                f"/renaming/approve/{batches[0].id}",
+                data=self.approval_data(rows, stain_0="H&E"),
+                headers={"Accept": "application/json"},
+            )
 
         self.assertEqual(200, response.status_code)
         payload = response.get_json()
@@ -1033,6 +1096,7 @@ class RenamingPageTests(unittest.TestCase):
         self.assertEqual("True", first["Approved"])
         self.assertEqual("False", second["Approved"])
         self.assertEqual(renaming.mapping_signature(saved), payload["signature"])
+        self.assertEqual(1, len(render_groups.call_args.args[1]))
 
     def test_async_approval_rejects_a_stale_mapping_without_saving(self):
         rows = self.add_second_accession()
