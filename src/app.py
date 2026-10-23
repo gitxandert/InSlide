@@ -30,6 +30,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -3472,6 +3473,14 @@ class TQConfigResult:
     backup_path: Optional[Path] = None
 
 
+@dataclass
+class TQBatch:
+    number: int
+    slides: List[Dict[str, Any]]
+    ready: bool = False
+    staging_directory: Optional[Path] = None
+
+
 class TQJob:
     def __init__(
         self,
@@ -3486,6 +3495,9 @@ class TQJob:
         missing_copath_accessions: Sequence[str] = (),
         resume_upload: bool = False,
         metadata_slides: Optional[List[Dict[str, str]]] = None,
+        deidentify: bool = True,
+        batch_size: int = 10,
+        batches: Optional[List[TQBatch]] = None,
     ):
         self.id = job_id
         self.owner_id = owner_id
@@ -3498,6 +3510,14 @@ class TQJob:
         self.copath_path = copath_path
         self.include_copath = copath_path is not None
         self.missing_copath_accessions = tuple(missing_copath_accessions)
+        self.deidentify = deidentify
+        self.batch_size = batch_size
+        if resume_upload:
+            for slide in slides:
+                slide["_tq_ready"] = True
+        self.batches = batches or [
+            TQBatch(1, slides, all(slide.get("_tq_ready") for slide in slides))
+        ]
         self.status = "running"
         self.return_code: Optional[int] = None
         self.output = ""
@@ -3548,7 +3568,7 @@ def _tq_windows_safe_component(value: str) -> bool:
 
 
 def _tq_staging_path(slide: Dict[str, str]) -> Path:
-    staging_dir = slide.get("staging_dir", "")
+    staging_dir = slide.get("staging_path_dir", slide.get("staging_dir", ""))
     parts = staging_dir.split("/")
     if (
         not staging_dir
@@ -3600,6 +3620,80 @@ def _tq_prepare_staging_paths(slides: List[Dict[str, str]]) -> None:
         slide["staged_path"] = str(target)
     if len(staging_directories) != 1:
         raise TQError("All selected slides must use one staging batch directory.")
+
+
+def _tq_original_filename(path: str) -> str:
+    return PureWindowsPath(path).name if "\\" in path else Path(path).name
+
+
+def _tq_batch_size(value: object) -> int:
+    raw = str(value).strip()
+    if not re.fullmatch(r"[1-9]\d{0,8}", raw):
+        raise TQError("Batch size must be a positive whole number.")
+    return int(raw)
+
+
+def _tq_batches(slides: List[Dict[str, str]], batch_size: int) -> List[TQBatch]:
+    batches: List[TQBatch] = []
+    start = 0
+    while start < len(slides):
+        ready = bool(slides[start].get("_tq_ready"))
+        end = start
+        while end < len(slides) and bool(slides[end].get("_tq_ready")) == ready:
+            end += 1
+        for offset in range(start, end, batch_size):
+            batches.append(
+                TQBatch(
+                    len(batches) + 1,
+                    slides[offset:min(offset + batch_size, end)],
+                    ready,
+                )
+            )
+        start = end
+    return batches
+
+
+def _tq_validate_destinations(slides: List[Dict[str, str]]) -> None:
+    seen = set()
+    for slide in slides:
+        destination = (
+            f"{slide.get('destination_dir', '')}/{slide.get('destination_name', '')}"
+        ).casefold()
+        if destination in seen:
+            raise TQError(
+                "Two selected slides have the same remote destination: "
+                f"{slide.get('destination_dir', '')}/{slide.get('destination_name', '')}"
+            )
+        seen.add(destination)
+
+
+def _tq_prepare_job_batches(job_id: str, batches: List[TQBatch]) -> None:
+    for batch in batches:
+        if batch.ready:
+            try:
+                for slide in batch.slides:
+                    _tq_prepare_staging_paths([slide])
+                if all(Path(slide["staged_path"]).is_file() for slide in batch.slides):
+                    continue
+            except (KeyError, TQError):
+                pass
+            batch.ready = False
+            for slide in batch.slides:
+                slide["_tq_ready"] = False
+
+        staging_directory = (
+            f"{batch.slides[0]['staging_dir']}/transfer-{job_id}/"
+            f"batch-{batch.number:04d}"
+        )
+        batch.staging_directory = _tq_staging_root().joinpath(
+            *staging_directory.split("/")
+        )
+        for index, slide in enumerate(batch.slides, start=1):
+            slide["staging_batch_dir"] = staging_directory
+            slide["staging_path_dir"] = (
+                f"{staging_directory}/slide-{index:04d}"
+            )
+            _tq_prepare_staging_paths([slide])
 
 
 def _tq_transfer_log_root() -> Path:
@@ -4419,8 +4513,8 @@ def _tq_read_pusher_results(job: TQJob) -> None:
             _tq_apply_transfer_result(job, result)
 
 
-def _tq_download_slides(job: TQJob) -> None:
-    for index, slide in enumerate(job.slides, start=1):
+def _tq_download_slides(job: TQJob, batch: TQBatch) -> None:
+    for index, slide in enumerate(batch.slides, start=1):
         source = Path(slide["original_path"])
         target = Path(slide["staged_path"])
         try:
@@ -4433,7 +4527,8 @@ def _tq_download_slides(job: TQJob) -> None:
             )
             _tq_append_output(
                 job,
-                f"[{index}/{len(job.slides)}] Downloading {source} to "
+                f"[batch {batch.number}: {index}/{len(batch.slides)}] "
+                f"Downloading {source} to "
                 f"{_tq_staging_display_path(target)}.\n",
             )
             try:
@@ -4445,7 +4540,7 @@ def _tq_download_slides(job: TQJob) -> None:
                 temporary.unlink(missing_ok=True)
             _tq_append_output(
                 job,
-                f"[{index}/{len(job.slides)}] Downloaded "
+                f"[batch {batch.number}: {index}/{len(batch.slides)}] Downloaded "
                 f"{_tq_staging_display_path(target)}.\n",
             )
         except Exception as exc:
@@ -4453,9 +4548,11 @@ def _tq_download_slides(job: TQJob) -> None:
             job.result_errors[slide["original_path"]] = message
             raise TQError(message) from exc
 
-    staging_directory = Path(job.slides[0]["staged_path"]).parent
+    staging_directory = batch.staging_directory or Path(
+        batch.slides[0]["staged_path"]
+    ).parent
     selected_paths = {
-        Path(slide["staged_path"]).resolve() for slide in job.slides
+        Path(slide["staged_path"]).resolve() for slide in batch.slides
     }
     unexpected = sorted(
         path for path in staging_directory.rglob("*.svs")
@@ -4491,13 +4588,15 @@ def _tq_stream_process_output(job: TQJob, process: subprocess.Popen) -> None:
         _tq_append_output(job, trailing)
 
 
-def _tq_deidentify_slides(job: TQJob) -> None:
+def _tq_deidentify_slides(job: TQJob, batch: TQBatch) -> None:
     output_log = _tq_temporary_csv("deidentify-results-")
     try:
-        staging_directory = Path(job.slides[0]["staged_path"]).parent
+        staging_directory = batch.staging_directory or Path(
+            batch.slides[0]["staged_path"]
+        ).parent
         _tq_append_output(
             job,
-            f"All {len(job.slides)} selected slide(s) downloaded.\n"
+            f"Batch {batch.number}: all {len(batch.slides)} slide(s) staged.\n"
             "Starting deidentify_anonymize.py on "
             f"{_tq_staging_display_path(staging_directory)}.\n",
         )
@@ -4525,7 +4624,7 @@ def _tq_deidentify_slides(job: TQJob) -> None:
                         row.get("original_path", ""): row.get("status", "")
                         for row in csv.DictReader(handle)
                     }
-                for slide in job.slides:
+                for slide in batch.slides:
                     if results.get(slide["staged_path"]) == "FAILURE":
                         job.result_errors[slide["original_path"]] = (
                             f"Deidentification failed for {slide['staged_path']}"
@@ -4533,7 +4632,10 @@ def _tq_deidentify_slides(job: TQJob) -> None:
             raise TQError(
                 f"deidentify_anonymize.py exited with code {return_code}"
             )
-        _tq_append_output(job, "deidentify_anonymize.py completed successfully.\n")
+        _tq_append_output(
+            job,
+            f"Batch {batch.number}: deidentify_anonymize.py completed successfully.\n",
+        )
     finally:
         output_log.unlink(missing_ok=True)
 
@@ -4552,34 +4654,30 @@ def _tq_fail_before_upload(job: TQJob, error: Exception) -> None:
     job.status = "failed"
 
 
-def _run_tq_job(job: TQJob) -> None:
-    global _tq_active_job_id
+def _tq_fail_batch(job: TQJob, batch: TQBatch, stage: str, error: Exception) -> None:
+    message = f"Batch {batch.number} {stage} failed: {error}"
+    for slide in batch.slides:
+        job.result_errors.setdefault(slide["original_path"], message)
+    _tq_append_output(job, f"{message}\n")
+
+
+def _tq_upload_batch(job: TQJob, batch: TQBatch) -> None:
+    manifest_path: Optional[Path] = None
     try:
-        if job.staging_complete:
-            _tq_append_output(
-                job, f"Retrying upload for {len(job.slides)} failed slide(s).\n"
-            )
-        else:
-            _tq_download_slides(job)
-            _tq_deidentify_slides(job)
-            job.staging_complete = True
-        _tq_append_output(job, "Starting TQ upload.\n")
-        job.metadata_path = _tq_write_metadata_csv(job.metadata_slides)
-        if job.missing_copath_accessions:
-            _tq_append_output(
-                job,
-                "CoPath data was unavailable for accession(s): "
-                + ", ".join(job.missing_copath_accessions)
-                + ". Continuing with available CoPath data.\n",
-            )
-        job.manifest_path = _tq_write_manifest(
-            job.slides, job.metadata_path, job.copath_path
+        _tq_append_output(
+            job,
+            f"Batch {batch.number}: Starting TQ upload for "
+            f"{len(batch.slides)} slide(s).\n",
         )
+        manifest_path = _tq_write_manifest(
+            batch.slides, job.metadata_path, job.copath_path
+        )
+        job.manifest_path = manifest_path
         command = [
             Config.TQ_EXECUTABLE,
             "pusher",
             "--paths",
-            str(job.manifest_path),
+            str(manifest_path),
         ]
         job.tq_log_offsets = _tq_snapshot_pusher_logs()
         job.process = subprocess.Popen(
@@ -4589,14 +4687,150 @@ def _run_tq_job(job: TQJob) -> None:
             stderr=subprocess.STDOUT,
             bufsize=0,
         )
+        _tq_stream_process_output(job, job.process)
+        return_code = job.process.wait()
+        if return_code != 0 and job.return_code in (None, 0):
+            job.return_code = return_code
+        _tq_read_pusher_results(job)
+        complete = return_code == 0
+        for slide in batch.slides:
+            original_path = slide["original_path"]
+            result = job.results.get(original_path)
+            if result is None and original_path not in job.result_errors:
+                job.result_errors[original_path] = (
+                    "tq did not report a result "
+                    f"(exit code {return_code})."
+                )
+            if result is None or not result["success"]:
+                complete = False
+        if complete:
+            _tq_append_output(job, f"Batch {batch.number}: upload completed.\n")
+        else:
+            _tq_append_output(job, f"Batch {batch.number}: upload failed.\n")
+    except Exception as exc:
+        _tq_fail_batch(job, batch, "upload", exc)
+        if job.return_code in (None, 0):
+            job.return_code = 1
+    finally:
+        if manifest_path is not None:
+            manifest_path.unlink(missing_ok=True)
+
+
+def _tq_finalize_pipeline(job: TQJob) -> None:
+    try:
+        job.log_path = _tq_write_transfer_log(job)
+        try:
+            updated_rows = _tq_update_sdl_push_status(job.all_slides)
+            if updated_rows:
+                _tq_append_output(
+                    job,
+                    f"Updated {updated_rows} Slide Digitization Log row(s).\n",
+                )
+        except Exception as exc:
+            app.logger.exception("Could not update SDL after TQ transfer")
+            _tq_append_output(
+                job,
+                "Transfer results were logged, but the Slide Digitization Log "
+                f"could not be updated: {exc}\n",
+            )
+        complete = (
+            len(job.results) == len(job.slides)
+            and not job.result_errors
+            and all(result["success"] for result in job.results.values())
+            and job.return_code in (None, 0)
+        )
+        job.status = "succeeded" if complete else "failed"
+        job.return_code = 0 if complete else (job.return_code or 1)
+    except Exception as exc:
+        app.logger.exception("TQ transfer finalization failed")
+        _tq_append_output(job, f"Launcher error: {exc}\n")
+        job.status = "failed"
+        job.return_code = job.return_code or 1
+
+
+def _run_tq_job(job: TQJob) -> None:
+    global _tq_active_job_id
+    staged_batches: queue.Queue = queue.Queue(maxsize=1)
+    upload_batches: queue.Queue = queue.Queue(maxsize=1)
+    finished = object()
+
+    def stage() -> None:
+        try:
+            for batch in job.batches:
+                try:
+                    if batch.ready:
+                        _tq_append_output(
+                            job,
+                            f"Batch {batch.number}: reusing staged slide(s).\n",
+                        )
+                    else:
+                        _tq_download_slides(job, batch)
+                    staged_batches.put(batch)
+                except Exception as exc:
+                    _tq_fail_batch(job, batch, "staging", exc)
+        finally:
+            staged_batches.put(finished)
+
+    def deidentify() -> None:
+        try:
+            while True:
+                batch = staged_batches.get()
+                if batch is finished:
+                    break
+                try:
+                    if not batch.ready and job.deidentify:
+                        _tq_deidentify_slides(job, batch)
+                    elif not batch.ready:
+                        _tq_append_output(
+                            job,
+                            f"Batch {batch.number}: deidentification not selected; "
+                            "preserving original filenames and associated images.\n",
+                        )
+                    batch.ready = True
+                    for slide in batch.slides:
+                        slide["_tq_ready"] = True
+                    upload_batches.put(batch)
+                except Exception as exc:
+                    _tq_fail_batch(job, batch, "deidentification", exc)
+        finally:
+            upload_batches.put(finished)
+
+    def upload() -> None:
+        while True:
+            batch = upload_batches.get()
+            if batch is finished:
+                return
+            _tq_upload_batch(job, batch)
+
+    try:
+        job.metadata_path = _tq_write_metadata_csv(job.metadata_slides)
+        if job.missing_copath_accessions:
+            _tq_append_output(
+                job,
+                "CoPath data was unavailable for accession(s): "
+                + ", ".join(job.missing_copath_accessions)
+                + ". Continuing with available CoPath data.\n",
+            )
+        workers = [
+            threading.Thread(target=stage, daemon=True),
+            threading.Thread(target=deidentify, daemon=True),
+            threading.Thread(target=upload, daemon=True),
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        job.staging_complete = all(
+            bool(slide.get("_tq_ready")) for slide in job.slides
+        )
+        _tq_finalize_pipeline(job)
     except Exception as exc:
         _tq_fail_before_upload(job, exc)
+    finally:
         _tq_cleanup_job_files(job)
         with _tq_state_lock:
             if _tq_active_job_id == job.id:
                 _tq_active_job_id = None
-        return
-    _read_tq_output(job)
 
 
 def _tq_cleanup_job_files(job: TQJob) -> None:
@@ -4668,10 +4902,19 @@ def _start_tq_job(
     missing_copath_accessions: Sequence[str] = (),
     resume_upload: bool = False,
     metadata_slides: Optional[List[Dict[str, str]]] = None,
+    deidentify: bool = True,
+    batch_size: int = 10,
 ) -> TQJob:
     global _tq_active_job_id
     config_result = _tq_config()
-    _tq_prepare_staging_paths(slides)
+    batch_size = _tq_batch_size(batch_size)
+    _tq_validate_destinations(slides)
+    if resume_upload:
+        for slide in slides:
+            slide["_tq_ready"] = True
+    job_id = uuid.uuid4().hex
+    batches = _tq_batches(slides, batch_size)
+    _tq_prepare_job_batches(job_id, batches)
     with _tq_state_lock:
         if _tq_active_job_id:
             active = _tq_jobs.get(_tq_active_job_id)
@@ -4679,7 +4922,7 @@ def _start_tq_job(
                 raise TQError("Another transfer is already running.")
             _tq_active_job_id = None
         job = TQJob(
-            uuid.uuid4().hex,
+            job_id,
             owner_id,
             None,
             slides,
@@ -4688,6 +4931,9 @@ def _start_tq_job(
             missing_copath_accessions=missing_copath_accessions,
             resume_upload=resume_upload,
             metadata_slides=metadata_slides,
+            deidentify=deidentify,
+            batch_size=batch_size,
+            batches=batches,
         )
         job.config_result = config_result
         _tq_jobs[job.id] = job
@@ -5839,6 +6085,8 @@ def tq_page():
                 "selected_ids": set(),
                 "destination_dir": "",
                 "include_copath": False,
+                "deidentify": False,
+                "batch_size": 10,
                 "phase": "select",
             },
         )
@@ -5846,6 +6094,8 @@ def tq_page():
             "selected_ids": set(draft["selected_ids"]),
             "destination_dir": str(draft.get("destination_dir", "")),
             "include_copath": bool(draft.get("include_copath", False)),
+            "deidentify": bool(draft.get("deidentify", False)),
+            "batch_size": int(draft.get("batch_size", 10)),
             "phase": draft["phase"],
         }
     requested_view = request.args.get("view")
@@ -5859,6 +6109,8 @@ def tq_page():
         selected_count=len(draft_snapshot["selected_ids"]),
         destination_dir=draft_snapshot["destination_dir"],
         include_copath=draft_snapshot["include_copath"],
+        deidentify=draft_snapshot["deidentify"],
+        batch_size=draft_snapshot["batch_size"],
         review=review,
         job=job,
         retry_count=(
@@ -6023,6 +6275,8 @@ def tq_review():
                 "selected_ids": set(),
                 "destination_dir": "",
                 "include_copath": False,
+                "deidentify": False,
+                "batch_size": 10,
                 "phase": "select",
             },
         )
@@ -6040,6 +6294,8 @@ def tq_save_draft():
     selected_ids = payload.get("selected_ids")
     destination_dir = payload.get("destination_dir")
     include_copath = payload.get("include_copath")
+    deidentify = payload.get("deidentify")
+    batch_size = payload.get("batch_size")
     phase = payload.get("phase")
     with _tq_state_lock:
         draft = _tq_drafts.setdefault(
@@ -6048,6 +6304,8 @@ def tq_save_draft():
                 "selected_ids": set(),
                 "destination_dir": "",
                 "include_copath": False,
+                "deidentify": False,
+                "batch_size": 10,
                 "phase": "select",
             },
         )
@@ -6073,6 +6331,17 @@ def tq_save_draft():
                     {"success": False, "message": "Invalid CoPath draft option."}
                 ), 400
             draft["include_copath"] = include_copath
+        if deidentify is not None:
+            if not isinstance(deidentify, bool):
+                return jsonify(
+                    {"success": False, "message": "Invalid deidentification option."}
+                ), 400
+            draft["deidentify"] = deidentify
+        if batch_size is not None:
+            try:
+                draft["batch_size"] = _tq_batch_size(batch_size)
+            except TQError as exc:
+                return jsonify({"success": False, "message": str(exc)}), 400
         if phase in {"select", "review"}:
             draft["phase"] = phase
     return jsonify({"success": True})
@@ -6095,21 +6364,27 @@ def tq_transfer():
         draft = _tq_drafts.get(owner_id)
         selected_ids = set(draft["selected_ids"]) if draft else set()
     all_slides, _ = _tq_catalog(slide_ids=selected_ids)
-    by_id = {slide["id"]: slide for slide in all_slides}
     selected = [
-        dict(by_id[slide_id])
-        for slide_id in selected_ids
-        if slide_id in by_id
+        dict(slide) for slide in all_slides if slide["id"] in selected_ids
     ]
     if not selected:
         flash("The transfer draft no longer contains any available slides.", "error")
         return redirect(url_for("tq_page"))
     destination_value = request.form.get("destination_dir", "")
     include_copath = request.form.get("include_copath") == "1"
+    deidentify = request.form.get("deidentify") == "1"
+    raw_batch_size = request.form.get(
+        "batch_size", str(draft.get("batch_size", 10) if draft else 10)
+    )
     copath_path = None
     try:
+        batch_size = _tq_batch_size(raw_batch_size)
         staging_dir = _tq_safe_prefix(destination_value)
         for slide in selected:
+            if not deidentify:
+                slide["destination_name"] = _tq_original_filename(
+                    slide["original_path"]
+                )
             slide["staging_dir"] = staging_dir
             slide["destination_dir"] = _tq_destination_dir(staging_dir, slide)
         missing_copath_accessions: List[str] = []
@@ -6121,6 +6396,8 @@ def tq_transfer():
             all_slides,
             copath_path=copath_path,
             missing_copath_accessions=missing_copath_accessions,
+            deidentify=deidentify,
+            batch_size=batch_size,
         )
     except TQError as exc:
         if copath_path is not None:
@@ -6134,6 +6411,11 @@ def tq_transfer():
             if draft:
                 draft["destination_dir"] = destination_value[:500]
                 draft["include_copath"] = include_copath
+                draft["deidentify"] = deidentify
+                try:
+                    draft["batch_size"] = _tq_batch_size(raw_batch_size)
+                except TQError:
+                    pass
                 draft["phase"] = "review"
         return redirect(url_for("tq_page", view="review"))
     session["tq_job_id"] = job.id
@@ -6197,6 +6479,8 @@ def tq_retry(job_id: str):
             missing_copath_accessions=missing_copath_accessions,
             resume_upload=previous.staging_complete,
             metadata_slides=previous.metadata_slides,
+            deidentify=previous.deidentify,
+            batch_size=previous.batch_size,
         )
     except TQError as exc:
         if copath_path is not None:

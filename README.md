@@ -253,11 +253,19 @@ The GT450 mount is the named Docker volume `inslide-gt450-images`. It mounts
 read-only permissions. The remaining paths are ordinary Windows bind mounts.
 
 Create and share `IMAGE_STAGING_HOST` (normally `D:\image_staging`) with Docker
-Desktop. Before each TQ upload, InSlide copies selected GT450 slides to
-`<IMAGE_STAGING_HOST>\<destination directory>\<renamed slide>.svs`, removes the
-identifying label and macro from those copies, then gives the staged slide paths
-and a generated metadata CSV to TQ. Each transfer uploads that CSV as
-`<destination directory>/metadata.csv` before the slides. It contains
+Desktop. InSlide splits each transfer into operator-sized batches (10 slides by
+default). One worker stages a complete batch while one worker deidentifies the
+previous staged batch and one worker uploads another ready batch. Batch objects
+move through FIFO queues; batch numbers are display-only.
+
+Deidentification is off unless the operator explicitly selects it. Selected
+deidentification removes embedded label and macro images and uses the approved
+renamed filename. Without deidentification, InSlide copies each SVS byte-for-byte
+and uploads it under its original basename, retaining all embedded associated
+images. Staged files use unique transfer and batch subdirectories beneath
+`<IMAGE_STAGING_HOST>\<destination directory>`. Each batch manifest gives its
+staged slide paths and the same transfer-wide metadata CSV to TQ, uploading that
+CSV as `<destination directory>/metadata.csv` before the batch's slides. It contains
 `accession_id,pid,num_slides`, with one row per accession
 and the number of selected slides for that accession. The transfer review page
 also offers an unchecked **Include CoPath data** option. When selected, the
@@ -266,16 +274,16 @@ and before the slides. It contains one full stored CoPath row per selected
 accession, including patient identifiers, clinical report text, and InSlide's
 derived fields. Missing accessions are reported in the transfer output while
 available CoPath rows and slides continue uploading; if none are available, the
-CoPath CSV contains only its header. A staging or
-deidentification failure prevents the whole selection from uploading. Staged
-slides remain in `IMAGE_STAGING_HOST` after every upload, whether it succeeds or
-fails. Size this directory for retained transfers and restrict it to the
-workstation operators and Docker Desktop service account.
+CoPath CSV contains only its header. A staging, deidentification, or upload
+failure marks that batch failed while later batches continue through the
+pipeline. Staged slides remain in `IMAGE_STAGING_HOST` after every upload,
+whether it succeeds or fails. Size this directory for retained transfers and
+restrict it to the workstation operators and Docker Desktop service account.
 
 Failed transfers can be retried from the transfer output. A retry includes every
 failed or unreported slide and excludes successful slides. Upload failures reuse
-the deidentified staged copies; earlier failures restart staging and
-deidentification.
+ready staged copies; staging or deidentification failures restart from the
+original slides with the same deidentification choice and batch size.
 
 ### Windows CoPath worker
 

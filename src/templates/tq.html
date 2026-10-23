@@ -116,11 +116,20 @@
                 <div class="field review-filter">
                     <label for="destination-dir">Batch destination directory</label>
                     <input id="destination-dir" name="destination_dir" value="{{ destination_dir }}" required placeholder="destination" autocomplete="off">
-                    <span class="muted">Slides stage together in D:\image_staging\&lt;destination&gt; before deidentification and upload.</span>
+                    <span class="muted">Batches stage under D:\image_staging\&lt;destination&gt; while completed batches move to later stages.</span>
+                </div>
+                <div class="field">
+                    <label for="batch-size">Slides per batch</label>
+                    <input id="batch-size" name="batch_size" type="number" min="1" step="1" value="{{ batch_size }}" required inputmode="numeric">
                 </div>
                 <label class="checkbox-field" for="include-copath">
                     <input id="include-copath" name="include_copath" type="checkbox" value="1" {% if include_copath %}checked{% endif %}>
                     Include CoPath data
+                </label>
+                <label class="checkbox-field" for="deidentify">
+                    <input id="deidentify" name="deidentify" type="checkbox" value="1" {% if deidentify %}checked{% endif %}>
+                    Deidentify slides
+                    <span class="muted">When unchecked, original filenames and embedded label/macro images containing PHI are transferred unchanged.</span>
                 </label>
             </div>
             <div class="actions">
@@ -414,10 +423,12 @@ document.getElementById('review-form')?.addEventListener('submit',(event) => { e
 
 const destinationDir = document.getElementById('destination-dir');
 const includeCopath = document.getElementById('include-copath');
+const deidentify = document.getElementById('deidentify');
+const batchSize = document.getElementById('batch-size');
 function saveReviewDraft() {
-    fetch(draftUrl,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},body:JSON.stringify({destination_dir:destinationDir.value,include_copath:Boolean(includeCopath?.checked),phase:'review'})}).catch(showCatalogError);
+    fetch(draftUrl,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},body:JSON.stringify({destination_dir:destinationDir.value,include_copath:Boolean(includeCopath?.checked),deidentify:Boolean(deidentify?.checked),batch_size:batchSize?.value,phase:'review'})}).catch(showCatalogError);
 }
-destinationDir?.addEventListener('input',saveReviewDraft); includeCopath?.addEventListener('change',saveReviewDraft);
+destinationDir?.addEventListener('input',saveReviewDraft); includeCopath?.addEventListener('change',saveReviewDraft); deidentify?.addEventListener('change',saveReviewDraft); batchSize?.addEventListener('change',saveReviewDraft);
 
 if (reviewMode) loadSlides({selected_ids:Array.from(draftSelectedIds)});
 else fetch(catalogOptionsUrl,{cache:'no-store'})

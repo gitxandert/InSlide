@@ -547,7 +547,7 @@ class TQTransferTests(unittest.TestCase):
             self.assertEqual({slides[0]["id"]}, draft["selected_ids"])
             self.assertEqual("review", draft["phase"])
 
-    def test_copath_checkbox_defaults_off_and_persists_in_draft(self):
+    def test_transfer_options_default_and_persist_in_draft(self):
         slides = self.catalog()
         self.client.post("/tq/review", data={"slide_id": slides[0]["id"]})
 
@@ -558,17 +558,43 @@ class TQTransferTests(unittest.TestCase):
             b'type="checkbox" value="1" checked'
         )
         self.assertNotIn(checked_markup, response.data)
+        self.assertNotIn(
+            b'id="deidentify" name="deidentify" type="checkbox" value="1" checked',
+            response.data,
+        )
+        self.assertIn(
+            b'id="batch-size" name="batch_size" type="number" min="1" step="1" value="10"',
+            response.data,
+        )
 
         draft_response = self.client.post(
             "/tq/draft",
-            json={"include_copath": True, "phase": "review"},
+            json={
+                "include_copath": True,
+                "deidentify": True,
+                "batch_size": "50",
+                "phase": "review",
+            },
         )
         self.assertEqual(200, draft_response.status_code)
         response = self.client.get("/tq?view=review")
         self.assertIn(checked_markup, response.data)
+        self.assertIn(
+            b'id="deidentify" name="deidentify" type="checkbox" value="1" checked',
+            response.data,
+        )
+        self.assertIn(b'value="50"', response.data)
 
         invalid = self.client.post("/tq/draft", json={"include_copath": "yes"})
         self.assertEqual(400, invalid.status_code)
+        self.assertEqual(
+            400,
+            self.client.post("/tq/draft", json={"deidentify": "yes"}).status_code,
+        )
+        self.assertEqual(
+            400,
+            self.client.post("/tq/draft", json={"batch_size": 0}).status_code,
+        )
 
     def test_transfer_console_uses_ansi_renderer(self):
         job = SimpleNamespace(
@@ -621,7 +647,10 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(
             "destination/BRAIN/AAAAAA", launched[0]["destination_dir"]
         )
+        self.assertEqual("one.svs", launched[0]["destination_name"])
         self.assertEqual("destination", launched[0]["staging_dir"])
+        self.assertFalse(start.call_args.kwargs["deidentify"])
+        self.assertEqual(10, start.call_args.kwargs["batch_size"])
         with self.client.session_transaction() as session:
             self.assertEqual("job-id", session["tq_job_id"])
 
@@ -649,6 +678,29 @@ class TQTransferTests(unittest.TestCase):
             )
         finally:
             copath_path.unlink(missing_ok=True)
+
+    def test_transfer_route_keeps_renamed_filename_when_deidentifying(self):
+        slides = self.catalog()
+        self.client.post("/tq/review", data={"slide_id": slides[0]["id"]})
+        fake_job = SimpleNamespace(id="deidentified-job", status="running")
+
+        with mock.patch.object(
+            app_module, "_start_tq_job", return_value=fake_job
+        ) as start:
+            response = self.client.post(
+                "/tq/transfer",
+                data={
+                    "destination_dir": "destination",
+                    "deidentify": "1",
+                    "batch_size": "50",
+                },
+            )
+
+        self.assertEqual(302, response.status_code)
+        launched = start.call_args.args[1]
+        self.assertEqual(slides[0]["destination_name"], launched[0]["destination_name"])
+        self.assertTrue(start.call_args.kwargs["deidentify"])
+        self.assertEqual(50, start.call_args.kwargs["batch_size"])
 
     def test_retry_restarts_all_failures_and_excludes_successes(self):
         slides = [dict(slide) for slide in self.catalog()]
@@ -697,6 +749,8 @@ class TQTransferTests(unittest.TestCase):
             {slide["original_path"] for slide in retried},
         )
         self.assertTrue(start.call_args.kwargs["resume_upload"])
+        self.assertTrue(start.call_args.kwargs["deidentify"])
+        self.assertEqual(10, start.call_args.kwargs["batch_size"])
         self.assertIs(
             previous.metadata_slides, start.call_args.kwargs["metadata_slides"]
         )
@@ -1131,6 +1185,170 @@ class TQTransferTests(unittest.TestCase):
         )
         workbook.close()
 
+    def test_batches_cover_each_slide_once_without_index_arithmetic(self):
+        slides = [{"id": str(index)} for index in range(23)]
+
+        for batch_size, expected_sizes in (
+            (1, [1] * 23),
+            (10, [10, 10, 3]),
+            (50, [23]),
+        ):
+            batches = app_module._tq_batches(slides, batch_size)
+            self.assertEqual(expected_sizes, [len(batch.slides) for batch in batches])
+            self.assertEqual(
+                slides,
+                [slide for batch in batches for slide in batch.slides],
+            )
+            self.assertEqual(
+                list(range(1, len(batches) + 1)),
+                [batch.number for batch in batches],
+            )
+
+    def test_pipeline_overlaps_stages_and_passes_same_batch_objects(self):
+        slides = [{"original_path": f"slide-{index}.svs"} for index in range(3)]
+        batches = [
+            app_module.TQBatch(index + 1, [slide])
+            for index, slide in enumerate(slides)
+        ]
+        job = app_module.TQJob(
+            "pipeline-job",
+            self.user.id,
+            None,
+            slides,
+            slides,
+            deidentify=True,
+            batch_size=1,
+            batches=batches,
+        )
+        stage_two = app_module.threading.Event()
+        stage_three = app_module.threading.Event()
+        deidentified_two = app_module.threading.Event()
+        overlap = {}
+        seen = {"stage": [], "deidentify": [], "upload": []}
+
+        def stage(_job, batch):
+            seen["stage"].append(id(batch))
+            if batch.number == 2:
+                stage_two.set()
+            if batch.number == 3:
+                stage_three.set()
+
+        def deidentify(_job, batch):
+            seen["deidentify"].append(id(batch))
+            if batch.number == 1:
+                overlap["deidentify_during_staging"] = stage_two.wait(1)
+            if batch.number == 2:
+                deidentified_two.set()
+
+        def upload(_job, batch):
+            seen["upload"].append(id(batch))
+            if batch.number == 1:
+                overlap["upload_during_other_stages"] = (
+                    deidentified_two.wait(1) and stage_three.wait(1)
+                )
+
+        with (
+            mock.patch.object(app_module, "_tq_write_metadata_csv", return_value=self.root / "metadata.csv"),
+            mock.patch.object(app_module, "_tq_download_slides", side_effect=stage),
+            mock.patch.object(app_module, "_tq_deidentify_slides", side_effect=deidentify),
+            mock.patch.object(app_module, "_tq_upload_batch", side_effect=upload),
+            mock.patch.object(app_module, "_tq_finalize_pipeline"),
+        ):
+            app_module._run_tq_job(job)
+
+        identities = [id(batch) for batch in batches]
+        self.assertEqual(identities, seen["stage"])
+        self.assertEqual(identities, seen["deidentify"])
+        self.assertEqual(identities, seen["upload"])
+        self.assertTrue(overlap["deidentify_during_staging"])
+        self.assertTrue(overlap["upload_during_other_stages"])
+
+    def test_failed_batch_does_not_stop_later_batch(self):
+        slides = [{"original_path": f"slide-{index}.svs"} for index in range(2)]
+        batches = [
+            app_module.TQBatch(index + 1, [slide])
+            for index, slide in enumerate(slides)
+        ]
+        job = app_module.TQJob(
+            "failure-job",
+            self.user.id,
+            None,
+            slides,
+            slides,
+            deidentify=False,
+            batch_size=1,
+            batches=batches,
+        )
+        uploaded = []
+
+        def stage(_job, batch):
+            if batch.number == 1:
+                raise app_module.TQError("copy failed")
+
+        def upload(_job, batch):
+            uploaded.append(batch.number)
+            _job.results[batch.slides[0]["original_path"]] = {
+                "success": True,
+                "error": "",
+            }
+
+        with (
+            mock.patch.object(app_module, "_tq_write_metadata_csv", return_value=self.root / "metadata.csv"),
+            mock.patch.object(app_module, "_tq_download_slides", side_effect=stage),
+            mock.patch.object(app_module, "_tq_deidentify_slides") as deidentify,
+            mock.patch.object(app_module, "_tq_upload_batch", side_effect=upload),
+            mock.patch.object(app_module, "_tq_finalize_pipeline"),
+        ):
+            app_module._run_tq_job(job)
+
+        self.assertEqual([2], uploaded)
+        self.assertIn(slides[0]["original_path"], job.result_errors)
+        deidentify.assert_not_called()
+
+    def test_no_deidentification_preserves_staged_bytes(self):
+        source = self.root / "gt450" / "original patient name.svs"
+        source.parent.mkdir()
+        source.write_bytes(b"slide pixels and embedded associated images")
+        slide = dict(self.catalog()[0])
+        slide.update(
+            {
+                "original_path": str(source),
+                "destination_name": source.name,
+                "destination_dir": "StudyA/BRAIN/AAAAAA",
+                "staging_dir": "StudyA",
+            }
+        )
+        app_module._tq_prepare_staging_paths([slide])
+        batch = app_module.TQBatch(1, [slide])
+        job = app_module.TQJob(
+            "unchanged-job",
+            self.user.id,
+            None,
+            [slide],
+            [slide],
+            deidentify=False,
+            batches=[batch],
+        )
+        captured = {}
+
+        def upload(_job, uploaded_batch):
+            staged = Path(uploaded_batch.slides[0]["staged_path"])
+            captured["name"] = staged.name
+            captured["bytes"] = staged.read_bytes()
+            _job.results[str(source)] = {"success": True, "error": ""}
+
+        with (
+            mock.patch.object(app_module, "_tq_write_metadata_csv", return_value=self.root / "metadata.csv"),
+            mock.patch.object(app_module, "_tq_deidentify_slides") as deidentify,
+            mock.patch.object(app_module, "_tq_upload_batch", side_effect=upload),
+            mock.patch.object(app_module, "_tq_finalize_pipeline"),
+        ):
+            app_module._run_tq_job(job)
+
+        self.assertEqual(source.name, captured["name"])
+        self.assertEqual(source.read_bytes(), captured["bytes"])
+        deidentify.assert_not_called()
+
     def test_launcher_schedules_staging_worker(self):
         slides = self.catalog()
         selected = [dict(slides[0])]
@@ -1148,6 +1366,9 @@ class TQTransferTests(unittest.TestCase):
             str(
                 Path(app_module.Config.IMAGE_STAGING_ROOT)
                 / "destination"
+                / f"transfer-{job.id}"
+                / "batch-0001"
+                / "slide-0001"
                 / selected[0]["destination_name"]
             ),
             selected[0]["staged_path"],
@@ -1305,6 +1526,29 @@ class TQTransferTests(unittest.TestCase):
         slides[0]["staging_dir"] = "../outside"
         with self.assertRaisesRegex(app_module.TQError, "cannot be used"):
             app_module._tq_staging_path(slides[0])
+
+    def test_job_batch_keeps_same_original_basename_without_local_collision(self):
+        slides = [dict(slide) for slide in self.catalog()]
+        for index, slide in enumerate(slides):
+            slide.update(
+                {
+                    "destination_name": "original.svs",
+                    "destination_dir": f"StudyA/BRAIN/PID{index}",
+                    "staging_dir": "StudyA",
+                }
+            )
+        batch = app_module.TQBatch(1, slides)
+
+        app_module._tq_validate_destinations(slides)
+        app_module._tq_prepare_job_batches("job-id", [batch])
+
+        paths = [Path(slide["staged_path"]) for slide in slides]
+        self.assertEqual(["original.svs", "original.svs"], [path.name for path in paths])
+        self.assertNotEqual(paths[0], paths[1])
+
+        slides[1]["destination_dir"] = slides[0]["destination_dir"]
+        with self.assertRaisesRegex(app_module.TQError, "same remote destination"):
+            app_module._tq_validate_destinations(slides)
 
     def test_log_browser_rejects_symlink_escape(self):
         outside = self.root / "outside.log"
