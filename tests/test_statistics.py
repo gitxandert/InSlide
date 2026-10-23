@@ -143,9 +143,130 @@ class SDLStatisticsIntegrationTests(unittest.TestCase):
             1,
         )
 
+    def test_rack_add_saves_each_accession_and_counts_each(self):
+        form = self.form_data()
+        form.update(
+            {
+                "accession_id": ["NP26-100", "NP26-101"],
+                "organ": ["BRAIN", "BREAST"],
+                "type": ["PROSP", "TRICHROME"],
+                "slides_count": ["2", "3"],
+                "scanner": ["RSCH1 (SS12797)", "CLIN1 (SS12602)"],
+                "notes": ["first", "second"],
+                "carousel_rack": "7",
+            }
+        )
+
+        response = self.client.post("/sdl", data=form)
+
+        self.assertEqual(302, response.status_code)
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        rows = app_module._read_sdl_rows(worksheet)
+        self.assertEqual(
+            [
+                ("NP26-100", "BRAIN", "2", "RSCH1 (SS12797)", "first"),
+                ("NP26-101", "BREAST", "3", "CLIN1 (SS12602)", "second"),
+            ],
+            [
+                (
+                    row["values"]["Accession ID"],
+                    row["values"]["Organ"],
+                    row["values"]["Slides Count"],
+                    row["values"]["Scanner"],
+                    row["values"]["Notes"],
+                )
+                for row in rows
+            ],
+        )
+        self.assertTrue(
+            all(row["values"]["Carousel Rack"] == "7" for row in rows)
+        )
+        self.assertTrue(
+            all(not any(row["statuses"].values()) for row in rows)
+        )
+        workbook.close()
+        today = datetime.date.today().isoformat()
+        self.assertEqual(
+            2,
+            app_module.stats_store._database_rows(self.user.id)[today][
+                "accessions_logged"
+            ],
+        )
+
+    def test_duplicate_accessions_reject_entire_rack(self):
+        form = self.form_data()
+        form.update(
+            {
+                "accession_id": ["NP26-100", " np26-100 "],
+                "organ": ["BRAIN", "BRAIN"],
+                "type": ["PROSP", "PROSP"],
+                "slides_count": ["2", "1"],
+                "scanner": ["RSCH1 (SS12797)", "RSCH1 (SS12797)"],
+                "notes": ["first", "second"],
+            }
+        )
+
+        response = self.client.post("/sdl", data=form)
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b"listed more than once", response.data)
+        self.assertIn(b'value="NP26-100"', response.data)
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        self.assertEqual(
+            1, workbook[app_module.Config.SDL_SHEET_NAME].max_row
+        )
+        workbook.close()
+
+    def test_rack_add_rejects_multiple_rack_numbers(self):
+        form = self.form_data()
+        form["carousel_rack"] = "1, 2"
+
+        response = self.client.post("/sdl", data=form)
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b"Carousel Rack must be a positive integer", response.data)
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        self.assertEqual(
+            1, workbook[app_module.Config.SDL_SHEET_NAME].max_row
+        )
+        workbook.close()
+
+    def test_conflict_in_second_accession_saves_none_of_rack(self):
+        self.client.post("/sdl", data=self.form_data())
+        form = self.form_data()
+        form.update(
+            {
+                "accession_id": ["NP26-101", "NP26-100"],
+                "organ": ["BRAIN", "BRAIN"],
+                "type": ["PROSP", "SEMINOMA"],
+                "slides_count": ["1", "2"],
+                "scanner": ["RSCH1 (SS12797)", "RSCH1 (SS12797)"],
+                "notes": ["", ""],
+            }
+        )
+
+        response = self.client.post("/sdl", data=form)
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b"already has Type PROSP", response.data)
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        self.assertEqual(
+            2, workbook[app_module.Config.SDL_SHEET_NAME].max_row
+        )
+        workbook.close()
+        today = datetime.date.today().isoformat()
+        self.assertEqual(
+            1,
+            app_module.stats_store._database_rows(self.user.id)[today][
+                "accessions_logged"
+            ],
+        )
+
     def test_nonstandard_accession_warns_but_saves_and_links_metadata(self):
         page = self.client.get("/sdl")
-        self.assertIn(b'id="accession-format-warning"', page.data)
+        self.assertIn(b'id="accession_format_warning_0"', page.data)
+        self.assertIn(b'value="RSCH1 (SS12797)" selected', page.data)
         self.assertNotIn(b'pattern="[A-Z]{1,3}[0-9]{2}-[0-9]+"', page.data)
 
         form = self.form_data()

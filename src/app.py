@@ -2656,6 +2656,31 @@ SDL_FORM_FIELDS = {
     "Notes": "notes",
 }
 
+SDL_ACCESSION_FORM_FIELDS = {
+    header: SDL_FORM_FIELDS[header]
+    for header in (
+        "Accession ID",
+        "Organ",
+        "Type",
+        "Slides Count",
+        "Scanner",
+        "Notes",
+    )
+}
+
+SDL_RACK_FORM_FIELDS = {
+    header: SDL_FORM_FIELDS[header]
+    for header in (
+        "Carousel Rack",
+        "Date Loaded",
+        "Time Loaded",
+        "Date Unloaded",
+        "Time Unloaded",
+    )
+}
+
+SDL_DEFAULT_SCANNER = "RSCH1 (SS12797)"
+
 SDL_UNKNOWN_DATE = "----------"
 
 _sdl_workbook_lock = threading.Lock()
@@ -2916,6 +2941,28 @@ def _submitted_sdl_form() -> Dict[str, str]:
     }
 
 
+def _submitted_sdl_rack_form() -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+    rack_values = {
+        header: request.form.get(field_name, "").strip()
+        for header, field_name in SDL_RACK_FORM_FIELDS.items()
+    }
+    submitted_columns = {
+        header: request.form.getlist(field_name)
+        for header, field_name in SDL_ACCESSION_FORM_FIELDS.items()
+    }
+    row_count = max(
+        (len(values) for values in submitted_columns.values()), default=0
+    )
+    accession_values = [
+        {
+            header: values[index].strip() if index < len(values) else None
+            for header, values in submitted_columns.items()
+        }
+        for index in range(row_count)
+    ]
+    return rack_values, accession_values
+
+
 def _validate_sdl_form(values: Dict[str, str]) -> Dict[str, Any]:
     accession_id = values["Accession ID"]
     if not accession_id:
@@ -3003,6 +3050,38 @@ def _validate_sdl_form(values: Dict[str, str]) -> Dict[str, Any]:
         "Time Unloaded": time_unloaded,
         "Notes": values["Notes"],
     }
+
+
+def _validate_sdl_rack_form(
+    rack_values: Dict[str, str], accession_values: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    carousel_rack = rack_values["Carousel Rack"]
+    if not carousel_rack.isdigit() or int(carousel_rack) < 1:
+        raise SDLValidationError("Carousel Rack must be a positive integer.")
+    if not accession_values:
+        raise SDLValidationError("Add at least one accession to the rack.")
+
+    normalized_rows = []
+    seen_accessions = set()
+    for index, accession in enumerate(accession_values, start=1):
+        if any(value is None for value in accession.values()):
+            raise SDLValidationError(
+                f"Accession {index} does not contain every expected field."
+            )
+        accession_key = accession["Accession ID"].casefold()
+        if accession_key and accession_key in seen_accessions:
+            raise SDLValidationError(
+                f"Accession {accession['Accession ID']} is listed more than once "
+                "in this rack."
+            )
+        seen_accessions.add(accession_key)
+        try:
+            normalized_rows.append(
+                _validate_sdl_form({**rack_values, **accession})
+            )
+        except SDLValidationError as exc:
+            raise SDLValidationError(f"Accession {index}: {exc}") from exc
+    return normalized_rows
 
 
 def _validate_sdl_type_consistency(
@@ -3196,6 +3275,8 @@ def _replace_sdl_accession(old_accession: str, new_accession: str) -> int:
 
 def _render_sdl_page(
     form_values: Optional[Dict[str, str]] = None,
+    rack_values: Optional[Dict[str, str]] = None,
+    accession_values: Optional[List[Dict[str, Any]]] = None,
     edit_row: Optional[int] = None,
     edit_signature: str = "",
 ):
@@ -3330,10 +3411,18 @@ def _render_sdl_page(
         status_headers=SDL_STATUS_HEADERS,
         form_fields=SDL_FORM_FIELDS,
         form_values=form_values or {header: "" for header in SDL_FORM_FIELDS},
+        rack_values=rack_values or {header: "" for header in SDL_RACK_FORM_FIELDS},
+        accession_values=accession_values or [
+            {
+                **{header: "" for header in SDL_ACCESSION_FORM_FIELDS},
+                "Scanner": SDL_DEFAULT_SCANNER,
+            }
+        ],
         edit_row=edit_row,
         edit_signature=edit_signature,
         organ_options=Config.SDL_ORGANS,
         scanner_options=Config.SDL_SCANNERS,
+        default_scanner=SDL_DEFAULT_SCANNER,
         global_query=global_query,
         column_filters=column_filters,
         sort_column=sort_column,
@@ -7428,9 +7517,22 @@ def sdl():
                 workbook.close()
         return redirect(url_for("sdl"))
 
-    submitted_values = _submitted_sdl_form()
+    submitted_values: Dict[str, str] = {}
+    submitted_rack_values: Dict[str, str] = {}
+    submitted_accession_values: List[Dict[str, Any]] = []
     try:
-        normalized_values = _validate_sdl_form(submitted_values)
+        if action == "update":
+            submitted_values = _submitted_sdl_form()
+            normalized_rows = [_validate_sdl_form(submitted_values)]
+        elif action == "add":
+            submitted_rack_values, submitted_accession_values = (
+                _submitted_sdl_rack_form()
+            )
+            normalized_rows = _validate_sdl_rack_form(
+                submitted_rack_values, submitted_accession_values
+            )
+        else:
+            raise SDLValidationError("Invalid SDL action.")
     except SDLValidationError as exc:
         flash(str(exc), "error")
         edit_row = None
@@ -7440,7 +7542,9 @@ def sdl():
             except ValueError:
                 pass
         return _render_sdl_page(
-            form_values=submitted_values,
+            form_values=submitted_values or None,
+            rack_values=submitted_rack_values or None,
+            accession_values=submitted_accession_values or None,
             edit_row=edit_row,
             edit_signature=request.form.get("row_signature", ""),
         )
@@ -7471,48 +7575,65 @@ def sdl():
                     raise SDLValidationError(
                         "This SDL row changed after it was opened. Reload it before saving."
                     )
-            elif action == "add":
-                row_number = worksheet.max_row + 1
+                rows_to_write = [(row_number, normalized_rows[0])]
             else:
-                raise SDLValidationError("Invalid SDL action.")
+                rows_to_write = [
+                    (worksheet.max_row + index, values)
+                    for index, values in enumerate(normalized_rows, start=1)
+                ]
 
-            _validate_sdl_type_consistency(
-                worksheet,
-                normalized_values,
-                excluded_row=row_number if action == "update" else None,
-            )
+            for row_number, normalized_values in rows_to_write:
+                _validate_sdl_type_consistency(
+                    worksheet,
+                    normalized_values,
+                    excluded_row=row_number if action == "update" else None,
+                )
 
-            for header in SDL_HEADERS:
-                column = header_columns[header]
-                if header in normalized_values:
-                    worksheet.cell(row=row_number, column=column).value = normalized_values[header]
-                elif action == "add" and header in SDL_STATUS_HEADERS:
-                    worksheet.cell(row=row_number, column=column).value = False
+                for header in SDL_HEADERS:
+                    column = header_columns[header]
+                    if header in normalized_values:
+                        worksheet.cell(row=row_number, column=column).value = (
+                            normalized_values[header]
+                        )
+                    elif action == "add" and header in SDL_STATUS_HEADERS:
+                        worksheet.cell(row=row_number, column=column).value = False
 
-            for header in ("Date Loaded", "Date Unloaded"):
-                worksheet.cell(
-                    row=row_number, column=header_columns[header]
-                ).number_format = "yyyy-mm-dd"
-            for header in ("Time Loaded", "Time Unloaded"):
-                worksheet.cell(
-                    row=row_number, column=header_columns[header]
-                ).number_format = "hh:mm"
+                for header in ("Date Loaded", "Date Unloaded"):
+                    worksheet.cell(
+                        row=row_number, column=header_columns[header]
+                    ).number_format = "yyyy-mm-dd"
+                for header in ("Time Loaded", "Time Unloaded"):
+                    worksheet.cell(
+                        row=row_number, column=header_columns[header]
+                    ).number_format = "hh:mm"
 
             _save_sdl_workbook(workbook)
     except (SDLWorkbookError, SDLValidationError) as exc:
         flash(str(exc), "error")
         app.logger.warning("SDL save rejected: %s", exc)
         return _render_sdl_page(
-            form_values=submitted_values,
-            edit_row=(row_number if action == "update" and "row_number" in locals() else None),
+            form_values=submitted_values or None,
+            rack_values=submitted_rack_values or None,
+            accession_values=submitted_accession_values or None,
+            edit_row=(
+                row_number
+                if action == "update" and "row_number" in locals()
+                else None
+            ),
             edit_signature=request.form.get("row_signature", ""),
         )
     except Exception as exc:
         app.logger.exception("Unexpected error while saving the SDL workbook")
         flash(f"The Slide Digitization Log could not be saved: {exc}", "error")
         return _render_sdl_page(
-            form_values=submitted_values,
-            edit_row=None,
+            form_values=submitted_values or None,
+            rack_values=submitted_rack_values or None,
+            accession_values=submitted_accession_values or None,
+            edit_row=(
+                row_number
+                if action == "update" and "row_number" in locals()
+                else None
+            ),
         )
     finally:
         if workbook is not None:
@@ -7520,18 +7641,20 @@ def sdl():
 
     if action == "add":
         try:
-            stats_store.increment(str(current_user.id), "accessions_logged")
+            stats_store.increment(
+                str(current_user.id), "accessions_logged", len(normalized_rows)
+            )
         except Exception:
             app.logger.exception("Could not record accession activity")
             flash(
-                "The row was saved, but its statistics entry could not be recorded.",
+                "The rack was saved, but its statistics entry could not be recorded.",
                 "warning",
             )
 
     flash(
         "Slide Digitization Log row updated successfully."
         if action == "update"
-        else "Slide Digitization Log row added successfully.",
+        else f"Rack added successfully with {len(normalized_rows)} accession(s).",
         "success",
     )
     return redirect(url_for("sdl"))
