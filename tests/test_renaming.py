@@ -763,6 +763,25 @@ class RenamingPageTests(unittest.TestCase):
         self.assertIn(b"reserved_pid", detail.data)
         self.assertIn(b'name="pid" value="AAAAAA" maxlength="6" required readonly', detail.data)
         self.assertIn(b'class="success approve-button"', detail.data)
+        self.assertIn(b'Accession changed. Consider requerying CoPath.', detail.data)
+        self.assertIn(b'>Requery CoPath</button>', detail.data)
+
+    def test_approval_allows_accession_change_without_copath_requery(self):
+        rows = self.add_second_accession()
+        batches, _ = app_module._renaming_batches()
+
+        response = self.client.post(
+            f"/renaming/approve/{batches[0].id}",
+            data=self.approval_data(rows, accession_id="NP25-300"),
+            headers={"Accept": "application/json"},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.get_json()["success"])
+        _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
+        changed = next(row for row in saved if row["OriginalPath"] == "one.svs")
+        self.assertEqual("NP25-300", changed["AccessionID"])
+        self.assertEqual("True", changed["Approved"])
 
     def test_page_links_to_label_and_macro_images(self):
         batches, _ = app_module._renaming_batches()

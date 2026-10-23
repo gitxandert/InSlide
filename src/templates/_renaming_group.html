@@ -4,7 +4,10 @@
     <input type="hidden" name="mapping_signature" value="{{ signature }}">
     <input type="hidden" name="slide_count" value="{{ group.slides|length }}">
     <div class="cell"><button class="slide-toggle secondary" type="button" aria-expanded="false" aria-controls="slides-{{ group_key }}" title="Show slides">▶</button></div>
-    <div class="cell"><input name="accession_id" value="{{ group.shared.AccessionID }}" required></div>
+    <div class="cell accession-cell">
+        <input name="accession_id" value="{{ group.shared.AccessionID }}" aria-describedby="requery-suggestion-{{ group_key }}" required>
+        <small class="requery-suggestion" id="requery-suggestion-{{ group_key }}" hidden>Accession changed. Consider requerying CoPath.</small>
+    </div>
     <div class="cell"><select name="organ">{% for value in ['BRAIN','BREAST','TESTIS','OTHER','UNKNOWN'] %}<option {% if group.shared.Organ==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
     <div class="cell"><input name="pid" value="{{ group.shared.PID }}" maxlength="6" required readonly></div>
     <div class="cell"><input name="accession_date" value="{{ group.shared.AccessionDate }}" maxlength="8" required></div>
@@ -15,7 +18,7 @@
     <div class="cell approval-state">{% if group.approved %}<strong>Approved</strong>{% else %}<span>Pending</span>{% endif %}</div>
     <div class="cell actions">
         <button class="success approve-button" type="submit" {% if job_state.status in ('preparing','retrying') %}disabled{% endif %}>Approve</button>
-        <button class="secondary retry-button" type="submit" formaction="{{ url_for('renaming_retry', batch_id=context.id) }}" {% if job_state.status in ('preparing','retrying') %}disabled{% endif %}>Retry</button>
+        <button class="secondary retry-button" type="submit" formaction="{{ url_for('renaming_retry', batch_id=context.id) }}" {% if job_state.status in ('preparing','retrying') %}disabled{% endif %}>Requery CoPath</button>
     </div>
     <div class="expanded" id="slides-{{ group_key }}" hidden>
         <div class="slide"><strong>Original path</strong><strong>Stain</strong><strong>Block</strong><strong>Section</strong><strong>New name</strong></div>

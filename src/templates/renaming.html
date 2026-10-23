@@ -33,6 +33,8 @@
         .column-header { position:sticky; top:0; z-index:5; padding:11px 8px; color:white; background:#344054; font-size:.82rem; font-weight:700; }
         .cell { min-height:58px; display:flex; align-items:center; padding:8px; border-bottom:1px solid var(--border); }
         .cell input,.cell select { width:100%; min-width:0; padding:7px; border:1px solid #b8c0cc; border-radius:5px; background:white; }
+        .accession-cell { align-items:stretch; flex-direction:column; justify-content:center; gap:4px; }
+        .requery-suggestion { color:var(--muted); font-size:.72rem; }
         .approved .cell { background:#f0faf2; }
         .slide-toggle { width:30px; height:30px; padding:0; font-size:1rem; transition:transform .15s ease; }
         .slide-toggle[aria-expanded="true"] { transform:rotate(90deg); }
@@ -229,6 +231,8 @@ const bindRenamingForm = (form) => {
   const slides = form.querySelector(`#${slideToggle.getAttribute('aria-controls')}`);
   const reports = reportToggle ? form.querySelector(`#${reportToggle.getAttribute('aria-controls')}`) : null;
   const organInput = form.elements.organ;
+  const accessionInput = form.elements.accession_id;
+  const requerySuggestion = form.querySelector('.requery-suggestion');
   const approveButton = form.querySelector('.approve-button');
   const approvalInitiallyDisabled = approveButton.disabled;
   let pidLookupVersion = 0;
@@ -255,6 +259,12 @@ const bindRenamingForm = (form) => {
   });
   form.addEventListener('input', () => updateNames(form));
   form.addEventListener('change', () => updateNames(form));
+  const updateRequerySuggestion = () => {
+    requerySuggestion.hidden = accessionInput.value.trim().toLocaleLowerCase()
+      === form.elements.old_accession.value.trim().toLocaleLowerCase();
+  };
+  accessionInput.addEventListener('input', updateRequerySuggestion);
+  updateRequerySuggestion();
   organInput.addEventListener('change', () => {
     const lookupVersion = ++pidLookupVersion;
     form.dataset.pidPreviewOrgan = '';

@@ -7073,10 +7073,6 @@ def renaming_approve(batch_id: str):
                 for row in current_rows
                 if renaming.accession_key(row["AccessionID"]) != old_key
             )
-            if new_key != old_key and not target_exists:
-                raise renaming.RenamingError(
-                    "Retry CoPath after changing an accession ID before approving it"
-                )
             current = next(
                 (
                     row for row in current_rows
@@ -7126,10 +7122,7 @@ def renaming_approve(batch_id: str):
                         if renaming.row_accession_key(row) != old_key
                     ]
                     renaming.atomic_write(pending_path, headers, pending)
-        if (
-            values["AccessionID"] != old_accession
-            and renaming.same_accession(values["AccessionID"], old_accession)
-        ):
+        if values["AccessionID"] != old_accession:
             _replace_sdl_accession(old_accession, values["AccessionID"])
         if merged:
             message = "Accessions were merged. Review and approve the combined group."
