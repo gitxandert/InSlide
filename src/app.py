@@ -6395,7 +6395,7 @@ def tq_review():
         with _tq_state_lock:
             draft = _tq_drafts.get(str(current_user.id))
             requested_ids = set(draft["selected_ids"]) if draft else set()
-    all_slides, _ = _tq_catalog(slide_ids=requested_ids)
+    all_slides, _ = _tq_stored_catalog(slide_ids=requested_ids)
     valid_ids = {slide["id"] for slide in all_slides}
     selected_ids = requested_ids.intersection(valid_ids)
     if not selected_ids:
@@ -6496,7 +6496,7 @@ def tq_transfer():
     with _tq_state_lock:
         draft = _tq_drafts.get(owner_id)
         selected_ids = set(draft["selected_ids"]) if draft else set()
-    all_slides, _ = _tq_catalog(slide_ids=selected_ids)
+    all_slides, _ = _tq_stored_catalog(slide_ids=selected_ids)
     selected = [
         dict(slide) for slide in all_slides if slide["id"] in selected_ids
     ]

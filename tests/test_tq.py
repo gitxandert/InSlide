@@ -644,18 +644,23 @@ class TQTransferTests(unittest.TestCase):
 
     def test_review_and_transfer_route_use_authoritative_mapping_values(self):
         slides = self.catalog()
-        response = self.client.post(
-            "/tq/review", data={"slide_id": slides[0]["id"]}
-        )
-        self.assertEqual(302, response.status_code)
-        fake_job = SimpleNamespace(id="job-id", status="running")
         with mock.patch.object(
-            app_module, "_start_tq_job", return_value=fake_job
-        ) as start:
+            app_module,
+            "_tq_prepare_catalog",
+            side_effect=AssertionError("request refreshed transfer catalog"),
+        ):
             response = self.client.post(
-                "/tq/transfer",
-                data={"destination_dir": "destination"},
+                "/tq/review", data={"slide_id": slides[0]["id"]}
             )
+            self.assertEqual(302, response.status_code)
+            fake_job = SimpleNamespace(id="job-id", status="running")
+            with mock.patch.object(
+                app_module, "_start_tq_job", return_value=fake_job
+            ) as start:
+                response = self.client.post(
+                    "/tq/transfer",
+                    data={"destination_dir": "destination"},
+                )
 
         self.assertEqual(302, response.status_code)
         launched = start.call_args.args[1]
