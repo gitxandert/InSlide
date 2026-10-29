@@ -3265,8 +3265,13 @@ def _reconcile_sdl(batch_roots: Optional[Sequence[Path]] = None) -> int:
     """Prepare status changes for affected rows, then save workbook once."""
     roots = list(batch_roots or [])
     if not roots:
-        roots = [Path(Config.INSLIDE_BATCHES) / row["relative_path"]
-                 for row in batch_catalog.list_batches(Config.INSTANCE_DIR)]
+        base = Path(Config.INSLIDE_BATCHES)
+        roots = [path.parent for path in base.glob("SS*/*/enriched.csv")]
+        roots.extend(
+            base / row["relative_path"]
+            for row in batch_catalog.list_batches(Config.INSTANCE_DIR)
+            if base / row["relative_path"] not in roots
+        )
     evidence = {}
     for root in roots:
         if not root.is_dir():
