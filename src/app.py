@@ -3280,7 +3280,7 @@ def _reconcile_sdl(batch_roots: Optional[Sequence[Path]] = None) -> int:
             _, rows = renaming.read_csv(root / "enriched.csv")
             accessions = {renaming.accession_key(renaming.row_accession(row))
                           for row in rows if renaming.row_accession(row)}
-        except (OSError, UnicodeError, csv.Error):
+        except (OSError, UnicodeError, csv.Error, renaming.RenamingError):
             app.logger.exception("Could not prepare SDL status from %s", root)
             continue
         catalog_row = next((item for item in batch_catalog.list_batches(Config.INSTANCE_DIR)
@@ -3292,7 +3292,7 @@ def _reconcile_sdl(batch_roots: Optional[Sequence[Path]] = None) -> int:
                 _, mapping_rows = renaming.read_csv(mapping)
                 renamed_accessions = {renaming.row_accession_key(row) for row in mapping_rows
                                       if renaming.row_accession(row)}
-            except (OSError, UnicodeError, csv.Error):
+            except (OSError, UnicodeError, csv.Error, renaming.RenamingError):
                 app.logger.exception("Could not prepare SDL rename status from %s", mapping)
         evidence[root.name] = (accessions, bool(catalog_row.get("qc_complete")),
                                bool(catalog_row.get("renamed_complete")), renamed_accessions)
