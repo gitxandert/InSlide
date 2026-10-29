@@ -442,8 +442,12 @@ docker compose run --rm inslide pipeline `
   --end-at name --ocr-use-cpu
 
 docker compose run --rm inslide nightly
-docker compose run --rm inslide python /app/src/deidentify_anonymize.py --help
+docker compose run --rm inslide python /app/src/deidentify.py /data/slides/one.svs /data/slides/batch --output-log /data/results.csv
 ```
+
+`deidentify.py` edits supported SVS, NDPI, and MRXS files in place. Directory
+inputs are searched recursively. SVS processing removes both label and macro
+images, following [ScanTools deidentify](https://github.com/PathologyDataScience/ScanTools/blob/main/scantools/deidentify.py).
 
 Schedule `nightly` externally; it performs one cycle and exits. State, SDL,
 backups, TQ configuration, and transfer logs survive container replacement.

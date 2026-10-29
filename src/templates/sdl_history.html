@@ -1,0 +1,17 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Digitization history</title></head><body>
+<h1>Digitization history: {{ accession }}</h1>
+<p><a href="{{ url_for('sdl') }}">Back to SDL</a></p>
+<h2>Slides</h2>
+{% for slide in data.slides %}
+<section>
+  <h3>{{ slide.relative_path }} — {{ slide.original_path }}</h3>
+  <p>Label-Check: {{ 'Yes' if slide.validity == 'ready' else 'No' }} · QC: {{ 'Yes' if slide.qc_complete else 'No' }} · Renamed: {{ 'Yes' if slide.renamed_complete else 'No' }} · CoPath job: {{ slide.history_status }}</p>
+  <pre>{{ slide.extracted_fields }}</pre>
+  {% for label, url in slide.images %}<p>{{ label }} image: <a href="{{ url }}">Open</a></p>{% endfor %}
+  {% if slide.copath_path %}<p>CoPath source: {{ slide.copath_path }}</p>{% endif %}
+  {% if slide.copath_data %}<pre>{{ slide.copath_data }}</pre>{% endif %}
+</section>
+{% else %}<p>No cataloged slides for this accession.</p>{% endfor %}
+<h2>CoPath source files</h2>
+{% for path in data.copath_sources %}<p>{{ path }}</p>{% else %}<p>No CoPath records.</p>{% endfor %}
+</body></html>

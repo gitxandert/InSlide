@@ -1580,6 +1580,7 @@ class BatchContext:
             ):
                 raise DataSaveError("queue still contains unfinished slides")
             self.completed_stages["QC"] = True
+            _schedule_sdl_reconcile(self.root)
         except DataSaveError:
             raise
         except (OSError, sqlite3.Error, KeyError) as exc:
@@ -1592,6 +1593,7 @@ class BatchContext:
                 Config.INSTANCE_DIR, self.id, qc_complete=True, renamed_complete=True
             )
             self.completed_stages = {"QC": True, "Renamed": True}
+            _schedule_sdl_reconcile(self.root)
         except (OSError, sqlite3.Error, KeyError) as exc:
             raise DataSaveError(f"could not update batch catalog: {exc}") from exc
 
@@ -1676,6 +1678,7 @@ batch_contexts: Dict[str, BatchContext] = {}
 batch_contexts_lock = threading.Lock()
 _catalog_reconcile_lock = threading.Lock()
 _catalog_reconcile_start_lock = threading.Lock()
+_sdl_reconcile_signature = None
 _catalog_reconciled_target: Optional[Tuple[str, str]] = None
 _catalog_reconciler_started = False
 _catalog_reconcile_owner = uuid.uuid4().hex
@@ -2245,6 +2248,7 @@ def _renaming_report_rows(
 
 
 def _catalog_reconciler() -> None:
+    global _sdl_reconcile_signature
     while True:
         started = time.monotonic()
         try:
@@ -2262,6 +2266,11 @@ def _catalog_reconciler() -> None:
             _refresh_pipeline_date_options()
             _refresh_copath_report_index()
             _tq_prepare_catalog()
+            signature = tuple((row["public_id"], row.get("enriched_mtime_ns"))
+                              for row in batch_catalog.list_batches(Config.INSTANCE_DIR))
+            if signature != _sdl_reconcile_signature:
+                _sdl_reconcile_signature = signature
+                _schedule_sdl_reconcile_all()
             app.logger.info(
                 "CATALOG_RECONCILE status=succeeded duration_ms=%d",
                 round((time.monotonic() - started) * 1000),
@@ -3250,6 +3259,85 @@ def _update_sdl_after_renaming(batch_root: Path) -> int:
             return len(new_rows)
         finally:
             workbook.close()
+
+
+def _reconcile_sdl(batch_roots: Optional[Sequence[Path]] = None) -> int:
+    """Prepare status changes for affected rows, then save workbook once."""
+    roots = list(batch_roots or [])
+    if not roots:
+        roots = [Path(Config.INSLIDE_BATCHES) / row["relative_path"]
+                 for row in batch_catalog.list_batches(Config.INSTANCE_DIR)]
+    evidence = {}
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            _, rows = renaming.read_csv(root / "enriched.csv")
+            accessions = {renaming.accession_key(renaming.row_accession(row))
+                          for row in rows if renaming.row_accession(row)}
+        except (OSError, UnicodeError, csv.Error):
+            app.logger.exception("Could not prepare SDL status from %s", root)
+            continue
+        catalog_row = next((item for item in batch_catalog.list_batches(Config.INSTANCE_DIR)
+                            if Path(item["relative_path"]) == root.relative_to(Path(Config.INSLIDE_BATCHES))), {})
+        mapping = root / "name_mapping.csv"
+        renamed_accessions = set()
+        if mapping.is_file():
+            try:
+                _, mapping_rows = renaming.read_csv(mapping)
+                renamed_accessions = {renaming.row_accession_key(row) for row in mapping_rows
+                                      if renaming.row_accession(row)}
+            except (OSError, UnicodeError, csv.Error):
+                app.logger.exception("Could not prepare SDL rename status from %s", mapping)
+        evidence[root.name] = (accessions, bool(catalog_row.get("qc_complete")),
+                               bool(catalog_row.get("renamed_complete")), renamed_accessions)
+    if not evidence:
+        return 0
+    copath_accessions = set(batch_catalog.copath_reports(
+        Config.INSTANCE_DIR,
+        [key for accessions, _, _, renamed in evidence.values()
+         for key in accessions | renamed],
+    ))
+    workbook = None
+    changed = 0
+    with _sdl_workbook_lock:
+        workbook, worksheet, _ = _load_sdl_workbook()
+        try:
+            columns = _sdl_header_columns(worksheet)
+            updates = []
+            for row in range(2, worksheet.max_row + 1):
+                accession = str(worksheet.cell(row, columns["Accession ID"]).value or "").strip()
+                key = renaming.accession_key(accession)
+                date = _format_sdl_value("Date Loaded", worksheet.cell(row, columns["Date Loaded"]).value)
+                if not key or date not in evidence:
+                    continue
+                accessions, qc_done, renamed_done, renamed_accessions = evidence[date]
+                has_copath = key in copath_accessions
+                updates.append((row, {
+                    "Ran Label-Check": key in accessions,
+                    "Finished QC": qc_done and key in accessions,
+                    "Collected CoPath Data": has_copath,
+                    "Renamed": renamed_done and key in renamed_accessions,
+                }))
+            for row, values in updates:
+                for header, value in values.items():
+                    cell = worksheet.cell(row, columns[header])
+                    if _coerce_sdl_bool(cell.value) != value:
+                        cell.value = value
+                        changed += 1
+            if changed:
+                _save_sdl_workbook(workbook)
+        finally:
+            workbook.close()
+    return changed
+
+
+def _schedule_sdl_reconcile(batch_root: Path) -> None:
+    threading.Thread(target=lambda: _reconcile_sdl([batch_root]), daemon=True).start()
+
+
+def _schedule_sdl_reconcile_all() -> None:
+    threading.Thread(target=_reconcile_sdl, daemon=True).start()
 
 
 def _replace_sdl_accession(old_accession: str, new_accession: str) -> int:
@@ -8001,6 +8089,23 @@ def update():
         app.logger.error(f"Update failed: {e}")
         flash("An error occurred during the update.", "error")
         return redirect(url_for("qc"))
+
+
+@app.route("/sdl/history/<path:accession>")
+@login_required
+def sdl_accession_history(accession: str):
+    data = batch_catalog.accession_history(Config.INSTANCE_DIR, renaming.accession_key(accession))
+    for slide in data["slides"]:
+        slide["images"] = []
+        for field, label in (("label_path", "Label"), ("macro_path", "Macro")):
+            path = str(slide["extracted_fields"].get(field, "")).replace("\\", "/")
+            if path and not Path(path).is_absolute() and ".." not in Path(path).parts:
+                slide["images"].append((label, url_for(
+                    "serve_relative_image", batch=slide["batch_id"],
+                    filepath=path,
+                )))
+    return render_template("sdl_history.html", accession=accession, data=data,
+                           messages=flash_messages())
 
 
 @app.route("/history")

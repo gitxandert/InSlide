@@ -1396,6 +1396,38 @@ class BatchCatalog:
             result.append(row)
         return result
 
+    def accession_history(self, instance_dir: str | Path, accession_key: str) -> dict:
+        """Return slide, extracted image, CoPath source, and stage data from catalog."""
+        with self.connection(instance_dir) as connection:
+            slides = connection.execute(
+                """SELECT s.*, b.public_id AS batch_id, b.relative_path,
+                          b.qc_complete, b.renamed_complete, b.renaming_status,
+                          b.history_status, b.validity,
+                          e.data_json AS enriched_json, cp.path AS copath_path,
+                          c.data_json AS copath_json
+                   FROM transfer_slides s JOIN batches b ON b.id=s.batch_id
+                   LEFT JOIN batch_document_rows e ON e.batch_id=b.id AND e.kind='enriched'
+                   LEFT JOIN batch_documents ed ON ed.batch_id=b.id AND ed.kind='enriched'
+                   LEFT JOIN copath_report_rows c ON c.accession_key=s.accession_key
+                   LEFT JOIN copath_sources cp ON cp.source_key=c.source_key
+                   WHERE s.accession_key=?
+                   ORDER BY b.relative_path,s.source_row""", (accession_key,)
+            ).fetchall()
+            sources = connection.execute(
+                "SELECT path FROM copath_sources WHERE source_key IN "
+                "(SELECT source_key FROM copath_report_rows WHERE accession_key=?)", (accession_key,)
+            ).fetchall()
+        result = []
+        for raw in slides:
+            row = dict(raw)
+            enriched = json.loads(row.pop("enriched_json")) if row.get("enriched_json") else {}
+            if enriched.get("original_slide_path", "").replace("\\", "/").casefold() != row["raw_original_path"].replace("\\", "/").casefold():
+                continue
+            row["extracted_fields"] = enriched
+            row["copath_data"] = json.loads(row.pop("copath_json")) if row.get("copath_json") else {}
+            result.append(row)
+        return {"slides": result, "copath_sources": [row[0] for row in sources]}
+
     def transfer_filter_options(self, instance_dir: str | Path) -> dict[str, list[str]]:
         """Return distinct categorical values without loading transfer rows."""
         columns = {

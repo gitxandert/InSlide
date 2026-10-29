@@ -482,7 +482,7 @@ class MrxsFile(object):
         """
         # MRXS files are actually directories, so we need the directory path
         dirname, ext = os.path.splitext(filename)
-        if ext != '.mrxs':
+        if ext.lower() != '.mrxs':
             raise UnrecognizedFile
 
         # Parse Slidedat.ini configuration file
@@ -982,13 +982,15 @@ def do_aperio_svs(filename, archive_root=None):
                 elif lines[1].startswith('macro '):
                     macro_dir = directory
 
-        if label_dir is None:
-            raise IOError("No label in SVS file")
+        if label_dir is None and macro_dir is None:
+            print(f"{filename}: no label or macro images to remove")
+            return
 
         if archive_root is not None:
             _export_removed_svs_images(filename, archive_root)
 
-        label_dir.delete(expected_prefix=LZW_CLEARCODE)
+        if label_dir is not None:
+            label_dir.delete(expected_prefix=LZW_CLEARCODE)
         if macro_dir is not None:
             macro_dir.delete(expected_prefix=JPEG_SOI)
 
@@ -1174,10 +1176,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Script to remove macro and label associated images from TIFF/SVS files."
     )
-    parser.add_argument(
-        "input_dir",
-        help="Directory with slides to anonymize"
-    )
+    parser.add_argument("inputs", nargs="+", help="Slide files and/or directories")
     parser.add_argument(
         "--output-log",
         required=False,
@@ -1192,23 +1191,25 @@ def main():
 
     args = parser.parse_args()
 
-    # Get the directory where this script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Path to folder containing slides to anonymize
-    slide_folder = Path(args.input_dir)
-    # Path to CSV file for logging results
     mapping_file = Path(args.output_log)
     archive_root = None
     if args.keep_removed_images:
         archive_root = mapping_file.parent / 'removed_images'
 
-    # Step 1: Recursively find all .svs files in slide_folder and subdirectories
-    svs_files = []
-    for root, dirs, files in os.walk(slide_folder):
-        for file in files:
-            if file.lower().endswith('.svs'):
-                svs_files.append(os.path.join(root, file))
-    svs_files.sort()
+    supported = {'.svs', '.ndpi', '.mrxs'}
+    slide_files = []
+    for value in args.inputs:
+        path = Path(value)
+        if path.is_dir():
+            slide_files.extend(
+                p for p in path.rglob('*')
+                if p.is_file() and p.suffix.lower() in supported
+            )
+        elif path.is_file() and path.suffix.lower() in supported:
+            slide_files.append(path)
+        else:
+            parser.error(f"not a supported slide file or directory: {path}")
+    slide_files = sorted(set(slide_files))
 
     # Step 2: Process each file to remove labels
     with open(mapping_file, 'w', newline='') as f:
@@ -1216,14 +1217,18 @@ def main():
         writer.writeheader()
 
         failures = 0
-        for file_path in svs_files:
-            print('Processing', os.path.basename(file_path))
-            exit_code = anonymize_slide(file_path, archive_root=archive_root)
+        for file_path in slide_files:
+            print('Processing', file_path.name)
+            exit_code = anonymize_slide(str(file_path), archive_root=archive_root)
             status = 'SUCCESS' if exit_code == 0 else 'FAILURE'
             failures += int(exit_code != 0)
             # Log the result (note: anonymized_path is same as original_path here
             # since we're modifying in-place, but folder was already renamed)
-            writer.writerow({'original_path': file_path, 'anonymized_path': file_path, 'status': status})
+            writer.writerow({
+                'original_path': str(file_path),
+                'anonymized_path': str(file_path),
+                'status': status,
+            })
 
     print('Anonymization process completed. Results are logged in {}'.format(mapping_file))
     return 1 if failures else 0

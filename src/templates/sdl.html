@@ -460,6 +460,7 @@
                                         {% endfor %}
                                         <td>
                                             <div class="row-actions">
+                                                <a class="edit-link" href="{{ url_for('sdl_accession_history', accession=row['values']['Accession ID']) }}">History</a>
                                                 <a class="edit-link" href="{{ edit_urls[row.worksheet_row] }}">Edit</a>
                                                 <form
                                                     class="delete-form"
