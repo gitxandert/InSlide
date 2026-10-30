@@ -248,6 +248,10 @@ Inside the container, Windows resources appear at stable Linux paths:
 Persisted UNC GT450 paths and `D:\label_check_batches` paths are translated to
 these mounts. New pipeline output records Linux mount paths directly.
 
+Each batch output contains `pipeline_events.jsonl`. Every JSON line records a
+UTC timestamp, pipeline stage, severity, slide path when applicable, and message.
+The file appends across reruns so previous warnings and errors remain available.
+
 The GT450 mount is the named Docker volume `inslide-gt450-images`. It mounts
 `//chp.clarian.org/app/Philips_Slide_Images/GT450_Images` through CIFS with
 read-only permissions. The remaining paths are ordinary Windows bind mounts.

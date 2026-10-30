@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import re
 import sys
 import tempfile
@@ -258,6 +259,7 @@ class PipelineAPITests(unittest.TestCase):
 
     def test_running_jobs_are_marked_interrupted_during_restart_recovery(self):
         job_id = self.create_durable_job(status="running", output="partial")
+        app_module.api_store.update_job(job_id, launcher_pid=os.getpid())
         app_module.api_store.mark_stale_jobs_interrupted()
         record = app_module.api_store.get_job(job_id)
         self.assertEqual("interrupted", record["status"])

@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from tqdm import tqdm  # For displaying a progress bar
+from pipeline_events import EVENT_LOG_NAME, configure_pipeline_event_logging
 
 # -----------------------------------------------------------------------------
 # 2. Logging Configuration
@@ -285,6 +286,24 @@ def process_csv_row(
     # Initialize the QC_PASSED column as empty.
     updated_row[COL_QC_PASSED] = ""
 
+    slide = row.get("original_slide_path") or None
+    if updated_row[COL_EXTRACTION_SUCCESSFUL]:
+        logger.info("Name extraction completed", extra={"slide": slide})
+    else:
+        missing = [
+            name
+            for name, value in (
+                ("accession ID", accession_id),
+                ("stain", canonical_stain),
+                ("block number", block_number),
+            )
+            if not value
+        ]
+        logger.warning(
+            f"Name extraction incomplete; missing {', '.join(missing)}",
+            extra={"slide": slide},
+        )
+
     return updated_row
 
 
@@ -351,7 +370,11 @@ def enrich_csv_with_parsing(
                 # Collect the result (the updated row) from the completed future.
                 updated_rows.append(future.result())
             except Exception as e:
-                logger.error(f"A row failed to process due to an unexpected error: {e}")
+                row = future_to_row[future]
+                logger.error(
+                    f"Name extraction failed: {e}",
+                    extra={"slide": row.get("original_slide_path") or None},
+                )
 
     # Calculate summary statistics for logging.
     successful_extractions = sum(1 for row in updated_rows if row[COL_EXTRACTION_SUCCESSFUL])
@@ -426,8 +449,15 @@ if __name__ == "__main__":
 
     # Ensure the output directory exists before writing the file.
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+    configure_pipeline_event_logging(
+        logger, args.output_csv.parent / EVENT_LOG_NAME, "name"
+    )
 
     # Run the main processing function with the provided arguments.
-    enrich_csv_with_parsing(
-        args.input_csv, args.output_csv, args.accession_pattern, args.workers
-    )
+    try:
+        enrich_csv_with_parsing(
+            args.input_csv, args.output_csv, args.accession_pattern, args.workers
+        )
+    except Exception:
+        logger.exception("Name stage failed")
+        raise

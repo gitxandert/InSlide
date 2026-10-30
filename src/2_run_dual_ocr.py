@@ -27,6 +27,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from pipeline_events import EVENT_LOG_NAME, configure_pipeline_event_logging
+
 # Third-party libraries for image processing and OCR
 import cv2  # OpenCV for image manipulation
 import easyocr  # The core OCR engine
@@ -138,6 +140,7 @@ def perform_ocr_on_row(row: dict, csv_dir: Path, reader: easyocr.Reader) -> dict
     # --- Step 1: Resolve and Validate Image Paths ---
     label_path_str = row.get("label_path")
     macro_path_str = row.get("macro_path")
+    slide = row.get("original_slide_path") or None
 
     paths_to_process = {}
     if label_path_str:
@@ -147,7 +150,10 @@ def perform_ocr_on_row(row: dict, csv_dir: Path, reader: easyocr.Reader) -> dict
             # Strip csv_dir from label_path for the flask app
             updated_row["label_path"] = label_path.relative_to(csv_dir)
         else:
-            logger.warning(f"Label image not found at resolved path '{label_path}' for row: {row}")
+            logger.warning(
+                f"Label image not found at resolved path '{label_path}'",
+                extra={"slide": slide},
+            )
 
     if macro_path_str:
         macro_path = clean_and_resolve_path(macro_path_str)
@@ -156,7 +162,10 @@ def perform_ocr_on_row(row: dict, csv_dir: Path, reader: easyocr.Reader) -> dict
             # Strip csv_dir from macro_path for the flask app
             updated_row["macro_path"] = macro_path.relative_to(csv_dir)
         else:
-            logger.warning(f"Macro image not found at resolved path '{macro_path}' for row: {row}")
+            logger.warning(
+                f"Macro image not found at resolved path '{macro_path}'",
+                extra={"slide": slide},
+            )
 
     # Also strip csv_dir from thumbnail_path for the flask app
     thumbnail_path = clean_and_resolve_path(row.get("thumbnail_path"))
@@ -203,12 +212,15 @@ def perform_ocr_on_row(row: dict, csv_dir: Path, reader: easyocr.Reader) -> dict
 
             # If the process completes without errors for at least one image, mark it.
             ocr_qc_needed = True
+            logger.info("OCR completed", extra={"slide": slide})
 
         except Exception as e:
             # If any error occurs (e.g., corrupted image), log it but don't crash.
             # The row will be written to the output CSV without OCR data.
-            logger.error(f"Failed OCR on row for slide '{row.get('original_slide_path')}': {e}")
+            logger.error(f"OCR failed: {e}", extra={"slide": slide})
             ocr_qc_needed = False
+    else:
+        logger.warning("No images available for OCR", extra={"slide": slide})
 
     # --- Step 4: Update the row with OCR results ---
     updated_row["label_text"] = label_text
@@ -278,7 +290,15 @@ def add_ocr_to_mapping(
         )
         for future in progress_bar:
             # Retrieve the result (the updated row dictionary) from the completed future.
-            updated_rows.append(future.result())
+            row = future_to_row[future]
+            try:
+                updated_rows.append(future.result())
+            except Exception:
+                logger.exception(
+                    "Unexpected OCR row failure",
+                    extra={"slide": row.get("original_slide_path") or None},
+                )
+                raise
 
     if not updated_rows:
         logger.error("Processing failed catastrophically. No rows were updated.")
@@ -337,6 +357,13 @@ if __name__ == "__main__":
 
     # Ensure the directory for the output file exists before trying to write to it.
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+    configure_pipeline_event_logging(
+        logger, args.output_csv.parent / EVENT_LOG_NAME, "ocr"
+    )
 
     # Call the main function with the parsed command-line arguments.
-    add_ocr_to_mapping(args.mapping_csv, args.output_csv, args.use_cpu, args.workers)
+    try:
+        add_ocr_to_mapping(args.mapping_csv, args.output_csv, args.use_cpu, args.workers)
+    except Exception:
+        logger.exception("OCR stage failed")
+        raise

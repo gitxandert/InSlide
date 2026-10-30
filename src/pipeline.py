@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+from pipeline_events import EVENT_LOG_NAME, append_pipeline_event
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RUN_TYPE_FILE = ".inslide_run_type"
@@ -152,10 +154,22 @@ def normalized_stage(value: str | None, default: int) -> int:
     return aliases[value]
 
 
-def run_stage(stage: int, command: list[object]) -> None:
+def run_stage(stage: int, command: list[object], event_log: Path) -> None:
     labels = {1: "1_get_macro.py", 2: "2_run_dual_ocr.py", 3: "3_name-files.py"}
+    stages = {1: "macro", 2: "ocr", 3: "name"}
     print(f"\n\x1b[1mExecuting {labels[stage]}...\x1b[0m\n", flush=True)
-    subprocess.run(command, check=True, text=True)
+    append_pipeline_event(event_log, stages[stage], "INFO", "Stage started")
+    try:
+        subprocess.run(command, check=True, text=True)
+    except subprocess.CalledProcessError as error:
+        append_pipeline_event(
+            event_log,
+            stages[stage],
+            "ERROR",
+            f"Stage failed with exit code {error.returncode}",
+        )
+        raise
+    append_pipeline_event(event_log, stages[stage], "INFO", "Stage completed")
 
 
 def copy_app_bundle(output_dir: Path) -> Path:
@@ -165,6 +179,7 @@ def copy_app_bundle(output_dir: Path) -> Path:
     for filename in (
         "app.py",
         "pipeline.py",
+        "pipeline_events.py",
         "1_get_macro.py",
         "2_run_dual_ocr.py",
         "3_name-files.py",
@@ -237,11 +252,19 @@ def main() -> int:
         return 2
 
     commands = build_stage_commands(args)
+    event_log = Path(args.output_dir) / EVENT_LOG_NAME
+    append_pipeline_event(event_log, "pipeline", "INFO", "Pipeline started")
     try:
         for stage in range(max(1, start_stage), min(3, end_stage) + 1):
-            run_stage(stage, commands[stage])
+            run_stage(stage, commands[stage], event_log)
     except subprocess.CalledProcessError as error:
         parse_except(error)
+        append_pipeline_event(
+            event_log,
+            "pipeline",
+            "ERROR",
+            f"Pipeline failed during stage {stage} with exit code {error.returncode}",
+        )
         return error.returncode or 1
 
     output_dir = Path(args.output_dir)
@@ -249,6 +272,7 @@ def main() -> int:
     (output_dir / RUN_TYPE_FILE).write_text(args.run_type, encoding="utf-8")
 
     if end_stage <= 3:
+        append_pipeline_event(event_log, "pipeline", "INFO", "Pipeline completed")
         print(f"\n\x1b[1mEnding at stage {end_stage}.\x1b[0m", flush=True)
         return 0
 

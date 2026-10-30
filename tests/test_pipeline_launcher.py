@@ -1,4 +1,5 @@
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ class FakeProcess:
     def __init__(self, output=b"", return_code=0):
         self.stdout = io.BytesIO(output)
         self.return_code = return_code
+        self.pid = 12345
 
     def wait(self):
         return self.return_code
@@ -57,6 +59,7 @@ class PipelineCommandTests(unittest.TestCase):
 
             self.assertTrue(output_app.is_file())
             self.assertTrue((output_app.parent / "pipeline.py").is_file())
+            self.assertTrue((output_app.parent / "pipeline_events.py").is_file())
             self.assertTrue((output_app.parent / "1_get_macro.py").is_file())
             self.assertTrue((output_app.parent / "2_run_dual_ocr.py").is_file())
             self.assertTrue((output_app.parent / "3_name-files.py").is_file())
@@ -66,6 +69,24 @@ class PipelineCommandTests(unittest.TestCase):
                 (output_app.parent / "copath_utilities" / "copath_texttypes.py").is_file()
             )
             self.assertTrue((output_app.parent / "templates" / "pipeline.html").is_file())
+
+    def test_stage_lifecycle_is_written_to_event_log(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            event_log = Path(temporary_directory) / "pipeline_events.jsonl"
+            with mock.patch.object(pipeline.subprocess, "run"):
+                pipeline.run_stage(1, ["python", "stage.py"], event_log)
+
+            events = [
+                json.loads(line)
+                for line in event_log.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(
+            ["Stage started", "Stage completed"],
+            [event["message"] for event in events],
+        )
+        self.assertTrue(all(event["stage"] == "macro" for event in events))
+        self.assertTrue(all(event["timestamp"].endswith("Z") for event in events))
 
     def test_successful_pipeline_records_run_type(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -326,6 +347,7 @@ class PipelineLauncherTests(unittest.TestCase):
         self.assertIs(app_module.subprocess.PIPE, popen.call_args.kwargs["stdout"])
         self.assertIs(app_module.subprocess.STDOUT, popen.call_args.kwargs["stderr"])
         self.assertNotIn("bufsize", popen.call_args.kwargs)
+        self.assertEqual(12345, app_module.api_store.get_job(job.id)["launcher_pid"])
         reader_thread.start.assert_called_once_with()
 
     def test_reader_marks_nonzero_exit_as_failed(self):

@@ -11,6 +11,8 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from pipeline_events import EVENT_LOG_NAME, configure_pipeline_event_logging
+
 try:
     import openslide
 except ImportError:
@@ -31,6 +33,18 @@ logger = logging.getLogger(__name__)
 ASSOCIATED_IMAGE_TYPES = ["macro", "label", "thumbnail"]
 DEFAULT_THUMBNAIL_SIZE = (300, 300)
 DEFAULT_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "tif", "tiff", "bmp"]
+DEFAULT_SLIDE_EXTENSIONS = [
+    "svs",
+    "ndpi",
+    "mrxs",
+    "scn",
+    "svslide",
+    "tif",
+    "tiff",
+    "bif",
+    "vms",
+    "vmu",
+]
 
 
 def write_mapping_csv(results: list[dict], csv_path: Path):
@@ -38,24 +52,21 @@ def write_mapping_csv(results: list[dict], csv_path: Path):
     Writes the stage-1 mapping CSV shared by both input modes.
     """
     logger.info(f"Writing mapping to {csv_path}...")
-    try:
-        with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
-            header = [f"{img_type}_path" for img_type in ASSOCIATED_IMAGE_TYPES] + [
-                "original_slide_path"
-            ]
-            writer = csv.DictWriter(csvfile, fieldnames=header)
-            writer.writeheader()
+    with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
+        header = [f"{img_type}_path" for img_type in ASSOCIATED_IMAGE_TYPES] + [
+            "original_slide_path"
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=header)
+        writer.writeheader()
 
-            for result in results:
-                row = {}
-                for img_type in ASSOCIATED_IMAGE_TYPES:
-                    row[f"{img_type}_path"] = result.get(img_type) or ""
-                row["original_slide_path"] = result["original"]
-                writer.writerow(row)
+        for result in results:
+            row = {}
+            for img_type in ASSOCIATED_IMAGE_TYPES:
+                row[f"{img_type}_path"] = result.get(img_type) or ""
+            row["original_slide_path"] = result["original"]
+            writer.writerow(row)
 
-        logger.info(f"CSV mapping saved to {csv_path}")
-    except Exception as e:
-        logger.error(f"Failed to write CSV file: {e}")
+    logger.info(f"CSV mapping saved to {csv_path}")
 
 
 def extract_associated_images(
@@ -68,6 +79,7 @@ def extract_associated_images(
     """
     Extracts associated images (macro, label, thumbnail) from a single WSI file.
     """
+    slide = None
     try:
         if openslide is None:
             raise ImportError(
@@ -93,18 +105,28 @@ def extract_associated_images(
                 slide.associated_images[image_type].save(image_path)
                 logger.debug(f"Extracted {image_type} from {svs_path}")
             elif image_type == "thumbnail":
-                logger.warning(f"No thumbnail in {svs_path}, generating one.")
+                logger.warning(
+                    "No embedded thumbnail; generating one",
+                    extra={"slide": str(svs_path)},
+                )
                 slide.get_thumbnail(thumbnail_size).save(image_path)
             else:
                 image_path = None
 
             output_paths[image_type] = image_path
 
-        slide.close()
+        if output_paths["label"] is None:
+            raise RuntimeError("slide has no embedded label image")
+        logger.info("Slide extraction completed", extra={"slide": str(svs_path)})
         return output_paths
     except Exception as e:
-        logger.error(f"Error processing {svs_path}: {e}")
+        logger.error(
+            f"Slide extraction failed: {e}", extra={"slide": str(svs_path)}
+        )
         return None
+    finally:
+        if slide is not None:
+            slide.close()
 
 
 def process_slide_files(
@@ -127,8 +149,7 @@ def process_slide_files(
 
     slide_files = sorted(set(slide_files))
     if not slide_files:
-        logger.warning("No slide files found to process.")
-        return
+        raise RuntimeError("No slide files found to process.")
 
     logger.info(f"Found {len(slide_files)} slide files to process.")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -156,14 +177,16 @@ def process_slide_files(
             if result:
                 results.append(result)
 
-    if not results:
-        logger.warning("Processing complete, but no images were successfully extracted.")
-        return
-
-    write_mapping_csv(results, csv_path)
+    if results:
+        write_mapping_csv(results, csv_path)
     logger.info(
         f"Successfully processed {len(results)} out of {len(slide_files)} files."
     )
+    if len(results) != len(slide_files):
+        raise RuntimeError(
+            f"Failed to process {len(slide_files) - len(results)} of "
+            f"{len(slide_files)} slide files."
+        )
 
 
 def normalize_image_stem(path: Path, image_type: str) -> str:
@@ -197,7 +220,8 @@ def scan_image_dir(
         if normalized_stem in matches:
             logger.warning(
                 f"Duplicate {image_type} image for '{normalized_stem}'; keeping "
-                f"{matches[normalized_stem]} and skipping {file_path}"
+                f"{matches[normalized_stem]} and skipping {file_path}",
+                extra={"slide": str(file_path)},
             )
             continue
         matches[normalized_stem] = file_path
@@ -231,10 +255,9 @@ def process_image_files(
     label_dir = input_dir / "label"
     macro_dir = input_dir / "macro"
     if not label_dir.is_dir() or not macro_dir.is_dir():
-        logger.error(
+        raise RuntimeError(
             "Image-directory mode requires both 'label/' and 'macro/' subdirectories."
         )
-        return
 
     logger.info(f"Scanning image directories in {input_dir}...")
     normalized_extensions = [ext.lower().lstrip(".") for ext in extensions]
@@ -242,8 +265,7 @@ def process_image_files(
     macro_images = scan_image_dir(macro_dir, "macro", normalized_extensions)
 
     if not label_images:
-        logger.warning("No label images found to process.")
-        return
+        raise RuntimeError("No label images found to process.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -265,7 +287,10 @@ def process_image_files(
             macro_output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(macro_source, macro_output)
         else:
-            logger.warning(f"No macro image found for '{normalized_stem}'")
+            logger.warning(
+                "No matching macro image",
+                extra={"slide": str(Path(normalized_stem).with_suffix(".svs"))},
+            )
 
         results.append(
             {
@@ -274,6 +299,10 @@ def process_image_files(
                 "thumbnail": None,
                 "original": Path(normalized_stem).with_suffix(".svs"),
             }
+        )
+        logger.info(
+            "Image inputs copied",
+            extra={"slide": str(Path(normalized_stem).with_suffix(".svs"))},
         )
 
     write_mapping_csv(results, csv_path)
@@ -322,7 +351,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--extensions",
         nargs="+",
-        default=["svs"],
+        default=DEFAULT_SLIDE_EXTENSIONS,
         help="List of slide-file extensions to process in slide mode.",
     )
     parser.add_argument(
@@ -354,21 +383,26 @@ if __name__ == "__main__":
     output_dir = Path(args.output_dir)
     csv_path = output_dir / args.csv_path
     csv_path.parent.mkdir(parents=True, exist_ok=True)
+    configure_pipeline_event_logging(logger, output_dir / EVENT_LOG_NAME, "macro")
     input_mode = detect_input_mode(args.input_dir, args.input_mode)
 
-    if input_mode == "slides":
-        process_slide_files(
-            args.input_dir,
-            output_dir,
-            csv_path,
-            args.extensions,
-            args.workers,
-            tuple(args.thumbnail_size),
-        )
-    else:
-        process_image_files(
-            args.input_dir,
-            output_dir,
-            csv_path,
-            args.image_extensions,
-        )
+    try:
+        if input_mode == "slides":
+            process_slide_files(
+                args.input_dir,
+                output_dir,
+                csv_path,
+                args.extensions,
+                args.workers,
+                tuple(args.thumbnail_size),
+            )
+        else:
+            process_image_files(
+                args.input_dir,
+                output_dir,
+                csv_path,
+                args.image_extensions,
+            )
+    except Exception:
+        logger.exception("Macro stage failed")
+        raise

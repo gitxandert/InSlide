@@ -1,10 +1,12 @@
 import importlib.util
 import re
+import sys
 import unittest
 from pathlib import Path
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "src" / "3_name-files.py"
+sys.path.insert(0, str(SCRIPT_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("name_files", SCRIPT_PATH)
 name_files = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(name_files)

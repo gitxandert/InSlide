@@ -94,7 +94,7 @@
           "end_at": {"type": "integer", "enum": [1, 2, 3], "default": 3},
           "input_mode": {"type": "string", "enum": ["auto", "slides", "images"], "default": "auto"},
           "macro_workers": {"type": "integer", "minimum": 1, "maximum": 8, "default": 4},
-          "macro_extensions": {"type": "array", "items": {"type": "string"}, "default": ["svs"]},
+          "macro_extensions": {"type": "array", "items": {"type": "string"}, "default": ["svs", "ndpi", "mrxs", "scn", "svslide", "tif", "tiff", "bif", "vms", "vmu"]},
           "macro_image_extensions": {"type": "array", "items": {"type": "string"}, "default": ["png", "jpg", "jpeg", "tif", "tiff", "bmp"]},
           "thumbnail_width": {"type": "integer", "minimum": 1, "maximum": 4096, "default": 300},
           "thumbnail_height": {"type": "integer", "minimum": 1, "maximum": 4096, "default": 300},

@@ -796,22 +796,11 @@ class APIStore:
 
     def mark_stale_jobs_interrupted(self) -> None:
         with self.connection() as connection:
-            rows = connection.execute(
-                "SELECT job_id, launcher_pid FROM pipeline_jobs WHERE status IN ('starting', 'running')"
-            ).fetchall()
-            for row in rows:
-                launcher_pid = row["launcher_pid"]
-                if launcher_pid:
-                    try:
-                        os.kill(launcher_pid, 0)
-                        continue
-                    except (OSError, ProcessLookupError):
-                        pass
-                connection.execute(
-                    """UPDATE pipeline_jobs SET status='interrupted', completed_at=?
-                       WHERE job_id=? AND status IN ('starting', 'running')""",
-                    (_iso_utc(), row["job_id"]),
-                )
+            connection.execute(
+                """UPDATE pipeline_jobs SET status='interrupted', completed_at=?
+                   WHERE status IN ('starting', 'running')""",
+                (_iso_utc(),),
+            )
 
 
 class StatisticsStore:
@@ -5430,7 +5419,7 @@ PIPELINE_FORM_DEFAULTS = {
     "end_at": "3",
     "input_mode": "auto",
     "macro_workers": "4",
-    "macro_extensions": "svs",
+    "macro_extensions": "svs, ndpi, mrxs, scn, svslide, tif, tiff, bif, vms, vmu",
     "macro_image_extensions": "png, jpg, jpeg, tif, tiff, bmp",
     "thumbnail_width": "300",
     "thumbnail_height": "300",
@@ -5938,7 +5927,7 @@ def _start_pipeline_job(
             job.id,
             status="running",
             started_at=_iso_utc(),
-            launcher_pid=os.getpid(),
+            launcher_pid=process.pid,
         )
 
     reader = threading.Thread(target=_read_pipeline_output, args=(job,), daemon=True)
