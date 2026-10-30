@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transfer History</title>
+    <style nonce="{{ csp_nonce() }}">
+        :root{--border:#dfe5ec;--muted:#65717e;--primary:#1565c0}
+        *{box-sizing:border-box}body{margin:0;background:#f4f7fa;color:#1d2731;font-family:Arial,sans-serif}
+        header{display:flex;justify-content:space-between;align-items:center;padding:18px 28px;background:#fff;border-bottom:1px solid var(--border)}
+        header h1{margin:0}nav{display:flex;gap:16px}a{color:var(--primary);text-decoration:none}
+        main{width:min(100% - 40px,1500px);margin:24px auto}.card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:20px;overflow:auto}
+        table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px;border-bottom:1px solid var(--border);vertical-align:top}th{color:var(--muted);font-size:.8rem;text-transform:uppercase}
+        .status{font-weight:700;text-transform:uppercase}.muted{color:var(--muted)}.messages{list-style:none;padding:0}.messages li{padding:10px;background:#eef4fb;border-radius:6px;margin-bottom:8px}
+        .pager{display:flex;justify-content:space-between;margin-top:18px}
+    </style>
+</head>
+<body>
+{% include '_app_sidebar.html' %}
+<header><h1>Transfer History</h1><nav><a href="{{ url_for('tq_page') }}">Transfers</a><a href="{{ url_for('tq_logs') }}">Show Logs</a></nav></header>
+<main>
+    {% if messages %}<ul class="messages">{% for message in messages %}<li class="{{ message.category }}">{{ message.message }}</li>{% endfor %}</ul>{% endif %}
+    <section class="card">
+        {% if transfers %}
+        <table>
+            <thead><tr><th>Started</th><th>Owner</th><th>Destination</th><th>Slides / batches</th><th>Status</th><th>Last checkpoint</th><th>Batch finished</th></tr></thead>
+            <tbody>
+            {% for transfer in transfers %}
+            <tr>
+                <td><a href="{{ url_for('tq_history_detail', transfer_id=transfer.transfer_id) }}">{{ transfer.created_at }}</a></td>
+                <td>{{ transfer.owner_id }}</td><td>{{ transfer.destination_dir }}</td>
+                <td>{{ transfer.slide_count }} / {{ transfer.batch_count }}</td>
+                <td class="status">{{ transfer.status }}</td>
+                <td>{% if transfer.last_batch_number %}Batch {{ transfer.last_batch_number }} · {{ transfer.last_stage }}{% else %}Not started{% endif %}</td>
+                <td>{{ 'Yes' if transfer.last_batch_finished else 'No' }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}<p class="muted">No durable transfer history is available yet.</p>{% endif %}
+        <div class="pager">
+            <span>{% if page > 1 %}<a href="{{ url_for('tq_history', page=page-1) }}">Previous</a>{% endif %}</span>
+            <span>Page {{ page }} of {{ total_pages }}</span>
+            <span>{% if page < total_pages %}<a href="{{ url_for('tq_history', page=page+1) }}">Next</a>{% endif %}</span>
+        </div>
+    </section>
+</main>
+</body>
+</html>

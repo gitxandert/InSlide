@@ -1059,6 +1059,7 @@ class StatisticsStore:
 api_store = APIStore(Config.API_DB_PATH, Config.API_JOB_OUTPUT_DIR)
 if os.environ.get("INSLIDE_STATS_SCHEDULER") != "true":
     api_store.mark_stale_jobs_interrupted()
+    batch_catalog.mark_stale_transfers_interrupted(Config.INSTANCE_DIR)
 stats_store = StatisticsStore(Config.STATS_DB_PATH, Config.USER_STATS_ROOT)
 
 
@@ -3676,8 +3677,12 @@ class TQJob:
         deidentify: bool = True,
         batch_size: int = 10,
         batches: Optional[List[TQBatch]] = None,
+        transfer_id: Optional[str] = None,
+        output_path: Optional[Path] = None,
     ):
         self.id = job_id
+        self.transfer_id = transfer_id or job_id
+        self.persisted = transfer_id is not None
         self.owner_id = owner_id
         self.process = process
         self.slides = slides
@@ -3706,11 +3711,45 @@ class TQJob:
         self.config_result: Optional[TQConfigResult] = None
         self.tq_log_offsets: Dict[str, int] = {}
         self.staging_complete = resume_upload
+        self.output_path = output_path
 
 
 def _tq_append_output(job: TQJob, message: str) -> None:
     with _tq_state_lock:
         job.output += message
+        if job.output_path is not None:
+            with job.output_path.open("a", encoding="utf-8") as handle:
+                handle.write(message)
+
+
+def _tq_attempt_output_path(attempt_id: str) -> Path:
+    directory = _make_private_directory(
+        Path(Config.INSTANCE_DIR) / "tq_transfer_output"
+    )
+    path = directory / f"{attempt_id}.log"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, PRIVATE_FILE_MODE)
+    os.close(descriptor)
+    return path
+
+
+def _tq_checkpoint(
+    job: TQJob,
+    batch: TQBatch,
+    stage: str,
+    status: str = "running",
+    error: str = "",
+) -> None:
+    if not job.persisted:
+        return
+    batch_catalog.update_transfer_batch(
+        Config.INSTANCE_DIR,
+        job.transfer_id,
+        job.id,
+        batch.number,
+        stage,
+        status,
+        error,
+    )
 
 
 def _tq_staging_root() -> Path:
@@ -4987,10 +5026,14 @@ def _run_tq_job(job: TQJob) -> None:
                             f"Batch {batch.number}: reusing staged slide(s).\n",
                         )
                     else:
+                        _tq_checkpoint(job, batch, "staging")
                         _tq_download_slides(job, batch)
                     staged_batches.put(batch)
                 except Exception as exc:
                     _tq_fail_batch(job, batch, "staging", exc)
+                    _tq_checkpoint(
+                        job, batch, "staging", "failed", str(exc)
+                    )
         finally:
             staged_batches.put(finished)
 
@@ -5002,6 +5045,7 @@ def _run_tq_job(job: TQJob) -> None:
                     break
                 try:
                     if not batch.ready and job.deidentify:
+                        _tq_checkpoint(job, batch, "deidentifying")
                         _tq_deidentify_slides(job, batch)
                     elif not batch.ready:
                         _tq_append_output(
@@ -5012,9 +5056,13 @@ def _run_tq_job(job: TQJob) -> None:
                     batch.ready = True
                     for slide in batch.slides:
                         slide["_tq_ready"] = True
+                    _tq_checkpoint(job, batch, "ready")
                     upload_batches.put(batch)
                 except Exception as exc:
                     _tq_fail_batch(job, batch, "deidentification", exc)
+                    _tq_checkpoint(
+                        job, batch, "deidentifying", "failed", str(exc)
+                    )
         finally:
             upload_batches.put(finished)
 
@@ -5023,7 +5071,20 @@ def _run_tq_job(job: TQJob) -> None:
             batch = upload_batches.get()
             if batch is finished:
                 return
+            _tq_checkpoint(job, batch, "uploading")
             _tq_upload_batch(job, batch)
+            failed = [
+                slide for slide in batch.slides
+                if not job.results.get(slide["original_path"], {}).get("success")
+            ]
+            if failed:
+                first = failed[0]["original_path"]
+                error = job.result_errors.get(first) or job.results.get(
+                    first, {}
+                ).get("error", "Upload failed.")
+                _tq_checkpoint(job, batch, "uploading", "failed", error)
+            else:
+                _tq_checkpoint(job, batch, "finished", "completed")
 
     try:
         job.metadata_path = _tq_write_metadata_csv(job.metadata_slides)
@@ -5051,6 +5112,22 @@ def _run_tq_job(job: TQJob) -> None:
         _tq_fail_before_upload(job, exc)
     finally:
         _tq_cleanup_job_files(job)
+        if job.persisted:
+            if job.status == "running":
+                job.status = "failed"
+                job.return_code = job.return_code or 1
+            try:
+                job.status = batch_catalog.finish_transfer_attempt(
+                    Config.INSTANCE_DIR,
+                    job.transfer_id,
+                    job.id,
+                    job.status,
+                    job.return_code,
+                    str(job.log_path) if job.log_path else None,
+                    "Transfer stopped before all batches completed.",
+                )
+            except Exception:
+                app.logger.exception("Could not persist TQ transfer completion")
         with _tq_state_lock:
             if _tq_active_job_id == job.id:
                 _tq_active_job_id = None
@@ -5127,6 +5204,9 @@ def _start_tq_job(
     metadata_slides: Optional[List[Dict[str, str]]] = None,
     deidentify: bool = True,
     batch_size: int = 10,
+    transfer_id: Optional[str] = None,
+    batches: Optional[List[TQBatch]] = None,
+    initiated_by: Optional[str] = None,
 ) -> TQJob:
     global _tq_active_job_id
     config_result = _tq_config()
@@ -5135,15 +5215,45 @@ def _start_tq_job(
     if resume_upload:
         for slide in slides:
             slide["_tq_ready"] = True
+    new_transfer = transfer_id is None
+    transfer_id = transfer_id or uuid.uuid4().hex
+    batches = batches or _tq_batches(slides, batch_size)
     job_id = uuid.uuid4().hex
-    batches = _tq_batches(slides, batch_size)
-    _tq_prepare_job_batches(job_id, batches)
     with _tq_state_lock:
         if _tq_active_job_id:
             active = _tq_jobs.get(_tq_active_job_id)
             if active and active.status == "running":
                 raise TQError("Another transfer is already running.")
             _tq_active_job_id = None
+    output_path: Optional[Path] = None
+    try:
+        if new_transfer:
+            batch_catalog.create_transfer(
+                Config.INSTANCE_DIR,
+                transfer_id,
+                owner_id,
+                slides[0]["staging_dir"],
+                copath_path is not None,
+                deidentify,
+                batch_size,
+                [batch.slides for batch in batches],
+            )
+        _tq_prepare_job_batches(job_id, batches)
+        output_path = _tq_attempt_output_path(job_id)
+        batch_catalog.start_transfer_attempt(
+            Config.INSTANCE_DIR,
+            transfer_id,
+            job_id,
+            initiated_by or owner_id,
+            str(output_path),
+        )
+    except (KeyError, OSError, sqlite3.Error, ValueError) as exc:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+        if new_transfer:
+            batch_catalog.delete_pending_transfer(Config.INSTANCE_DIR, transfer_id)
+        raise TQError(str(exc)) from exc
+    with _tq_state_lock:
         job = TQJob(
             job_id,
             owner_id,
@@ -5157,6 +5267,8 @@ def _start_tq_job(
             deidentify=deidentify,
             batch_size=batch_size,
             batches=batches,
+            transfer_id=transfer_id,
+            output_path=output_path,
         )
         job.config_result = config_result
         _tq_jobs[job.id] = job
@@ -5175,6 +5287,31 @@ def _tq_job_for_user(job_id: Optional[str]) -> Optional[TQJob]:
         if job.owner_id != str(current_user.id) and not current_user.is_admin:
             return None
         return job
+
+
+def _tq_transfer_for_user(transfer_id: str) -> Optional[Dict[str, Any]]:
+    transfer = batch_catalog.get_transfer(Config.INSTANCE_DIR, transfer_id)
+    if transfer is None:
+        return None
+    if transfer["owner_id"] != str(current_user.id) and not current_user.is_admin:
+        return None
+    return transfer
+
+
+def _tq_transfer_for_attempt(attempt_id: str) -> Optional[Dict[str, Any]]:
+    transfer = batch_catalog.get_transfer_for_attempt(Config.INSTANCE_DIR, attempt_id)
+    if transfer is None:
+        return None
+    if transfer["owner_id"] != str(current_user.id) and not current_user.is_admin:
+        return None
+    return transfer
+
+
+def _tq_unfinished_batches(transfer: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        batch for batch in transfer["batches"]
+        if batch["status"] != "completed"
+    ]
 
 
 def _tq_failed_slides(job: TQJob) -> List[Dict[str, str]]:
@@ -6327,7 +6464,17 @@ def tq_page():
     review = requested_view == "review" or (
         requested_view is None and draft_snapshot["phase"] == "review"
     )
-    job = _tq_job_for_user(session.get("tq_job_id"))
+    attempt_id = session.get("tq_job_id")
+    job = _tq_job_for_user(attempt_id)
+    transfer = _tq_transfer_for_attempt(attempt_id) if attempt_id else None
+    if transfer is not None:
+        attempt = batch_catalog.get_transfer_attempt(Config.INSTANCE_DIR, attempt_id)
+        job = {
+            "id": attempt_id,
+            "transfer_id": transfer["transfer_id"],
+            "status": transfer["status"],
+            "log_path": attempt.get("log_path") if attempt else None,
+        }
     return render_template(
         "tq.html",
         selected_ids=draft_snapshot["selected_ids"],
@@ -6339,7 +6486,9 @@ def tq_page():
         review=review,
         job=job,
         retry_count=(
-            len(_tq_failed_slides(job)) if job and job.status == "failed" else 0
+            sum(len(batch["slides"]) for batch in _tq_unfinished_batches(transfer))
+            if transfer and transfer["status"] in {"failed", "interrupted"}
+            else 0
         ),
         discovery_warnings=discovery_warnings,
         messages=flash_messages(),
@@ -6674,73 +6823,172 @@ def tq_transfer():
     return redirect(url_for("tq_page"))
 
 
-@app.route("/tq/jobs/<job_id>/retry", methods=["POST"])
-@login_required
-def tq_retry(job_id: str):
-    previous = _tq_job_for_user(job_id)
-    if previous is None:
-        flash("Transfer job not found.", "error")
-        return redirect(url_for("tq_page"))
-    if previous.status != "failed":
-        flash("Only failed transfers can be retried.", "error")
-        return redirect(url_for("tq_page"))
-
-    slides = [dict(slide) for slide in _tq_failed_slides(previous)]
-    if not slides:
-        flash("This transfer has no failed slides to retry.", "error")
-        return redirect(url_for("tq_page"))
-
+def _resume_tq_transfer(transfer: Dict[str, Any]):
+    unfinished = _tq_unfinished_batches(transfer)
+    if transfer["status"] not in {"failed", "interrupted"}:
+        raise TQError("Only failed or interrupted transfers can be resumed.")
+    if not unfinished:
+        raise TQError("This transfer has no unfinished batches to resume.")
+    batches = [
+        TQBatch(
+            int(batch["batch_number"]),
+            [dict(slide) for slide in batch["slides"]],
+        )
+        for batch in unfinished
+    ]
+    slides = [slide for batch in batches for slide in batch.slides]
+    all_slides = [
+        dict(slide)
+        for batch in transfer["batches"]
+        for slide in batch["slides"]
+    ]
     copath_path = None
     try:
         missing_copath_accessions: List[str] = []
-        if previous.include_copath:
+        if transfer["include_copath"]:
             copath_path, missing_copath_accessions = _tq_write_copath_csv(
-                previous.metadata_slides
+                all_slides
             )
         job = _start_tq_job(
-            str(current_user.id),
+            transfer["owner_id"],
             slides,
-            previous.all_slides,
+            all_slides,
             copath_path=copath_path,
             missing_copath_accessions=missing_copath_accessions,
-            resume_upload=previous.staging_complete,
-            metadata_slides=previous.metadata_slides,
-            deidentify=previous.deidentify,
-            batch_size=previous.batch_size,
+            metadata_slides=all_slides,
+            deidentify=transfer["deidentify"],
+            batch_size=int(transfer["batch_size"]),
+            transfer_id=transfer["transfer_id"],
+            batches=batches,
+            initiated_by=str(current_user.id),
         )
-    except TQError as exc:
+    except Exception:
         if copath_path is not None:
             copath_path.unlink(missing_ok=True)
+        raise
+    return job, len(unfinished), len(slides)
+
+
+@app.route("/tq/history", methods=["GET"])
+@login_required
+def tq_history():
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    owner_id = None if current_user.is_admin else str(current_user.id)
+    page_size = 50
+    total = batch_catalog.count_transfers(Config.INSTANCE_DIR, owner_id)
+    transfers = batch_catalog.list_transfers(
+        Config.INSTANCE_DIR, owner_id, page_size, (page - 1) * page_size
+    )
+    return render_template(
+        "tq_history.html",
+        transfers=transfers,
+        page=page,
+        total_pages=max(1, (total + page_size - 1) // page_size),
+        messages=flash_messages(),
+    )
+
+
+@app.route("/tq/history/<transfer_id>", methods=["GET"])
+@login_required
+def tq_history_detail(transfer_id: str):
+    transfer = _tq_transfer_for_user(transfer_id)
+    if transfer is None:
+        abort(404)
+    return render_template(
+        "tq_history_detail.html",
+        transfer=transfer,
+        unfinished=_tq_unfinished_batches(transfer),
+        messages=flash_messages(),
+    )
+
+
+@app.route("/tq/history/<transfer_id>/resume", methods=["POST"])
+@login_required
+def tq_resume(transfer_id: str):
+    transfer = _tq_transfer_for_user(transfer_id)
+    if transfer is None:
+        abort(404)
+    if request.form.get("confirm_resume") != "1":
+        flash("Confirm that unfinished batches will restart from their original slides.", "error")
+        return redirect(url_for("tq_history_detail", transfer_id=transfer_id))
+    try:
+        job, batch_count, slide_count = _resume_tq_transfer(transfer)
+    except TQError as exc:
         flash(str(exc), "error")
-        return redirect(url_for("tq_page"))
+        return redirect(url_for("tq_history_detail", transfer_id=transfer_id))
 
     session["tq_job_id"] = job.id
-    flash(f"Retry started for {len(slides)} failed slide(s).", "success")
+    flash(
+        f"Resume started for {slide_count} slide(s) in {batch_count} unfinished batch(es).",
+        "success",
+    )
     return redirect(url_for("tq_page"))
+
+
+@app.route("/tq/jobs/<job_id>/retry", methods=["POST"])
+@login_required
+def tq_retry(job_id: str):
+    transfer = _tq_transfer_for_attempt(job_id)
+    if transfer is None:
+        flash("Transfer job not found.", "error")
+        return redirect(url_for("tq_page"))
+    return redirect(url_for("tq_history_detail", transfer_id=transfer["transfer_id"]))
 
 
 @app.route("/tq/jobs/<job_id>/output", methods=["GET"])
 @login_required
 def tq_job_output(job_id: str):
-    job = _tq_job_for_user(job_id)
-    if job is None:
-        return jsonify({"error": "Transfer job not found."}), 404
+    transfer = _tq_transfer_for_attempt(job_id)
+    attempt = batch_catalog.get_transfer_attempt(Config.INSTANCE_DIR, job_id)
+    if transfer is None or attempt is None:
+        job = _tq_job_for_user(job_id)
+        if job is None:
+            return jsonify({"error": "Transfer job not found."}), 404
+        try:
+            offset = max(0, int(request.args.get("offset", "0")))
+        except ValueError:
+            offset = 0
+        with _tq_state_lock:
+            output = job.output[offset:]
+            return jsonify(
+                {
+                    "output": output,
+                    "next_offset": len(job.output),
+                    "status": job.status,
+                    "return_code": job.return_code,
+                    "log_path": str(job.log_path) if job.log_path else None,
+                    "eof": True,
+                }
+            )
     try:
         offset = max(0, int(request.args.get("offset", "0")))
     except ValueError:
         offset = 0
-    with _tq_state_lock:
-        output = job.output[offset:]
-        next_offset = len(job.output)
-        status = job.status
-        log_path = str(job.log_path) if job.log_path else None
+    path = Path(attempt["output_path"])
+    root = (Path(Config.INSTANCE_DIR) / "tq_transfer_output").resolve()
+    try:
+        if path.is_symlink() or path.resolve().parent != root:
+            raise OSError("invalid output path")
+        size = path.stat().st_size
+        offset = min(offset, size)
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            raw = handle.read(64 * 1024)
+    except OSError:
+        raw = b""
+        size = offset
+    next_offset = offset + len(raw)
     return jsonify(
         {
-            "output": output,
+            "output": raw.decode("utf-8", errors="replace"),
             "next_offset": next_offset,
-            "status": status,
-            "return_code": job.return_code,
-            "log_path": log_path,
+            "status": attempt["status"],
+            "return_code": attempt["return_code"],
+            "log_path": attempt["log_path"],
+            "eof": next_offset >= size,
         }
     )
 

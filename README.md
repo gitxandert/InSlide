@@ -280,10 +280,18 @@ pipeline. Staged slides remain in `IMAGE_STAGING_HOST` after every upload,
 whether it succeeds or fails. Size this directory for retained transfers and
 restrict it to the workstation operators and Docker Desktop service account.
 
-Failed transfers can be retried from the transfer output. A retry includes every
-failed or unreported slide and excludes successful slides. Upload failures reuse
-ready staged copies; staging or deidentification failures restart from the
-original slides with the same deidentification choice and batch size.
+Failed or interrupted transfers can be resumed from transfer history. Completed
+batches are excluded; unfinished batches restart from their original slides with
+the same deidentification choice and batch size.
+
+Transfer history is durable in `batch_catalog.sqlite3`. Open **Transfers →
+History** to inspect each batch's last checkpoint, completion state, errors, and
+attempt output. If InSlide stops during a transfer, startup marks its active
+attempt interrupted. Resume it manually from its history detail page. Completed
+batches are skipped; every unfinished batch restarts from its original slides,
+including staging and selected deidentification. Because a whole unfinished
+batch restarts, a slide uploaded before the interruption but not covered by a
+completed-batch checkpoint may upload again.
 
 ### Windows CoPath worker
 

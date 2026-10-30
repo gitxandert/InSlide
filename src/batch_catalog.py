@@ -10,10 +10,10 @@ import os
 import sqlite3
 import threading
 from pathlib import Path, PurePosixPath
-from typing import Dict, Iterable, Iterator, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 QUEUE_STATUSES = {"pending", "leased", "completed"}
 DOCUMENT_KINDS = {"enriched", "name_mapping"}
 
@@ -232,6 +232,83 @@ class BatchCatalog:
                         ON transfer_slides(organ);
                     CREATE INDEX IF NOT EXISTS transfer_slide_types_type
                         ON transfer_slide_types(slide_type, slide_id);
+                    CREATE TABLE IF NOT EXISTS transfer_jobs (
+                        transfer_id TEXT PRIMARY KEY,
+                        owner_id TEXT NOT NULL,
+                        destination_dir TEXT NOT NULL,
+                        include_copath INTEGER NOT NULL CHECK(include_copath IN (0,1)),
+                        deidentify INTEGER NOT NULL CHECK(deidentify IN (0,1)),
+                        batch_size INTEGER NOT NULL CHECK(batch_size > 0),
+                        slide_count INTEGER NOT NULL CHECK(slide_count > 0),
+                        batch_count INTEGER NOT NULL CHECK(batch_count > 0),
+                        status TEXT NOT NULL CHECK(status IN
+                            ('pending','running','succeeded','failed','interrupted')),
+                        current_attempt_id TEXT,
+                        last_batch_number INTEGER,
+                        last_stage TEXT NOT NULL DEFAULT 'pending' CHECK(last_stage IN
+                            ('pending','staging','deidentifying','ready','uploading','finished')),
+                        last_batch_finished INTEGER NOT NULL DEFAULT 0
+                            CHECK(last_batch_finished IN (0,1)),
+                        created_at TEXT NOT NULL,
+                        started_at TEXT,
+                        completed_at TEXT,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS transfer_job_batches (
+                        transfer_id TEXT NOT NULL REFERENCES transfer_jobs(transfer_id)
+                            ON DELETE CASCADE,
+                        batch_number INTEGER NOT NULL CHECK(batch_number > 0),
+                        status TEXT NOT NULL CHECK(status IN
+                            ('pending','running','completed','failed','interrupted')),
+                        stage TEXT NOT NULL CHECK(stage IN
+                            ('pending','staging','deidentifying','ready','uploading','finished')),
+                        started_at TEXT,
+                        completed_at TEXT,
+                        updated_at TEXT NOT NULL,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY(transfer_id,batch_number)
+                    );
+                    CREATE TABLE IF NOT EXISTS transfer_job_slides (
+                        transfer_id TEXT NOT NULL,
+                        batch_number INTEGER NOT NULL,
+                        slide_position INTEGER NOT NULL CHECK(slide_position > 0),
+                        data_json TEXT NOT NULL,
+                        PRIMARY KEY(transfer_id,batch_number,slide_position),
+                        FOREIGN KEY(transfer_id,batch_number)
+                            REFERENCES transfer_job_batches(transfer_id,batch_number)
+                            ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS transfer_attempts (
+                        attempt_id TEXT PRIMARY KEY,
+                        transfer_id TEXT NOT NULL REFERENCES transfer_jobs(transfer_id)
+                            ON DELETE CASCADE,
+                        attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+                        initiated_by TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK(status IN
+                            ('running','succeeded','failed','interrupted')),
+                        started_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        return_code INTEGER,
+                        output_path TEXT NOT NULL,
+                        log_path TEXT,
+                        UNIQUE(transfer_id,attempt_number)
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS one_active_transfer_attempt
+                        ON transfer_attempts((1)) WHERE status='running';
+                    CREATE TABLE IF NOT EXISTS transfer_attempt_batches (
+                        attempt_id TEXT NOT NULL REFERENCES transfer_attempts(attempt_id)
+                            ON DELETE CASCADE,
+                        batch_number INTEGER NOT NULL CHECK(batch_number > 0),
+                        status TEXT NOT NULL CHECK(status IN
+                            ('pending','running','completed','failed','interrupted')),
+                        stage TEXT NOT NULL CHECK(stage IN
+                            ('pending','staging','deidentifying','ready','uploading','finished')),
+                        started_at TEXT,
+                        completed_at TEXT,
+                        updated_at TEXT NOT NULL,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY(attempt_id,batch_number)
+                    );
                     """
                 )
                 connection.execute(
@@ -290,6 +367,12 @@ class BatchCatalog:
                             completed_count=(SELECT COUNT(*) FROM queue_items q WHERE q.batch_id=batches.id AND q.status='completed')
                         """
                     )
+                    connection.execute(
+                        "UPDATE catalog_metadata SET value=? WHERE key='schema_version'",
+                        (str(SCHEMA_VERSION),),
+                    )
+                    version = str(SCHEMA_VERSION)
+                if int(version) == 4:
                     connection.execute(
                         "UPDATE catalog_metadata SET value=? WHERE key='schema_version'",
                         (str(SCHEMA_VERSION),),
@@ -1531,6 +1614,435 @@ class BatchCatalog:
                 "DELETE FROM catalog_metadata WHERE key='reconcile_lease' AND value LIKE ?",
                 (f"{owner}:%",),
             )
+
+    def create_transfer(
+        self,
+        instance_dir: str | Path,
+        transfer_id: str,
+        owner_id: str,
+        destination_dir: str,
+        include_copath: bool,
+        deidentify: bool,
+        batch_size: int,
+        batches: Sequence[Sequence[Mapping[str, Any]]],
+    ) -> None:
+        now = utc_now()
+        slide_count = sum(len(batch) for batch in batches)
+        if not batches or not slide_count:
+            raise ValueError("transfer must contain at least one slide")
+        with self.connection(instance_dir) as connection:
+            connection.execute(
+                """
+                INSERT INTO transfer_jobs(
+                    transfer_id,owner_id,destination_dir,include_copath,deidentify,
+                    batch_size,slide_count,batch_count,status,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    transfer_id, owner_id, destination_dir, int(include_copath),
+                    int(deidentify), batch_size, slide_count, len(batches), "pending",
+                    now, now,
+                ),
+            )
+            for batch_number, slides in enumerate(batches, start=1):
+                connection.execute(
+                    """
+                    INSERT INTO transfer_job_batches(
+                        transfer_id,batch_number,status,stage,updated_at
+                    ) VALUES(?,?,'pending','pending',?)
+                    """,
+                    (transfer_id, batch_number, now),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO transfer_job_slides(
+                        transfer_id,batch_number,slide_position,data_json
+                    ) VALUES(?,?,?,?)
+                    """,
+                    [
+                        (
+                            transfer_id,
+                            batch_number,
+                            position,
+                            json.dumps(dict(slide), separators=(",", ":")),
+                        )
+                        for position, slide in enumerate(slides, start=1)
+                    ],
+                )
+
+    def delete_pending_transfer(
+        self, instance_dir: str | Path, transfer_id: str
+    ) -> None:
+        with self.connection(instance_dir) as connection:
+            connection.execute(
+                "DELETE FROM transfer_jobs WHERE transfer_id=? AND status='pending' "
+                "AND NOT EXISTS(SELECT 1 FROM transfer_attempts "
+                "WHERE transfer_id=transfer_jobs.transfer_id)",
+                (transfer_id,),
+            )
+
+    def start_transfer_attempt(
+        self,
+        instance_dir: str | Path,
+        transfer_id: str,
+        attempt_id: str,
+        initiated_by: str,
+        output_path: str,
+    ) -> list[int]:
+        now = utc_now()
+        with self.connection(instance_dir) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            transfer = connection.execute(
+                "SELECT status FROM transfer_jobs WHERE transfer_id=?",
+                (transfer_id,),
+            ).fetchone()
+            if transfer is None:
+                raise KeyError(f"unknown transfer: {transfer_id}")
+            if transfer["status"] == "succeeded":
+                raise ValueError("Completed transfers cannot be resumed.")
+            if connection.execute(
+                "SELECT 1 FROM transfer_attempts WHERE status='running'"
+            ).fetchone():
+                raise ValueError("Another transfer is already running.")
+            batches = connection.execute(
+                """
+                SELECT batch_number FROM transfer_job_batches
+                WHERE transfer_id=? AND status<>'completed' ORDER BY batch_number
+                """,
+                (transfer_id,),
+            ).fetchall()
+            batch_numbers = [int(row["batch_number"]) for row in batches]
+            if not batch_numbers:
+                raise ValueError("This transfer has no unfinished batches to resume.")
+            attempt_number = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(attempt_number),0)+1 FROM transfer_attempts "
+                    "WHERE transfer_id=?",
+                    (transfer_id,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                INSERT INTO transfer_attempts(
+                    attempt_id,transfer_id,attempt_number,initiated_by,status,
+                    started_at,output_path
+                ) VALUES(?,?,?,?,'running',?,?)
+                """,
+                (
+                    attempt_id, transfer_id, attempt_number, initiated_by,
+                    now, output_path,
+                ),
+            )
+            placeholders = ",".join("?" for _ in batch_numbers)
+            connection.execute(
+                f"""
+                UPDATE transfer_job_batches SET status='pending',stage='pending',
+                    started_at=NULL,completed_at=NULL,updated_at=?,last_error=''
+                WHERE transfer_id=? AND batch_number IN ({placeholders})
+                """,
+                (now, transfer_id, *batch_numbers),
+            )
+            connection.executemany(
+                """
+                INSERT INTO transfer_attempt_batches(
+                    attempt_id,batch_number,status,stage,updated_at
+                ) VALUES(?,?,'pending','pending',?)
+                """,
+                [(attempt_id, number, now) for number in batch_numbers],
+            )
+            connection.execute(
+                """
+                UPDATE transfer_jobs SET status='running',current_attempt_id=?,
+                    started_at=COALESCE(started_at,?),completed_at=NULL,updated_at=?
+                WHERE transfer_id=?
+                """,
+                (attempt_id, now, now, transfer_id),
+            )
+            return batch_numbers
+
+    def update_transfer_batch(
+        self,
+        instance_dir: str | Path,
+        transfer_id: str,
+        attempt_id: str,
+        batch_number: int,
+        stage: str,
+        status: str = "running",
+        error: str = "",
+    ) -> None:
+        if stage not in {
+            "pending", "staging", "deidentifying", "ready", "uploading", "finished"
+        }:
+            raise ValueError(f"invalid transfer stage: {stage}")
+        if status not in {"pending", "running", "completed", "failed", "interrupted"}:
+            raise ValueError(f"invalid transfer batch status: {status}")
+        now = utc_now()
+        terminal = status in {"completed", "failed", "interrupted"}
+        with self.connection(instance_dir) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = connection.execute(
+                "SELECT transfer_id FROM transfer_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None or attempt["transfer_id"] != transfer_id:
+                raise KeyError(f"unknown transfer attempt: {attempt_id}")
+            values = (
+                status, stage, now, now if terminal else None, now, error,
+                transfer_id, batch_number,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE transfer_job_batches SET status=?,stage=?,
+                    started_at=COALESCE(started_at,?),completed_at=?,updated_at=?,
+                    last_error=? WHERE transfer_id=? AND batch_number=?
+                """,
+                values,
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"unknown transfer batch: {batch_number}")
+            connection.execute(
+                """
+                UPDATE transfer_attempt_batches SET status=?,stage=?,
+                    started_at=COALESCE(started_at,?),completed_at=?,updated_at=?,
+                    last_error=? WHERE attempt_id=? AND batch_number=?
+                """,
+                (
+                    status, stage, now, now if terminal else None, now, error,
+                    attempt_id, batch_number,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE transfer_jobs SET last_batch_number=?,last_stage=?,
+                    last_batch_finished=?,updated_at=? WHERE transfer_id=?
+                """,
+                (
+                    batch_number, stage, int(status == "completed"), now,
+                    transfer_id,
+                ),
+            )
+
+    def finish_transfer_attempt(
+        self,
+        instance_dir: str | Path,
+        transfer_id: str,
+        attempt_id: str,
+        status: str,
+        return_code: Optional[int],
+        log_path: Optional[str],
+        error: str = "",
+    ) -> str:
+        if status not in {"succeeded", "failed", "interrupted"}:
+            raise ValueError(f"invalid transfer attempt status: {status}")
+        now = utc_now()
+        batch_status = "interrupted" if status == "interrupted" else "failed"
+        with self.connection(instance_dir) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if status != "succeeded":
+                rows = connection.execute(
+                    """
+                    SELECT batch_number FROM transfer_attempt_batches
+                    WHERE attempt_id=? AND status IN ('pending','running')
+                    """,
+                    (attempt_id,),
+                ).fetchall()
+                for row in rows:
+                    number = int(row["batch_number"])
+                    connection.execute(
+                        """
+                        UPDATE transfer_attempt_batches SET status=?,completed_at=?,
+                            updated_at=?,last_error=CASE WHEN last_error='' THEN ?
+                                ELSE last_error END
+                        WHERE attempt_id=? AND batch_number=?
+                        """,
+                        (batch_status, now, now, error, attempt_id, number),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE transfer_job_batches SET status=?,completed_at=?,
+                            updated_at=?,last_error=CASE WHEN last_error='' THEN ?
+                                ELSE last_error END
+                        WHERE transfer_id=? AND batch_number=? AND status<>'completed'
+                        """,
+                        (batch_status, now, now, error, transfer_id, number),
+                    )
+            connection.execute(
+                """
+                UPDATE transfer_attempts SET status=?,completed_at=?,return_code=?,
+                    log_path=? WHERE attempt_id=? AND transfer_id=?
+                """,
+                (status, now, return_code, log_path, attempt_id, transfer_id),
+            )
+            incomplete = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM transfer_job_batches "
+                    "WHERE transfer_id=? AND status<>'completed'",
+                    (transfer_id,),
+                ).fetchone()[0]
+            )
+            final_status = "succeeded" if incomplete == 0 else status
+            connection.execute(
+                """
+                UPDATE transfer_jobs SET status=?,current_attempt_id=NULL,
+                    completed_at=?,updated_at=? WHERE transfer_id=?
+                """,
+                (final_status, now, now, transfer_id),
+            )
+            return final_status
+
+    def mark_stale_transfers_interrupted(self, instance_dir: str | Path) -> int:
+        now = utc_now()
+        with self.connection(instance_dir) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempts = connection.execute(
+                "SELECT attempt_id,transfer_id FROM transfer_attempts WHERE status='running'"
+            ).fetchall()
+            for attempt in attempts:
+                attempt_id = attempt["attempt_id"]
+                transfer_id = attempt["transfer_id"]
+                connection.execute(
+                    "UPDATE transfer_attempts SET status='interrupted',completed_at=? "
+                    "WHERE attempt_id=?",
+                    (now, attempt_id),
+                )
+                rows = connection.execute(
+                    "SELECT batch_number FROM transfer_attempt_batches "
+                    "WHERE attempt_id=? AND status IN ('pending','running')",
+                    (attempt_id,),
+                ).fetchall()
+                for row in rows:
+                    number = int(row["batch_number"])
+                    connection.execute(
+                        """
+                        UPDATE transfer_attempt_batches SET status='interrupted',
+                            completed_at=?,updated_at=? WHERE attempt_id=? AND batch_number=?
+                        """,
+                        (now, now, attempt_id, number),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE transfer_job_batches SET status='interrupted',
+                            completed_at=?,updated_at=? WHERE transfer_id=?
+                            AND batch_number=? AND status<>'completed'
+                        """,
+                        (now, now, transfer_id, number),
+                    )
+                incomplete = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM transfer_job_batches WHERE transfer_id=? "
+                        "AND status<>'completed'",
+                        (transfer_id,),
+                    ).fetchone()[0]
+                )
+                connection.execute(
+                    """
+                    UPDATE transfer_jobs SET status=?,current_attempt_id=NULL,
+                        completed_at=?,updated_at=? WHERE transfer_id=?
+                    """,
+                    ("interrupted" if incomplete else "succeeded", now, now, transfer_id),
+                )
+            return len(attempts)
+
+    @staticmethod
+    def _transfer_row(row: sqlite3.Row) -> Dict[str, Any]:
+        record = dict(row)
+        record["include_copath"] = bool(record["include_copath"])
+        record["deidentify"] = bool(record["deidentify"])
+        record["last_batch_finished"] = bool(record["last_batch_finished"])
+        return record
+
+    def list_transfers(
+        self,
+        instance_dir: str | Path,
+        owner_id: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Dict[str, Any]]:
+        query = "SELECT * FROM transfer_jobs"
+        params: list[Any] = []
+        if owner_id is not None:
+            query += " WHERE owner_id=?"
+            params.append(owner_id)
+        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend((max(1, int(limit)), max(0, int(offset))))
+        with self.connection(instance_dir) as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self._transfer_row(row) for row in rows]
+
+    def count_transfers(
+        self, instance_dir: str | Path, owner_id: Optional[str] = None
+    ) -> int:
+        query = "SELECT COUNT(*) FROM transfer_jobs"
+        params: tuple[Any, ...] = ()
+        if owner_id is not None:
+            query += " WHERE owner_id=?"
+            params = (owner_id,)
+        with self.connection(instance_dir) as connection:
+            return int(connection.execute(query, params).fetchone()[0])
+
+    def get_transfer(
+        self, instance_dir: str | Path, transfer_id: str
+    ) -> Optional[Dict[str, Any]]:
+        with self.connection(instance_dir) as connection:
+            row = connection.execute(
+                "SELECT * FROM transfer_jobs WHERE transfer_id=?", (transfer_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            record = self._transfer_row(row)
+            batches = [dict(value) for value in connection.execute(
+                "SELECT * FROM transfer_job_batches WHERE transfer_id=? "
+                "ORDER BY batch_number",
+                (transfer_id,),
+            ).fetchall()]
+            slide_rows = connection.execute(
+                """
+                SELECT batch_number,slide_position,data_json FROM transfer_job_slides
+                WHERE transfer_id=? ORDER BY batch_number,slide_position
+                """,
+                (transfer_id,),
+            ).fetchall()
+            slides: Dict[int, list[Dict[str, Any]]] = {}
+            for value in slide_rows:
+                slides.setdefault(int(value["batch_number"]), []).append(
+                    json.loads(value["data_json"])
+                )
+            for batch in batches:
+                batch["slides"] = slides.get(int(batch["batch_number"]), [])
+                batch["finished"] = batch["status"] == "completed"
+            attempts = [dict(value) for value in connection.execute(
+                "SELECT * FROM transfer_attempts WHERE transfer_id=? "
+                "ORDER BY attempt_number",
+                (transfer_id,),
+            ).fetchall()]
+            for attempt in attempts:
+                attempt["batches"] = [dict(value) for value in connection.execute(
+                    "SELECT * FROM transfer_attempt_batches WHERE attempt_id=? "
+                    "ORDER BY batch_number",
+                    (attempt["attempt_id"],),
+                ).fetchall()]
+            record["batches"] = batches
+            record["attempts"] = attempts
+            return record
+
+    def get_transfer_for_attempt(
+        self, instance_dir: str | Path, attempt_id: str
+    ) -> Optional[Dict[str, Any]]:
+        with self.connection(instance_dir) as connection:
+            row = connection.execute(
+                "SELECT transfer_id FROM transfer_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+        return self.get_transfer(instance_dir, row["transfer_id"]) if row else None
+
+    def get_transfer_attempt(
+        self, instance_dir: str | Path, attempt_id: str
+    ) -> Optional[Dict[str, Any]]:
+        with self.connection(instance_dir) as connection:
+            row = connection.execute(
+                "SELECT * FROM transfer_attempts WHERE attempt_id=?", (attempt_id,)
+            ).fetchone()
+        return dict(row) if row else None
 
 
 catalog = BatchCatalog()

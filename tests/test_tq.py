@@ -724,7 +724,7 @@ class TQTransferTests(unittest.TestCase):
         self.assertTrue(start.call_args.kwargs["deidentify"])
         self.assertEqual(50, start.call_args.kwargs["batch_size"])
 
-    def test_retry_restarts_all_failures_and_excludes_successes(self):
+    def test_resume_restarts_only_unfinished_batches_from_originals(self):
         slides = [dict(slide) for slide in self.catalog()]
         successful = slides[0]
         failed = slides[1]
@@ -737,32 +737,78 @@ class TQTransferTests(unittest.TestCase):
             slide["destination_dir"] = app_module._tq_destination_dir(
                 "StudyA", slide
             )
-        previous = app_module.TQJob(
-            "failed-job",
+        app_module.batch_catalog.create_transfer(
+            app_module.Config.INSTANCE_DIR,
+            "transfer-1",
             self.user.id,
-            None,
-            [successful, failed, missing],
-            slides,
-            resume_upload=True,
+            "StudyA",
+            False,
+            True,
+            2,
+            [[successful], [failed, missing]],
         )
-        previous.status = "failed"
-        previous.results = {
-            successful["original_path"]: {"success": True, "error": ""},
-            failed["original_path"]: {"success": False, "error": "network"},
-        }
-        with app_module._tq_state_lock:
-            app_module._tq_jobs[previous.id] = previous
+        output = Path(app_module.Config.INSTANCE_DIR) / "tq_transfer_output" / "attempt-1.log"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("partial output", encoding="utf-8")
+        app_module.batch_catalog.start_transfer_attempt(
+            app_module.Config.INSTANCE_DIR,
+            "transfer-1",
+            "attempt-1",
+            self.user.id,
+            str(output),
+        )
+        app_module.batch_catalog.update_transfer_batch(
+            app_module.Config.INSTANCE_DIR,
+            "transfer-1",
+            "attempt-1",
+            1,
+            "finished",
+            "completed",
+        )
+        app_module.batch_catalog.update_transfer_batch(
+            app_module.Config.INSTANCE_DIR,
+            "transfer-1",
+            "attempt-1",
+            2,
+            "uploading",
+            "failed",
+            "network",
+        )
+        app_module.batch_catalog.finish_transfer_attempt(
+            app_module.Config.INSTANCE_DIR,
+            "transfer-1",
+            "attempt-1",
+            "failed",
+            1,
+            None,
+        )
         with self.client.session_transaction() as session:
-            session["tq_job_id"] = previous.id
+            session["tq_job_id"] = "attempt-1"
 
         page = self.client.get("/tq")
-        self.assertIn(b"Retry 2 failed slide(s)", page.data)
+        self.assertIn(b"Review resume for 2 slide(s)", page.data)
+        detail = self.client.get("/tq/history/transfer-1")
+        self.assertIn(b"Resume unfinished batches", detail.data)
+        output_response = self.client.get("/tq/jobs/attempt-1/output")
+        self.assertEqual("partial output", output_response.get_json()["output"])
+
+        other = app_module.User("other-operator", "")
+        app_module.user_manager.users[other.id] = other
+        self.login_as(other)
+        self.assertNotIn(b"transfer-1", self.client.get("/tq/history").data)
+        self.assertEqual(404, self.client.get("/tq/history/transfer-1").status_code)
+        self.login_as(self.admin)
+        self.assertIn(b"transfer-1", self.client.get("/tq/history").data)
+        self.login_as(self.user)
 
         replacement = SimpleNamespace(id="retry-job", status="running")
         with mock.patch.object(
             app_module, "_start_tq_job", return_value=replacement
         ) as start:
-            response = self.client.post(f"/tq/jobs/{previous.id}/retry")
+            response = self.client.post(
+                "/tq/history/transfer-1/resume",
+                data={"confirm_resume": "1"},
+            )
 
         self.assertEqual(302, response.status_code)
         retried = start.call_args.args[1]
@@ -770,12 +816,10 @@ class TQTransferTests(unittest.TestCase):
             {failed["original_path"], missing["original_path"]},
             {slide["original_path"] for slide in retried},
         )
-        self.assertTrue(start.call_args.kwargs["resume_upload"])
         self.assertTrue(start.call_args.kwargs["deidentify"])
-        self.assertEqual(10, start.call_args.kwargs["batch_size"])
-        self.assertIs(
-            previous.metadata_slides, start.call_args.kwargs["metadata_slides"]
-        )
+        self.assertEqual(2, start.call_args.kwargs["batch_size"])
+        self.assertEqual("transfer-1", start.call_args.kwargs["transfer_id"])
+        self.assertEqual([2], [batch.number for batch in start.call_args.kwargs["batches"]])
         with self.client.session_transaction() as session:
             self.assertEqual("retry-job", session["tq_job_id"])
 

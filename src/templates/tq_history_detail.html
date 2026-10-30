@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transfer {{ transfer.transfer_id }}</title>
+    <style nonce="{{ csp_nonce() }}">
+        :root{--border:#dfe5ec;--muted:#65717e;--primary:#1565c0;--danger:#a51d2d}
+        *{box-sizing:border-box}body{margin:0;background:#f4f7fa;color:#1d2731;font-family:Arial,sans-serif}
+        header{display:flex;justify-content:space-between;align-items:center;padding:18px 28px;background:#fff;border-bottom:1px solid var(--border)}header h1{margin:0;font-size:1.35rem}nav{display:flex;gap:16px}a{color:var(--primary);text-decoration:none}
+        main{width:min(100% - 40px,1500px);margin:24px auto;display:grid;gap:18px}.card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:20px;overflow:auto}
+        .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.summary div{min-width:0}.label{display:block;color:var(--muted);font-size:.78rem;text-transform:uppercase;margin-bottom:4px}.value{overflow-wrap:anywhere}
+        table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px;border-bottom:1px solid var(--border);vertical-align:top}th{color:var(--muted);font-size:.8rem;text-transform:uppercase}.status{font-weight:700;text-transform:uppercase}.error{color:var(--danger);max-width:500px;overflow-wrap:anywhere}
+        .warning{padding:12px;border:1px solid #e2b93b;background:#fff8db;border-radius:7px}.resume-form{display:grid;gap:12px;margin-top:14px}.resume-form button{width:max-content;padding:10px 16px;border:0;border-radius:6px;background:var(--primary);color:#fff;font-weight:700;cursor:pointer}
+        details{border-top:1px solid var(--border);padding:12px 0}details:first-of-type{border-top:0}summary{cursor:pointer;font-weight:700}.attempt-meta{color:var(--muted);margin:8px 0}.output{max-height:420px;overflow:auto;padding:14px;border-radius:7px;background:#111820;color:#e7edf3;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 ui-monospace,Consolas,monospace}
+        .messages{list-style:none;padding:0}.messages li{padding:10px;background:#eef4fb;border-radius:6px;margin-bottom:8px}@media(max-width:800px){.summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    </style>
+</head>
+<body>
+{% include '_app_sidebar.html' %}
+<header><h1>Transfer {{ transfer.transfer_id }}</h1><nav><a href="{{ url_for('tq_history') }}">History</a><a href="{{ url_for('tq_page') }}">Transfers</a></nav></header>
+<main>
+    {% if messages %}<ul class="messages">{% for message in messages %}<li class="{{ message.category }}">{{ message.message }}</li>{% endfor %}</ul>{% endif %}
+    <section class="card summary">
+        <div><span class="label">Status</span><span class="value status">{{ transfer.status }}</span></div>
+        <div><span class="label">Owner</span><span class="value">{{ transfer.owner_id }}</span></div>
+        <div><span class="label">Destination</span><span class="value">{{ transfer.destination_dir }}</span></div>
+        <div><span class="label">Created</span><span class="value">{{ transfer.created_at }}</span></div>
+        <div><span class="label">Slides</span><span class="value">{{ transfer.slide_count }}</span></div>
+        <div><span class="label">Batch size</span><span class="value">{{ transfer.batch_size }}</span></div>
+        <div><span class="label">Deidentify</span><span class="value">{{ 'Yes' if transfer.deidentify else 'No' }}</span></div>
+        <div><span class="label">Include CoPath</span><span class="value">{{ 'Yes' if transfer.include_copath else 'No' }}</span></div>
+    </section>
+    <section class="card">
+        <h2>Batch checkpoints</h2>
+        <table><thead><tr><th>Batch</th><th>Slides</th><th>Status</th><th>Last stage</th><th>Finished</th><th>Updated</th><th>Error</th></tr></thead>
+        <tbody>{% for batch in transfer.batches %}<tr>
+            <td>{{ batch.batch_number }}</td><td>{{ batch.slides|length }}</td><td class="status">{{ batch.status }}</td><td>{{ batch.stage }}</td><td>{{ 'Yes' if batch.finished else 'No' }}</td><td>{{ batch.updated_at }}</td><td class="error">{{ batch.last_error }}</td>
+        </tr>{% endfor %}</tbody></table>
+        {% if transfer.status in ('failed','interrupted') and unfinished %}
+        <div class="warning"><strong>{{ unfinished|length }} unfinished batch(es) will restart from original slides.</strong> A slide uploaded before interruption but before its batch completed may upload again.</div>
+        <form class="resume-form" method="POST" action="{{ url_for('tq_resume', transfer_id=transfer.transfer_id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label><input type="checkbox" name="confirm_resume" value="1" required> I understand every unfinished batch restarts from its beginning.</label>
+            <button type="submit">Resume unfinished batches</button>
+        </form>
+        {% endif %}
+    </section>
+    <section class="card">
+        <h2>Attempts</h2>
+        {% for attempt in transfer.attempts %}
+        <details><summary>Attempt {{ attempt.attempt_number }} · {{ attempt.status }} · {{ attempt.started_at }}</summary>
+            <p class="attempt-meta">Started by {{ attempt.initiated_by }}{% if attempt.completed_at %} · ended {{ attempt.completed_at }}{% endif %}{% if attempt.log_path %} · CSV log: <code>{{ attempt.log_path }}</code>{% endif %}</p>
+            <pre class="output" data-output-url="{{ url_for('tq_job_output', job_id=attempt.attempt_id) }}">Loading output…</pre>
+        </details>
+        {% else %}<p>No attempts recorded.</p>{% endfor %}
+    </section>
+</main>
+<script nonce="{{ csp_nonce() }}">
+document.querySelectorAll('.output').forEach(async element => {
+    let offset=0, text='';
+    try {
+        while (true) {
+            const response=await fetch(`${element.dataset.outputUrl}?offset=${offset}`,{cache:'no-store'});
+            if(!response.ok) throw new Error(`Output request failed (${response.status})`);
+            const data=await response.json();
+            text+=data.output||'';
+            if(!data.output||data.next_offset===offset) break;
+            offset=data.next_offset;
+        }
+        element.textContent=text||'No output recorded.';
+    } catch(error) { element.textContent=error.message; }
+});
+</script>
+</body>
+</html>

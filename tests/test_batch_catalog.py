@@ -121,13 +121,61 @@ class BatchCatalogTests(unittest.TestCase):
             }
         finally:
             connection.close()
-        self.assertEqual("4", version)
+        self.assertEqual("5", version)
         self.assertIn("transfer_slides", tables)
         self.assertIn("transfer_sources", tables)
+        self.assertIn("transfer_jobs", tables)
+        self.assertIn("transfer_attempts", tables)
         self.assertIn("batch_documents", tables)
         self.assertTrue(
-            (legacy_instance / "batch_catalog.sqlite3.pre-v4.backup").is_file()
+            (legacy_instance / "batch_catalog.sqlite3.pre-v5.backup").is_file()
         )
+
+    def test_transfer_checkpoint_survives_restart_and_resumes_unfinished_batches(self):
+        batches = [
+            [{"original_path": "one.svs", "destination_name": "one.svs"}],
+            [{"original_path": "two.svs", "destination_name": "two.svs"}],
+        ]
+        self.catalog.create_transfer(
+            self.instance, "transfer-1", "operator", "study", False, True, 1, batches
+        )
+        self.assertEqual(
+            [1, 2],
+            self.catalog.start_transfer_attempt(
+                self.instance, "transfer-1", "attempt-1", "operator", "first.log"
+            ),
+        )
+        self.catalog.update_transfer_batch(
+            self.instance, "transfer-1", "attempt-1", 1, "finished", "completed"
+        )
+        self.catalog.update_transfer_batch(
+            self.instance, "transfer-1", "attempt-1", 2, "uploading"
+        )
+
+        self.assertEqual(
+            1, self.catalog.mark_stale_transfers_interrupted(self.instance)
+        )
+        interrupted = self.catalog.get_transfer(self.instance, "transfer-1")
+        self.assertEqual("interrupted", interrupted["status"])
+        self.assertEqual("completed", interrupted["batches"][0]["status"])
+        self.assertEqual("interrupted", interrupted["batches"][1]["status"])
+        self.assertEqual("uploading", interrupted["batches"][1]["stage"])
+
+        self.assertEqual(
+            [2],
+            self.catalog.start_transfer_attempt(
+                self.instance, "transfer-1", "attempt-2", "admin", "second.log"
+            ),
+        )
+        self.catalog.update_transfer_batch(
+            self.instance, "transfer-1", "attempt-2", 2, "finished", "completed"
+        )
+        status = self.catalog.finish_transfer_attempt(
+            self.instance, "transfer-1", "attempt-2", "succeeded", 0, "result.csv"
+        )
+        finished = self.catalog.get_transfer(self.instance, "transfer-1")
+        self.assertEqual("succeeded", status)
+        self.assertEqual([1, 2], [attempt["attempt_number"] for attempt in finished["attempts"]])
 
     def test_schema_version_two_adds_nightly_run_type(self):
         legacy_instance = self.root / "version-two-instance"
