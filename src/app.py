@@ -3712,6 +3712,7 @@ class TQJob:
         self.tq_log_offsets: Dict[str, int] = {}
         self.staging_complete = resume_upload
         self.output_path = output_path
+        self.cancel_requested = threading.Event()
 
 
 def _tq_append_output(job: TQJob, message: str) -> None:
@@ -4777,6 +4778,8 @@ def _tq_read_pusher_results(job: TQJob) -> None:
 
 def _tq_download_slides(job: TQJob, batch: TQBatch) -> None:
     for index, slide in enumerate(batch.slides, start=1):
+        if job.cancel_requested.is_set():
+            return
         source = Path(slide["original_path"])
         target = Path(slide["staged_path"])
         try:
@@ -4796,7 +4799,13 @@ def _tq_download_slides(job: TQJob, batch: TQBatch) -> None:
             try:
                 # Do not preserve GT450 mode bits. Scanner files can be read-only,
                 # while deidentify_anonymize.py must reopen staged copies with r+b.
-                shutil.copyfile(source, temporary)
+                with source.open("rb") as source_handle, temporary.open(
+                    "xb"
+                ) as target_handle:
+                    while chunk := source_handle.read(1024 * 1024):
+                        if job.cancel_requested.is_set():
+                            return
+                        target_handle.write(chunk)
                 os.replace(temporary, target)
             finally:
                 temporary.unlink(missing_ok=True)
@@ -4850,6 +4859,25 @@ def _tq_stream_process_output(job: TQJob, process: subprocess.Popen) -> None:
         _tq_append_output(job, trailing)
 
 
+def _tq_start_process(job: TQJob, command: Sequence[str]) -> subprocess.Popen:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    with _tq_state_lock:
+        job.process = process
+        stop_requested = job.cancel_requested.is_set()
+    if stop_requested:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    return process
+
+
 def _tq_deidentify_slides(job: TQJob, batch: TQBatch) -> None:
     output_log = _tq_temporary_csv("deidentify-results-")
     try:
@@ -4870,15 +4898,11 @@ def _tq_deidentify_slides(job: TQJob, batch: TQBatch) -> None:
             "--output-log",
             str(output_log),
         ]
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-        )
+        process = _tq_start_process(job, command)
         _tq_stream_process_output(job, process)
         return_code = process.wait()
+        if job.cancel_requested.is_set():
+            return
         if return_code != 0:
             if output_log.is_file():
                 with output_log.open("r", newline="", encoding="utf-8-sig") as handle:
@@ -4942,18 +4966,14 @@ def _tq_upload_batch(job: TQJob, batch: TQBatch) -> None:
             str(manifest_path),
         ]
         job.tq_log_offsets = _tq_snapshot_pusher_logs()
-        job.process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-        )
+        job.process = _tq_start_process(job, command)
         _tq_stream_process_output(job, job.process)
         return_code = job.process.wait()
+        _tq_read_pusher_results(job)
+        if job.cancel_requested.is_set():
+            return
         if return_code != 0 and job.return_code in (None, 0):
             job.return_code = return_code
-        _tq_read_pusher_results(job)
         complete = return_code == 0
         for slide in batch.slides:
             original_path = slide["original_path"]
@@ -5001,8 +5021,12 @@ def _tq_finalize_pipeline(job: TQJob) -> None:
             and all(result["success"] for result in job.results.values())
             and job.return_code in (None, 0)
         )
-        job.status = "succeeded" if complete else "failed"
-        job.return_code = 0 if complete else (job.return_code or 1)
+        if job.cancel_requested.is_set():
+            job.status = "interrupted"
+            job.return_code = job.return_code or 130
+        else:
+            job.status = "succeeded" if complete else "failed"
+            job.return_code = 0 if complete else (job.return_code or 1)
     except Exception as exc:
         app.logger.exception("TQ transfer finalization failed")
         _tq_append_output(job, f"Launcher error: {exc}\n")
@@ -5019,6 +5043,8 @@ def _run_tq_job(job: TQJob) -> None:
     def stage() -> None:
         try:
             for batch in job.batches:
+                if job.cancel_requested.is_set():
+                    break
                 try:
                     if batch.ready:
                         _tq_append_output(
@@ -5028,6 +5054,8 @@ def _run_tq_job(job: TQJob) -> None:
                     else:
                         _tq_checkpoint(job, batch, "staging")
                         _tq_download_slides(job, batch)
+                    if job.cancel_requested.is_set():
+                        break
                     staged_batches.put(batch)
                 except Exception as exc:
                     _tq_fail_batch(job, batch, "staging", exc)
@@ -5043,6 +5071,8 @@ def _run_tq_job(job: TQJob) -> None:
                 batch = staged_batches.get()
                 if batch is finished:
                     break
+                if job.cancel_requested.is_set():
+                    continue
                 try:
                     if not batch.ready and job.deidentify:
                         _tq_checkpoint(job, batch, "deidentifying")
@@ -5053,6 +5083,8 @@ def _run_tq_job(job: TQJob) -> None:
                             f"Batch {batch.number}: deidentification not selected; "
                             "preserving original filenames and associated images.\n",
                         )
+                    if job.cancel_requested.is_set():
+                        continue
                     batch.ready = True
                     for slide in batch.slides:
                         slide["_tq_ready"] = True
@@ -5071,8 +5103,12 @@ def _run_tq_job(job: TQJob) -> None:
             batch = upload_batches.get()
             if batch is finished:
                 return
+            if job.cancel_requested.is_set():
+                continue
             _tq_checkpoint(job, batch, "uploading")
             _tq_upload_batch(job, batch)
+            if job.cancel_requested.is_set():
+                continue
             failed = [
                 slide for slide in batch.slides
                 if not job.results.get(slide["original_path"], {}).get("success")
@@ -6466,6 +6502,8 @@ def tq_page():
     )
     attempt_id = session.get("tq_job_id")
     job = _tq_job_for_user(attempt_id)
+    cancel_requested = getattr(job, "cancel_requested", None)
+    stop_requested = bool(cancel_requested and cancel_requested.is_set())
     transfer = _tq_transfer_for_attempt(attempt_id) if attempt_id else None
     if transfer is not None:
         attempt = batch_catalog.get_transfer_attempt(Config.INSTANCE_DIR, attempt_id)
@@ -6485,6 +6523,7 @@ def tq_page():
         batch_size=draft_snapshot["batch_size"],
         review=review,
         job=job,
+        stop_requested=stop_requested,
         retry_count=(
             sum(len(batch["slides"]) for batch in _tq_unfinished_batches(transfer))
             if transfer and transfer["status"] in {"failed", "interrupted"}
@@ -6936,6 +6975,31 @@ def tq_retry(job_id: str):
         flash("Transfer job not found.", "error")
         return redirect(url_for("tq_page"))
     return redirect(url_for("tq_history_detail", transfer_id=transfer["transfer_id"]))
+
+
+@app.route("/tq/jobs/<job_id>/stop", methods=["POST"])
+@login_required
+def tq_stop(job_id: str):
+    job = _tq_job_for_user(job_id)
+    if job is None:
+        abort(404)
+    with _tq_state_lock:
+        if job.status != "running":
+            flash("This transfer is no longer running.", "warning")
+            return redirect(url_for("tq_page"))
+        already_requested = job.cancel_requested.is_set()
+        job.cancel_requested.set()
+        process = job.process
+    if not already_requested:
+        _tq_append_output(job, "\nStop requested by user.\n")
+    if process is not None:
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except OSError:
+            app.logger.exception("Could not terminate TQ transfer process")
+    flash("Transfer stop requested.", "success")
+    return redirect(url_for("tq_page"))
 
 
 @app.route("/tq/jobs/<job_id>/output", methods=["GET"])

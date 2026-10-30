@@ -204,6 +204,13 @@
     <section class="card" aria-live="polite">
         <div class="console-heading">
             <h2>Transfer output</h2><span id="job-status" class="status {{ job.status }}">{{ job.status }}</span>
+            {% if job.status == 'running' and not stop_requested %}
+            <form method="POST" action="{{ url_for('tq_stop', job_id=job.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button class="danger" type="submit">Stop transfer</button>
+            </form>
+            {% elif stop_requested %}<span class="muted">Stop requested…</span>
+            {% endif %}
             {% if job.status in ('failed','interrupted') and retry_count %}
             <a class="button-link" href="{{ url_for('tq_history_detail', transfer_id=job.transfer_id) }}">Review resume for {{ retry_count }} slide(s)</a>
             {% endif %}

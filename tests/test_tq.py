@@ -634,6 +634,40 @@ class TQTransferTests(unittest.TestCase):
         self.assertNotIn(
             b"consoleElement.textContent += data.output", response.data
         )
+        self.assertIn(b">Stop transfer</button>", response.data)
+
+    def test_stop_transfer_terminates_process_and_marks_job_interrupted(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        job = app_module.TQJob(
+            "stoppable-job", self.user.id, process, [], []
+        )
+        with app_module._tq_state_lock:
+            app_module._tq_jobs[job.id] = job
+            app_module._tq_active_job_id = job.id
+
+        response = self.client.post(f"/tq/jobs/{job.id}/stop")
+
+        self.assertEqual(302, response.status_code)
+        self.assertTrue(job.cancel_requested.is_set())
+        process.terminate.assert_called_once_with()
+        self.assertIn("Stop requested by user.", job.output)
+        with (
+            mock.patch.object(
+                app_module, "_tq_write_transfer_log", return_value=self.root / "log.csv"
+            ),
+            mock.patch.object(app_module, "_tq_update_sdl_push_status", return_value=0),
+        ):
+            app_module._tq_finalize_pipeline(job)
+        self.assertEqual("interrupted", job.status)
+        self.assertEqual(130, job.return_code)
+
+    def test_transfer_history_keeps_application_sidebar_vertical(self):
+        response = self.client.get("/tq/history")
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b"header nav{display:flex;gap:16px}", response.data)
+        self.assertNotIn(b"}nav{display:flex;gap:16px}", response.data)
 
     def test_catalog_endpoint_requires_login(self):
         anonymous = app_module.app.test_client()
@@ -1370,6 +1404,36 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual([2], uploaded)
         self.assertIn(slides[0]["original_path"], job.result_errors)
         deidentify.assert_not_called()
+
+    def test_cancelled_pipeline_does_not_start_later_stages(self):
+        slides = [{"original_path": f"slide-{index}.svs"} for index in range(2)]
+        job = app_module.TQJob(
+            "cancelled-job",
+            self.user.id,
+            None,
+            slides,
+            slides,
+            batches=[
+                app_module.TQBatch(index + 1, [slide])
+                for index, slide in enumerate(slides)
+            ],
+        )
+
+        def cancel(_job, _batch):
+            _job.cancel_requested.set()
+
+        with (
+            mock.patch.object(app_module, "_tq_write_metadata_csv", return_value=self.root / "metadata.csv"),
+            mock.patch.object(app_module, "_tq_download_slides", side_effect=cancel) as stage,
+            mock.patch.object(app_module, "_tq_deidentify_slides") as deidentify,
+            mock.patch.object(app_module, "_tq_upload_batch") as upload,
+            mock.patch.object(app_module, "_tq_finalize_pipeline"),
+        ):
+            app_module._run_tq_job(job)
+
+        self.assertEqual(1, stage.call_count)
+        deidentify.assert_not_called()
+        upload.assert_not_called()
 
     def test_no_deidentification_preserves_staged_bytes(self):
         source = self.root / "gt450" / "original patient name.svs"
