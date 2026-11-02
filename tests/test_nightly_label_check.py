@@ -53,6 +53,8 @@ class NightlyLabelCheckTests(unittest.TestCase):
         new = self.write_inventory()
 
         def run_pipeline(command, **_kwargs):
+            if command[1].endswith("repair_sdl_statuses.py"):
+                return
             output = Path(command[command.index("--output-dir") + 1])
             (output / "label" / "rack").mkdir(parents=True)
             (output / "label" / "rack" / "one.png").write_bytes(b"one")
@@ -69,13 +71,36 @@ class NightlyLabelCheckTests(unittest.TestCase):
         ) as run:
             result = nightly_label_check.main()
 
-        command = run.call_args.args[0]
+        command = run.call_args_list[0].args[0]
+        repair_command = run.call_args_list[1].args[0]
         updated_log = pd.read_csv(self.log_path)
         self.assertEqual(0, result)
         self.assertEqual(sys.executable, command[0])
         self.assertEqual(str(ROOT_DIR / "src" / "pipeline.py"), command[1])
         self.assertEqual(str(new), command[command.index("--input-dir") + 1])
+        self.assertEqual(
+            str(ROOT_DIR / "src" / "repair_sdl_statuses.py"), repair_command[1]
+        )
         self.assertEqual(2, updated_log.loc[0, "slides_checked"])
+
+    def test_sdl_repair_failure_returns_nonzero_scheduler_status(self):
+        self.write_inventory()
+
+        def run_pipeline(command, **_kwargs):
+            if command[1].endswith("repair_sdl_statuses.py"):
+                raise subprocess.CalledProcessError(1, command)
+            output = Path(command[command.index("--output-dir") + 1])
+            output.mkdir()
+            pd.DataFrame({"original_slide_path": ["one.svs"]}).to_csv(
+                output / "slide_mapping.csv", index=False
+            )
+
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
+            nightly_label_check.subprocess, "run", side_effect=run_pipeline
+        ):
+            result = nightly_label_check.main()
+
+        self.assertEqual(1, result)
 
     def test_pipeline_failure_returns_nonzero_scheduler_status(self):
         self.write_inventory()

@@ -32,6 +32,7 @@ def main() -> int:
         os.environ.get("SCANNER_INVENTORIES", "D:\\scanner_inventories")
     )
     failed = False
+    processed_batches = False
 
     for scanner_dir in label_check_batches.iterdir():
         scanner = scanner_dir.name
@@ -108,6 +109,7 @@ def main() -> int:
             )
             slides_checked += slide_count
             batches_created.append(dir_date)
+            processed_batches = True
 
         new_log_row = pd.DataFrame(
             {
@@ -123,6 +125,17 @@ def main() -> int:
             print(f"Updated {scanner_log_path}\n")
         except Exception as error:
             print(f"\x1b[31mERROR\x1b[0m -- unable to update log: {error}\n")
+            failed = True
+
+    if processed_batches:
+        try:
+            subprocess.run(
+                [sys.executable, str(SRC_DIR / "repair_sdl_statuses.py")],
+                check=True,
+                text=True,
+            )
+        except Exception as error:
+            print(f"\x1b[31mERROR\x1b[0m -- unable to update SDL statuses: {error}\n")
             failed = True
 
     return 1 if failed else 0
