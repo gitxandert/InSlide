@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import sys
+from unittest import mock
 
 from openpyxl import Workbook, load_workbook
 
@@ -330,6 +331,52 @@ class SDLPostQCTests(unittest.TestCase):
             workbook[app_module.Config.SDL_SHEET_NAME]
         )
         self.assertEqual("UNKNOWN", rows[0]["values"]["Organ"])
+        workbook.close()
+
+    def test_reconcile_keeps_same_date_scanners_separate(self):
+        make_workbook(self.workbook_path, app_module.SDL_HEADERS)
+        workbook = load_workbook(self.workbook_path)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        columns = app_module._sdl_header_columns(worksheet)
+        for row_number, accession, scanner in (
+            (2, "NP26-100", "RSCH1 (SS12797)"),
+            (3, "NP26-200", "CLIN1 (SS12602)"),
+        ):
+            worksheet.cell(row_number, columns["Accession ID"]).value = accession
+            worksheet.cell(row_number, columns["Scanner"]).value = scanner
+            worksheet.cell(row_number, columns["Date Loaded"]).value = "2026-10-30"
+            worksheet.cell(row_number, columns["Ran Label-Check"]).value = False
+        workbook.save(self.workbook_path)
+        workbook.close()
+
+        research_batch = self.batch_base / "SS12797" / "2026-10-30"
+        clinical_batch = self.batch_base / "SS12602" / "2026-10-30"
+        renaming.atomic_write(
+            research_batch / "enriched.csv",
+            ("AccessionID",),
+            ({"AccessionID": "NP26-100"},),
+        )
+        renaming.atomic_write(
+            clinical_batch / "enriched.csv",
+            ("AccessionID",),
+            ({"AccessionID": "NP26-200"},),
+        )
+
+        with mock.patch.object(
+            app_module.batch_catalog, "list_batches", return_value=[]
+        ), mock.patch.object(
+            app_module.batch_catalog, "copath_reports", return_value={}
+        ):
+            changed = app_module._reconcile_sdl(
+                [research_batch, clinical_batch]
+            )
+
+        workbook = load_workbook(self.workbook_path)
+        rows = app_module._read_sdl_rows(
+            workbook[app_module.Config.SDL_SHEET_NAME]
+        )
+        self.assertEqual(2, changed)
+        self.assertTrue(all(row["statuses"]["Ran Label-Check"] for row in rows))
         workbook.close()
 
     def test_missing_and_duplicate_required_headers_are_rejected(self):

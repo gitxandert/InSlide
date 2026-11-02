@@ -173,19 +173,26 @@ def process_slide_files(
             desc="Processing slides",
         )
         for future in progress_bar:
-            result = future.result()
+            slide_path = future_to_svs[future]
+            try:
+                result = future.result()
+            except Exception as error:
+                logger.error(
+                    f"Slide extraction failed: {error}",
+                    extra={"slide": str(slide_path)},
+                )
+                continue
             if result:
                 results.append(result)
 
-    if results:
-        write_mapping_csv(results, csv_path)
+    write_mapping_csv(results, csv_path)
     logger.info(
         f"Successfully processed {len(results)} out of {len(slide_files)} files."
     )
-    if len(results) != len(slide_files):
-        raise RuntimeError(
-            f"Failed to process {len(slide_files) - len(results)} of "
-            f"{len(slide_files)} slide files."
+    failed_count = len(slide_files) - len(results)
+    if failed_count:
+        logger.error(
+            f"Failed to process {failed_count} of {len(slide_files)} slide files."
         )
 
 

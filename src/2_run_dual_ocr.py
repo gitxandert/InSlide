@@ -169,7 +169,9 @@ def perform_ocr_on_row(row: dict, csv_dir: Path, reader: easyocr.Reader) -> dict
 
     # Also strip csv_dir from thumbnail_path for the flask app
     thumbnail_path = clean_and_resolve_path(row.get("thumbnail_path"))
-    updated_row["thumbnail_path"] = thumbnail_path.relative_to(csv_dir)
+    updated_row["thumbnail_path"] = (
+        thumbnail_path.relative_to(csv_dir) if thumbnail_path else ""
+    )
 
     # Proceed only if at least one image file was found.
     if paths_to_process:
@@ -251,6 +253,23 @@ def add_ocr_to_mapping(
         logger.error(f"Input mapping CSV not found: {mapping_csv}")
         return
 
+    # Read the entire CSV into a list of dictionaries.
+    with open(mapping_csv, "r", encoding="utf-8") as f:
+        reader_csv = csv.DictReader(f)
+        rows = list(reader_csv)
+        input_headers = reader_csv.fieldnames or []
+
+    if not rows:
+        logger.warning("Input CSV is empty. Nothing to process.")
+        headers = list(
+            dict.fromkeys(
+                input_headers + ["label_text", "macro_text", "ocr_qc_needed"]
+            )
+        )
+        with open(output_csv, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=headers).writeheader()
+        return
+
     logger.info("Initializing EasyOCR reader... (This may take a moment)")
     # Initialize the OCR reader once and share it among all threads.
     # GPU is generally much faster if available.
@@ -260,15 +279,6 @@ def add_ocr_to_mapping(
     if model_directory:
         reader_options["model_storage_directory"] = model_directory
     reader = easyocr.Reader(["en"], **reader_options)
-
-    # Read the entire CSV into a list of dictionaries.
-    with open(mapping_csv, "r", encoding="utf-8") as f:
-        reader_csv = csv.DictReader(f)
-        rows = list(reader_csv)
-
-    if not rows:
-        logger.warning("Input CSV is empty. Nothing to process.")
-        return
 
     updated_rows = []
     # This is not strictly necessary with the current path resolution but is good practice.
@@ -293,16 +303,16 @@ def add_ocr_to_mapping(
             row = future_to_row[future]
             try:
                 updated_rows.append(future.result())
-            except Exception:
-                logger.exception(
-                    "Unexpected OCR row failure",
+            except Exception as error:
+                logger.error(
+                    f"OCR failed: {error}",
                     extra={"slide": row.get("original_slide_path") or None},
                 )
-                raise
-
-    if not updated_rows:
-        logger.error("Processing failed catastrophically. No rows were updated.")
-        return
+                updated_row = row.copy()
+                updated_row.update(
+                    {"label_text": "", "macro_text": "", "ocr_qc_needed": False}
+                )
+                updated_rows.append(updated_row)
 
     # --- Write the updated data to the new CSV file ---
     # Dynamically determine the headers from the first processed row. This ensures

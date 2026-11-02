@@ -348,6 +348,20 @@ def enrich_csv_with_parsing(
 
     if not original_rows:
         logger.warning("Input CSV is empty. No data to process.")
+        headers = list(
+            dict.fromkeys(
+                (original_headers or [])
+                + [
+                    COL_ACCESSION_ID,
+                    COL_STAIN,
+                    COL_BLOCK_NUMBER,
+                    COL_EXTRACTION_SUCCESSFUL,
+                    COL_QC_PASSED,
+                ]
+            )
+        )
+        with open(output_path, mode="w", newline="", encoding="utf-8") as outfile:
+            csv.DictWriter(outfile, fieldnames=headers).writeheader()
         return
 
     logger.info(f"Starting CSV enrichment for {len(original_rows)} rows using {num_workers} workers.")
@@ -374,6 +388,16 @@ def enrich_csv_with_parsing(
                 logger.error(
                     f"Name extraction failed: {e}",
                     extra={"slide": row.get("original_slide_path") or None},
+                )
+                updated_rows.append(
+                    {
+                        **row,
+                        COL_ACCESSION_ID: "",
+                        COL_STAIN: "",
+                        COL_BLOCK_NUMBER: "",
+                        COL_EXTRACTION_SUCCESSFUL: False,
+                        COL_QC_PASSED: "",
+                    }
                 )
 
     # Calculate summary statistics for logging.

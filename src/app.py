@@ -3298,8 +3298,12 @@ def _reconcile_sdl(batch_roots: Optional[Sequence[Path]] = None) -> int:
                                       if renaming.row_accession(row)}
             except (OSError, UnicodeError, csv.Error, renaming.RenamingError):
                 app.logger.exception("Could not prepare SDL rename status from %s", mapping)
-        evidence[root.name] = (accessions, bool(catalog_row.get("qc_complete")),
-                               bool(catalog_row.get("renamed_complete")), renamed_accessions)
+        evidence[(root.name, _sdl_scanner_for_batch(root))] = (
+            accessions,
+            bool(catalog_row.get("qc_complete")),
+            bool(catalog_row.get("renamed_complete")),
+            renamed_accessions,
+        )
     if not evidence:
         return 0
     copath_accessions = set(batch_catalog.copath_reports(
@@ -3318,9 +3322,15 @@ def _reconcile_sdl(batch_roots: Optional[Sequence[Path]] = None) -> int:
                 accession = str(worksheet.cell(row, columns["Accession ID"]).value or "").strip()
                 key = renaming.accession_key(accession)
                 date = _format_sdl_value("Date Loaded", worksheet.cell(row, columns["Date Loaded"]).value)
-                if not key or date not in evidence:
+                scanner = _format_sdl_value(
+                    "Scanner", worksheet.cell(row, columns["Scanner"]).value
+                )
+                evidence_key = (date, scanner)
+                if not key or evidence_key not in evidence:
                     continue
-                accessions, qc_done, renamed_done, renamed_accessions = evidence[date]
+                accessions, qc_done, renamed_done, renamed_accessions = evidence[
+                    evidence_key
+                ]
                 has_copath = key in copath_accessions
                 updates.append((row, {
                     "Ran Label-Check": key in accessions,
