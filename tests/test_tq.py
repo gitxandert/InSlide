@@ -379,6 +379,39 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual({"PROSP"}, by_date["2026-07-20"])
         self.assertEqual({"SEMINOMA"}, by_date["2026-07-21"])
 
+    def test_catalog_matches_type_across_overnight_scan(self):
+        workbook = load_workbook(self.sdl_path)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        columns = app_module._sdl_header_columns(worksheet)
+        worksheet.cell(row=2, column=columns["Date Loaded"]).value = "2026-07-19"
+        worksheet.cell(row=2, column=columns["Date Unloaded"]).value = "2026-07-20"
+        workbook.save(self.sdl_path)
+        workbook.close()
+
+        slides = self.catalog()
+
+        self.assertTrue(all(slide["sdl_types"] == ["PROSP"] for slide in slides))
+
+    def test_catalog_does_not_guess_between_overlapping_types(self):
+        workbook = load_workbook(self.sdl_path)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        columns = app_module._sdl_header_columns(worksheet)
+        worksheet.cell(row=2, column=columns["Date Loaded"]).value = "2026-07-18"
+        worksheet.cell(row=2, column=columns["Date Unloaded"]).value = "2026-07-20"
+        row = [None] * len(app_module.SDL_HEADERS)
+        row[app_module.SDL_HEADERS.index("Accession ID")] = "NP25-100"
+        row[app_module.SDL_HEADERS.index("Type")] = "SEMINOMA"
+        row[app_module.SDL_HEADERS.index("Scanner")] = "RSCH1 (SS12797)"
+        row[app_module.SDL_HEADERS.index("Date Loaded")] = "2026-07-19"
+        row[app_module.SDL_HEADERS.index("Date Unloaded")] = "2026-07-20"
+        worksheet.append(row)
+        workbook.save(self.sdl_path)
+        workbook.close()
+
+        slides = self.catalog()
+
+        self.assertTrue(all(slide["sdl_types"] == ["NONE"] for slide in slides))
+
     def test_page_contains_client_filters_and_transfer_navigation(self):
         self.catalog()
         response = self.client.get("/tq")

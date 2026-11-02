@@ -3961,6 +3961,9 @@ def _tq_sdl_accession_metadata() -> Tuple[Dict[str, Any], Optional[str]]:
         with _sdl_workbook_lock:
             workbook, worksheet, _ = _load_sdl_workbook()
             dates: Dict[str, set] = defaultdict(set)
+            type_windows: Dict[
+                Tuple[str, str], List[Tuple[str, str, str]]
+            ] = defaultdict(list)
             records = []
             for row in _read_sdl_rows(worksheet):
                 accession = renaming.accession_key(row["values"]["Accession ID"])
@@ -3970,6 +3973,19 @@ def _tq_sdl_accession_metadata() -> Tuple[Dict[str, Any], Optional[str]]:
                 record = sdl_type_record(row["values"], row["worksheet_row"])
                 if record is not None:
                     records.append(record)
+                    loaded_date = _strict_sdl_date(record.loaded_date)
+                    unloaded_date = (
+                        _strict_sdl_date(row["values"]["Date Unloaded"].strip())
+                        or loaded_date
+                    )
+                    if loaded_date and unloaded_date >= loaded_date:
+                        type_windows[(record.key[0], record.key[2])].append(
+                            (
+                                loaded_date.isoformat(),
+                                unloaded_date.isoformat(),
+                                record.slide_type,
+                            )
+                        )
             types, conflicts = resolve_sdl_types(records)
             warning = None
             if conflicts:
@@ -3987,11 +4003,13 @@ def _tq_sdl_accession_metadata() -> Tuple[Dict[str, Any], Optional[str]]:
                     for accession, values in dates.items()
                 },
                 "types": types,
+                "type_windows": dict(type_windows),
             }, warning
     except (SDLWorkbookError, OSError) as exc:
         return {
             "dates": {},
             "types": {},
+            "type_windows": {},
         }, f"Slide Digitization Log transfer metadata is unavailable: {exc}"
     finally:
         if workbook is not None:
@@ -4014,6 +4032,26 @@ def _tq_digitization_date(
     return candidates[0] if len(candidates) == 1 else ""
 
 
+def _tq_sdl_type(
+    metadata: Mapping[str, Any],
+    accession: str,
+    scanner: str,
+    digitization_date: str,
+) -> str:
+    key = sdl_type_key(accession, scanner, digitization_date)
+    exact = metadata["types"].get(key)
+    if exact is not None:
+        return exact
+    candidates = {
+        slide_type.casefold(): slide_type
+        for loaded, unloaded, slide_type in metadata["type_windows"].get(
+            (key[0], key[2]), []
+        )
+        if loaded <= digitization_date <= unloaded
+    }
+    return next(iter(candidates.values())) if len(candidates) == 1 else "NONE"
+
+
 def _tq_source_stat(path: Path) -> Dict[str, Optional[int]]:
     try:
         details = path.stat()
@@ -4027,6 +4065,7 @@ def _tq_catalog_signature(batches: Sequence[BatchContext]) -> str:
     values: List[Dict[str, Any]] = [
         {
             "kind": "configuration",
+            "catalog_version": 2,
             "batches_root": str(Config.INSLIDE_BATCHES),
             "image_host_prefix": os.environ.get("GT450_IMAGES_HOST_PREFIX", ""),
             "image_container_root": os.environ.get("GT450_IMAGES_CONTAINER_ROOT", ""),
@@ -4122,9 +4161,8 @@ def _tq_rebuild_catalog(
                     sdl_metadata["dates"],
                 )
                 scanner = _sdl_scanner_for_batch(context.root)
-                slide_type = sdl_metadata["types"].get(
-                    sdl_type_key(accession, scanner, digitization_date),
-                    "NONE",
+                slide_type = _tq_sdl_type(
+                    sdl_metadata, accession, scanner, digitization_date
                 )
                 batch_slides.append(
                     {
