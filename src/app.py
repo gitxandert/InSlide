@@ -3333,7 +3333,7 @@ def _reconcile_sdl(batch_roots: Optional[Sequence[Path]] = None) -> int:
                 ]
                 has_copath = key in copath_accessions
                 updates.append((row, {
-                    "Ran Label-Check": key in accessions,
+                    "Ran Label-Check": True,
                     "Finished QC": qc_done and key in accessions,
                     "Collected CoPath Data": has_copath,
                     "Renamed": renamed_done and key in renamed_accessions,

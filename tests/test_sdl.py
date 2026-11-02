@@ -341,6 +341,7 @@ class SDLPostQCTests(unittest.TestCase):
         for row_number, accession, scanner in (
             (2, "NP26-100", "RSCH1 (SS12797)"),
             (3, "NP26-200", "CLIN1 (SS12602)"),
+            (4, "NP26-300", "RSCH1 (SS12797)"),
         ):
             worksheet.cell(row_number, columns["Accession ID"]).value = accession
             worksheet.cell(row_number, columns["Scanner"]).value = scanner
@@ -375,7 +376,7 @@ class SDLPostQCTests(unittest.TestCase):
         rows = app_module._read_sdl_rows(
             workbook[app_module.Config.SDL_SHEET_NAME]
         )
-        self.assertEqual(2, changed)
+        self.assertEqual(3, changed)
         self.assertTrue(all(row["statuses"]["Ran Label-Check"] for row in rows))
         workbook.close()
 
