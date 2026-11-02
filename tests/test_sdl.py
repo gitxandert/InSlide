@@ -333,7 +333,7 @@ class SDLPostQCTests(unittest.TestCase):
         self.assertEqual("UNKNOWN", rows[0]["values"]["Organ"])
         workbook.close()
 
-    def test_reconcile_keeps_same_date_scanners_separate(self):
+    def test_reconcile_uses_scanner_date_batch_statuses(self):
         make_workbook(self.workbook_path, app_module.SDL_HEADERS)
         workbook = load_workbook(self.workbook_path)
         worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
@@ -363,8 +363,22 @@ class SDLPostQCTests(unittest.TestCase):
             ({"AccessionID": "NP26-200"},),
         )
 
+        catalog_rows = [
+            {
+                "relative_path": "SS12797/2026-10-30",
+                "qc_complete": True,
+                "renamed_complete": True,
+            },
+            {
+                "relative_path": "SS12602/2026-10-30",
+                "qc_complete": True,
+                "renamed_complete": True,
+            },
+        ]
         with mock.patch.object(
-            app_module.batch_catalog, "list_batches", return_value=[]
+            app_module.Config, "INSLIDE_BATCHES", str(self.batch_base)
+        ), mock.patch.object(
+            app_module.batch_catalog, "list_batches", return_value=catalog_rows
         ), mock.patch.object(
             app_module.batch_catalog, "copath_reports", return_value={}
         ):
@@ -376,8 +390,13 @@ class SDLPostQCTests(unittest.TestCase):
         rows = app_module._read_sdl_rows(
             workbook[app_module.Config.SDL_SHEET_NAME]
         )
-        self.assertEqual(3, changed)
+        self.assertEqual(9, changed)
         self.assertTrue(all(row["statuses"]["Ran Label-Check"] for row in rows))
+        self.assertTrue(all(row["statuses"]["Finished QC"] for row in rows))
+        self.assertTrue(all(row["statuses"]["Renamed"] for row in rows))
+        self.assertTrue(
+            all(not row["statuses"]["Collected CoPath Data"] for row in rows)
+        )
         workbook.close()
 
     def test_missing_and_duplicate_required_headers_are_rejected(self):
