@@ -121,10 +121,15 @@ class TableSearchRouteTests(unittest.TestCase):
         worksheet = workbook.active
         worksheet.title = app_module.Config.SDL_SHEET_NAME
         worksheet.append(app_module.SDL_HEADERS)
-        for accession in ("NP25-10", "NP25-2"):
+        for accession, organ, slides in (
+            ("NP25-10", "BRAIN", 2),
+            ("NP25-2", "BRAIN", 3),
+            ("np25-2", "BREAST", 4),
+        ):
             row = ["" for _ in app_module.SDL_HEADERS]
             row[0] = accession
-            row[1] = "BRAIN"
+            row[1] = organ
+            row[3] = slides
             worksheet.append(row)
         workbook.save(self.workbook_path)
         workbook.close()
@@ -159,6 +164,16 @@ class TableSearchRouteTests(unittest.TestCase):
         self.assertIn(b"await fetch(url", response.data)
         self.assertNotIn(b"requestSubmit()", response.data)
         self.assertIn(b"updateTable(link.href)", response.data)
+
+    def test_sdl_statistics_follow_filters(self):
+        full_page = self.client.get("/sdl")
+        filtered_page = self.client.get("/sdl?filter_1=BRAIN")
+
+        self.assertIn(b"2 accessions", full_page.data)
+        self.assertIn(b"9 slides", full_page.data)
+        self.assertIn(b"2 accessions", filtered_page.data)
+        self.assertIn(b"5 slides", filtered_page.data)
+        self.assertIn(b"nextStatistics.innerHTML", filtered_page.data)
 
     def test_sdl_route_sorts_by_workbook_row(self):
         response = self.client.get("/sdl?sort=16&direction=asc")

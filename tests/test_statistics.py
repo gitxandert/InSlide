@@ -333,6 +333,57 @@ class SDLStatisticsIntegrationTests(unittest.TestCase):
             1,
         )
 
+    def test_edit_allows_fields_missing_from_discovered_accession(self):
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        values = {header: None for header in app_module.SDL_HEADERS}
+        values.update(
+            {
+                "Accession ID": "NP26-100",
+                "Organ": "BRAIN",
+                "Slides Count": 2,
+                "Scanner": "RSCH1 (SS12797)",
+                "Date Loaded": datetime.date(2026, 8, 25),
+            }
+        )
+        worksheet.append([values[header] for header in app_module.SDL_HEADERS])
+        workbook.save(app_module.Config.SDL_FILE_PATH)
+        workbook.close()
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        signature = app_module._sdl_row_signature(
+            workbook[app_module.Config.SDL_SHEET_NAME], 2
+        )
+        workbook.close()
+
+        edit_page = self.client.get("/sdl?edit_row=2")
+        edit_form = edit_page.get_data(as_text=True).split(
+            '<form method="POST"', 1
+        )[1].split("</form>", 1)[0]
+        self.assertNotIn(" required", edit_form)
+        response = self.client.post(
+            "/sdl",
+            data={
+                **self.form_data("update"),
+                "worksheet_row": "2",
+                "row_signature": signature,
+                "type": "",
+                "carousel_rack": "",
+                "time_loaded": "",
+                "notes": "Reviewed after QC",
+            },
+        )
+
+        self.assertEqual(302, response.status_code)
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        row = app_module._read_sdl_rows(
+            workbook[app_module.Config.SDL_SHEET_NAME]
+        )[0]
+        self.assertEqual("", row["values"]["Type"])
+        self.assertEqual("", row["values"]["Carousel Rack"])
+        self.assertEqual("", row["values"]["Time Loaded"])
+        self.assertEqual("Reviewed after QC", row["values"]["Notes"])
+        workbook.close()
+
     def test_dashboard_heartbeat_and_lifetime_download(self):
         home = self.client.get("/")
         self.assertEqual(home.status_code, 200)

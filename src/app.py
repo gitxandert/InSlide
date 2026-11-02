@@ -2962,47 +2962,58 @@ def _submitted_sdl_rack_form() -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
     return rack_values, accession_values
 
 
-def _validate_sdl_form(values: Dict[str, str]) -> Dict[str, Any]:
+def _validate_sdl_form(
+    values: Dict[str, str], *, require_all: bool = True
+) -> Dict[str, Any]:
     accession_id = values["Accession ID"]
-    if not accession_id:
+    if require_all and not accession_id:
         raise SDLValidationError("Accession ID is required.")
-    if values["Organ"] not in Config.SDL_ORGANS:
+    if (require_all or values["Organ"]) and values["Organ"] not in Config.SDL_ORGANS:
         raise SDLValidationError("Select a valid Organ.")
-    if not values["Type"]:
+    if require_all and not values["Type"]:
         raise SDLValidationError("Type is required.")
-    try:
-        slides_count = int(values["Slides Count"])
-    except ValueError as exc:
-        raise SDLValidationError("Slides Count must be an integer.") from exc
-    if slides_count < 1:
-        raise SDLValidationError("Slides Count must be at least 1.")
-    if values["Scanner"] not in Config.SDL_SCANNERS:
+    slides_count = None
+    if require_all or values["Slides Count"]:
+        try:
+            slides_count = int(values["Slides Count"])
+        except ValueError as exc:
+            raise SDLValidationError("Slides Count must be an integer.") from exc
+        if slides_count < 1:
+            raise SDLValidationError("Slides Count must be at least 1.")
+    if (require_all or values["Scanner"]) and values["Scanner"] not in Config.SDL_SCANNERS:
         raise SDLValidationError("Select a valid Scanner.")
 
     carousel_rack = values["Carousel Rack"]
-    if not _rack_pattern.fullmatch(carousel_rack):
-        raise SDLValidationError(
-            "Carousel Rack must contain positive integers separated by commas."
-        )
-    rack_numbers = [int(value.strip()) for value in carousel_rack.split(",")]
-    if any(value < 1 for value in rack_numbers):
-        raise SDLValidationError("Carousel Rack numbers must be at least 1.")
+    rack_numbers = []
+    if require_all or carousel_rack:
+        if not _rack_pattern.fullmatch(carousel_rack):
+            raise SDLValidationError(
+                "Carousel Rack must contain positive integers separated by commas."
+            )
+        rack_numbers = [int(value.strip()) for value in carousel_rack.split(",")]
+        if any(value < 1 for value in rack_numbers):
+            raise SDLValidationError("Carousel Rack numbers must be at least 1.")
 
-    if values["Date Loaded"] == SDL_UNKNOWN_DATE:
+    date_loaded_value = values["Date Loaded"]
+    date_loaded = None
+    if date_loaded_value == SDL_UNKNOWN_DATE:
         date_loaded: Union[datetime.date, str] = SDL_UNKNOWN_DATE
-    else:
+    elif require_all or date_loaded_value:
         try:
-            date_loaded = datetime.date.fromisoformat(values["Date Loaded"])
+            date_loaded = datetime.date.fromisoformat(date_loaded_value)
         except ValueError as exc:
             raise SDLValidationError(
                 f"Date Loaded must use YYYY-MM-DD format or {SDL_UNKNOWN_DATE}."
             ) from exc
-    if not _time_pattern.fullmatch(values["Time Loaded"]):
-        raise SDLValidationError("Time Loaded must use HH:MM 24-hour format.")
-    try:
-        time_loaded = datetime.time.fromisoformat(values["Time Loaded"])
-    except ValueError as exc:
-        raise SDLValidationError("Time Loaded must be a valid 24-hour time.") from exc
+    time_loaded_value = values["Time Loaded"]
+    time_loaded = None
+    if require_all or time_loaded_value:
+        if not _time_pattern.fullmatch(time_loaded_value):
+            raise SDLValidationError("Time Loaded must use HH:MM 24-hour format.")
+        try:
+            time_loaded = datetime.time.fromisoformat(time_loaded_value)
+        except ValueError as exc:
+            raise SDLValidationError("Time Loaded must be a valid 24-hour time.") from exc
 
     date_unloaded_value = values["Date Unloaded"]
     time_unloaded_value = values["Time Unloaded"]
@@ -3031,6 +3042,7 @@ def _validate_sdl_form(values: Dict[str, str]) -> Dict[str, Any]:
         if (
             isinstance(date_loaded, datetime.date)
             and isinstance(date_unloaded, datetime.date)
+            and isinstance(time_loaded, datetime.time)
             and datetime.datetime.combine(date_unloaded, time_unloaded)
             < datetime.datetime.combine(date_loaded, time_loaded)
         ):
@@ -3042,7 +3054,9 @@ def _validate_sdl_form(values: Dict[str, str]) -> Dict[str, Any]:
         "Type": values["Type"],
         "Slides Count": slides_count,
         "Scanner": values["Scanner"],
-        "Carousel Rack": ", ".join(str(value) for value in rack_numbers),
+        "Carousel Rack": (
+            ", ".join(str(value) for value in rack_numbers) if rack_numbers else None
+        ),
         "Date Loaded": date_loaded,
         "Time Loaded": time_loaded,
         "Date Unloaded": date_unloaded,
@@ -3444,6 +3458,18 @@ def _render_sdl_page(
             sort_column,
             sort_direction,
         )
+    accession_count = len(
+        {
+            key
+            for row in rows
+            if (key := renaming.accession_key(row["values"]["Accession ID"]))
+        }
+    )
+    slide_count = sum(
+        int(value)
+        for row in rows
+        if (value := row["values"]["Slides Count"].strip()).isdigit()
+    )
     query_params = _table_query_params(
         global_query, column_filters, sort_column, sort_direction
     )
@@ -3490,6 +3516,8 @@ def _render_sdl_page(
         workbook_available=True,
         rows=rows,
         total_rows=total_rows,
+        accession_count=accession_count,
+        slide_count=slide_count,
         headers=SDL_HEADERS,
         status_headers=SDL_STATUS_HEADERS,
         form_fields=SDL_FORM_FIELDS,
@@ -7964,7 +7992,9 @@ def sdl():
     try:
         if action == "update":
             submitted_values = _submitted_sdl_form()
-            normalized_rows = [_validate_sdl_form(submitted_values)]
+            normalized_rows = [
+                _validate_sdl_form(submitted_values, require_all=False)
+            ]
         elif action == "add":
             submitted_rack_values, submitted_accession_values = (
                 _submitted_sdl_rack_form()

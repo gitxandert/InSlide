@@ -137,7 +137,8 @@
         button.danger { background: var(--danger); }
         button.danger:hover { background: #a71d2a; }
 
-        .table-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 15px; }
+        .table-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 15px; }
+        .table-heading h3 { margin-bottom: 4px; }
         .table-heading p { margin: 0; color: var(--muted); }
         .table-search-form {
             display: flex;
@@ -248,15 +249,15 @@
 
                     {% if edit_row %}
                         <div class="form-group">
-                            <label class="required" for="accession_id">Accession ID</label>
-                            <input id="accession_id" name="accession_id" value="{{ form_values['Accession ID'] }}" placeholder="A12-123" aria-describedby="accession-format-warning" required>
+                            <label for="accession_id">Accession ID</label>
+                            <input id="accession_id" name="accession_id" value="{{ form_values['Accession ID'] }}" placeholder="A12-123" aria-describedby="accession-format-warning">
                             <p id="accession-format-warning" class="field-warning" role="status" hidden>
                                 This does not match the usual A12-123 format. You can still save it.
                             </p>
                         </div>
                         <div class="form-group">
-                            <label class="required" for="organ">Organ</label>
-                            <select id="organ" name="organ" required>
+                            <label for="organ">Organ</label>
+                            <select id="organ" name="organ">
                                 <option value="">Select an organ</option>
                                 {% for organ in organ_options %}
                                     <option value="{{ organ }}" {% if form_values['Organ'] == organ %}selected{% endif %}>{{ organ }}</option>
@@ -264,16 +265,16 @@
                             </select>
                         </div>
                         <div class="form-group">
-                            <label class="required" for="type">Type</label>
-                            <input id="type" name="type" value="{{ form_values['Type'] }}" placeholder="PROSP, SEMINOMA, TRICHROME..." required>
+                            <label for="type">Type</label>
+                            <input id="type" name="type" value="{{ form_values['Type'] }}" placeholder="PROSP, SEMINOMA, TRICHROME...">
                         </div>
                         <div class="form-group">
-                            <label class="required" for="slides_count">Slides Count</label>
-                            <input type="number" min="1" step="1" id="slides_count" name="slides_count" value="{{ form_values['Slides Count'] }}" required>
+                            <label for="slides_count">Slides Count</label>
+                            <input type="number" min="1" step="1" id="slides_count" name="slides_count" value="{{ form_values['Slides Count'] }}">
                         </div>
                         <div class="form-group">
-                            <label class="required" for="scanner">Scanner</label>
-                            <select id="scanner" name="scanner" required>
+                            <label for="scanner">Scanner</label>
+                            <select id="scanner" name="scanner">
                                 <option value="">Select a scanner</option>
                                 {% for scanner in scanner_options %}
                                     <option value="{{ scanner }}" {% if form_values['Scanner'] == scanner %}selected{% endif %}>{{ scanner }}</option>
@@ -329,16 +330,16 @@
                         <button class="add-accession" id="add-accession" type="button">Add another accession</button>
                     {% endif %}
                     <div class="form-group">
-                        <label class="required" for="carousel_rack">Carousel Rack</label>
-                        <input id="carousel_rack" name="carousel_rack" value="{{ shared_values['Carousel Rack'] }}" placeholder="{{ '1 or 1, 2' if edit_row else '1' }}" {% if not edit_row %}pattern="[0-9]+" inputmode="numeric"{% endif %} required>
+                        <label{% if not edit_row %} class="required"{% endif %} for="carousel_rack">Carousel Rack</label>
+                        <input id="carousel_rack" name="carousel_rack" value="{{ shared_values['Carousel Rack'] }}" placeholder="{{ '1 or 1, 2' if edit_row else '1' }}" {% if not edit_row %}pattern="[0-9]+" inputmode="numeric" required{% endif %}>
                     </div>
                     <div class="form-group">
-                        <label class="required" for="date_loaded">Date Loaded</label>
-                        <input type="text" id="date_loaded" name="date_loaded" value="{{ shared_values['Date Loaded'] }}" placeholder="YYYY-MM-DD or ----------" pattern="(?:[0-9]{4}-[0-9]{2}-[0-9]{2}|----------)" list="sdl-date-options" required>
+                        <label{% if not edit_row %} class="required"{% endif %} for="date_loaded">Date Loaded</label>
+                        <input type="text" id="date_loaded" name="date_loaded" value="{{ shared_values['Date Loaded'] }}" placeholder="YYYY-MM-DD or ----------" pattern="(?:[0-9]{4}-[0-9]{2}-[0-9]{2}|----------)" list="sdl-date-options"{% if not edit_row %} required{% endif %}>
                     </div>
                     <div class="form-group">
-                        <label class="required" for="time_loaded">Time Loaded</label>
-                        <input type="time" id="time_loaded" name="time_loaded" value="{{ shared_values['Time Loaded'] }}" required>
+                        <label{% if not edit_row %} class="required"{% endif %} for="time_loaded">Time Loaded</label>
+                        <input type="time" id="time_loaded" name="time_loaded" value="{{ shared_values['Time Loaded'] }}"{% if not edit_row %} required{% endif %}>
                     </div>
                     <div class="form-group">
                         <label for="date_unloaded">Date Unloaded</label>
@@ -375,7 +376,13 @@
 
             <section class="card">
                 <div class="table-heading">
-                    <h3>Workbook entries</h3>
+                    <div>
+                        <h3>Workbook entries</h3>
+                        <p data-table-statistics>
+                            {{ accession_count }} {{ 'accession' if accession_count == 1 else 'accessions' }} ·
+                            {{ slide_count }} {{ 'slide' if slide_count == 1 else 'slides' }}
+                        </p>
+                    </div>
                     <p data-table-count>
                         {% if rows|length != total_rows %}{{ rows|length }} of {% endif %}
                         {{ total_rows }} {{ 'entry' if total_rows == 1 else 'entries' }}
@@ -581,12 +588,14 @@
                 );
                 const nextBody = nextPage.querySelector('[data-table-body]');
                 const nextCount = nextPage.querySelector('[data-table-count]');
-                if (!nextBody || !nextCount) {
+                const nextStatistics = nextPage.querySelector('[data-table-statistics]');
+                if (!nextBody || !nextCount || !nextStatistics) {
                     window.location.assign(response.url);
                     return;
                 }
                 document.querySelector('[data-table-body]').innerHTML = nextBody.innerHTML;
                 document.querySelector('[data-table-count]').innerHTML = nextCount.innerHTML;
+                document.querySelector('[data-table-statistics]').innerHTML = nextStatistics.innerHTML;
                 const nextSortLinks = nextPage.querySelectorAll('.sort-link');
                 document.querySelectorAll('.sort-link').forEach((link, index) => {
                     if (nextSortLinks[index]) {
