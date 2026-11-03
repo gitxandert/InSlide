@@ -1,6 +1,8 @@
 import csv
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -215,64 +217,23 @@ class RenamingDataTests(unittest.TestCase):
         self.assertEqual(list(renaming.COPATH_FIELDS), headers)
         self.assertEqual([], unknown_rows)
 
-    def test_organ_change_pid_follows_highest_staged_pid(self):
+    def test_completed_mapping_is_repaired_only_when_explicitly_included(self):
         renaming.prepare_batch(self.batch, self.clone, self.batch_base, self.query)
         _, mapping = renaming.read_csv(self.batch / "name_mapping.csv")
         for row in mapping:
-            row.update({"Organ": "OTHER", "PID": "AAAAAA"})
-            row["NewName"] = renaming.build_new_name(row)
-        renaming.atomic_write(
-            self.batch / "name_mapping.csv", renaming.MAPPING_FIELDS, mapping
-        )
-        write_csv(
-            self.batch / "pending_CoPath_data.csv",
-            ["accession_id", "mrn"],
-            [{"accession_id": "NP25-100", "mrn": "MRN2"}],
-        )
-        staged_batch = self.batch_base / "SS200" / "batch-2"
-        staged = dict(mapping[0])
-        staged.update({
-            "AccessionID": "NP25-200", "Organ": "BRAIN", "PID": "AAAABA"
-        })
-        staged["NewName"] = renaming.build_new_name(staged)
-        renaming.atomic_write(
-            staged_batch / "name_mapping.csv", renaming.MAPPING_FIELDS, [staged]
-        )
-
-        pid = renaming.pid_after_organ_change(
-            self.batch, self.clone, self.batch_base, "NP25-100", "BRAIN"
-        )
-        reserved_pid = renaming.pid_after_organ_change(
-            self.batch, self.clone, self.batch_base, "NP25-100", "BRAIN",
-            ["AAAABB"],
-        )
-
-        self.assertEqual("AAAABB", pid)
-        self.assertEqual("AAAABC", reserved_pid)
-
-    def test_organ_change_pid_reuses_existing_mrn_organ_pid(self):
-        renaming.prepare_batch(self.batch, self.clone, self.batch_base, self.query)
-        _, mapping = renaming.read_csv(self.batch / "name_mapping.csv")
-        for row in mapping:
-            row.update({"Organ": "OTHER", "PID": "AAAAAA"})
+            row.update({"PID": "AAAABA", "Approved": "True"})
             row["NewName"] = renaming.build_new_name(row)
         renaming.atomic_write(
             self.batch / "name_mapping.csv", renaming.MAPPING_FIELDS, mapping
         )
 
-        pid = renaming.pid_after_organ_change(
-            self.batch, self.clone, self.batch_base, "NP25-100", "BRAIN"
+        self.assertEqual(
+            0, renaming.repair_staged_pid_assignments(self.clone, self.batch_base)
         )
-
-        self.assertEqual("AAAAAZ", pid)
-
-    def test_committed_pid_wins_over_conflicting_staged_pid(self):
-        renaming.prepare_batch(self.batch, self.clone, self.batch_base, self.query)
         staged_batch = self.batch_base / "SS200" / "batch-2"
-        _, mapping = renaming.read_csv(self.batch / "name_mapping.csv")
         staged = dict(mapping[0])
         staged.update({
-            "AccessionID": "NP25-200", "Organ": "BRAIN", "PID": "AAAABA"
+            "AccessionID": "NP25-200", "PID": "AAAABB", "Approved": "False"
         })
         staged["NewName"] = renaming.build_new_name(staged)
         renaming.atomic_write(
@@ -283,12 +244,18 @@ class RenamingDataTests(unittest.TestCase):
             ["accession_id", "mrn"],
             [{"accession_id": "NP25-200", "mrn": "MRN1"}],
         )
-
-        pid = renaming.pid_after_organ_change(
-            self.batch, self.clone, self.batch_base, "NP25-100", "BRAIN"
+        self.assertEqual(
+            1,
+            renaming.repair_staged_pid_assignments(
+                self.clone,
+                self.batch_base,
+                self.batch / "name_mapping.csv",
+            ),
         )
-
-        self.assertEqual("AAAAAZ", pid)
+        _, repaired = renaming.read_csv(self.batch / "name_mapping.csv")
+        _, still_staged = renaming.read_csv(staged_batch / "name_mapping.csv")
+        self.assertEqual({"AAAAAZ"}, {row["PID"] for row in repaired})
+        self.assertEqual("AAAABB", still_staged[0]["PID"])
 
     def test_multiple_staged_pids_for_one_pair_are_normalized(self):
         renaming.initialize_clone(self.clone)
@@ -695,6 +662,7 @@ class RenamingPageTests(unittest.TestCase):
             catalog_batches[0].id,
             qc_complete=True,
         )
+        self.batch_id = catalog_batches[0].id
         self.user = app_module.User("renamer", "", False)
         app_module.user_manager.users[self.user.id] = self.user
         self.client = app_module.app.test_client()
@@ -737,6 +705,13 @@ class RenamingPageTests(unittest.TestCase):
         return data
 
     def tearDown(self):
+        deadline = time.monotonic() + 3
+        while (
+            app_module._renaming_job_state(self.batch_id).get("status")
+            == "finalizing"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
         app_module.Config.INSLIDE_BATCHES = self.old_batch_base
         app_module.Config.COPATH_CLONE = self.old_clone
         app_module.Config.INSTANCE_DIR = self.old_instance
@@ -746,6 +721,16 @@ class RenamingPageTests(unittest.TestCase):
         app_module.batch_contexts.clear()
         app_module._renaming_jobs.clear()
         self.temporary.cleanup()
+
+    def wait_for_finalization(self, expected="complete"):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            state = app_module._renaming_job_state(self.batch_id)
+            if state.get("status") != "finalizing":
+                self.assertEqual(expected, state.get("status"), state.get("error"))
+                return state
+            time.sleep(0.01)
+        self.fail("Renaming finalization did not finish")
 
     def test_page_lists_batch_and_renders_mapping_and_report(self):
         listing = self.client.get("/renaming")
@@ -758,9 +743,8 @@ class RenamingPageTests(unittest.TestCase):
         self.assertIn(b"NP25-100", detail.data)
         self.assertIn(b"Diagnosis text", detail.data)
         self.assertIn(b"fetch(form.action", detail.data)
-        self.assertIn(b"pidLookupUrl", detail.data)
-        self.assertIn(b"pidLookupQueue", detail.data)
-        self.assertIn(b"reserved_pid", detail.data)
+        self.assertNotIn(b"pidLookupUrl", detail.data)
+        self.assertNotIn(b"/renaming/pid/", detail.data)
         self.assertIn(b'name="pid" value="AAAAAA" maxlength="6" required readonly', detail.data)
         self.assertIn(b'class="success approve-button"', detail.data)
         self.assertIn(b'Accession changed. Consider requerying CoPath.', detail.data)
@@ -878,74 +862,14 @@ class RenamingPageTests(unittest.TestCase):
         self.assertEqual(["NP25-200", "NP25-300"], values)
         workbook.close()
 
-    def test_pid_preview_returns_next_staged_pid_for_changed_organ(self):
-        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
-        rows[0].update({"Organ": "OTHER", "PID": "AAAAAA"})
-        rows[0]["NewName"] = renaming.build_new_name(rows[0])
-        renaming.atomic_write(
-            self.batch / "name_mapping.csv", renaming.MAPPING_FIELDS, rows
-        )
-        staged_batch = self.batch_base / "SS200" / "batch-2"
-        staged = dict(rows[0])
-        staged.update({
-            "AccessionID": "NP25-200", "Organ": "BRAIN", "PID": "AAAAAB"
-        })
-        staged["NewName"] = renaming.build_new_name(staged)
-        renaming.atomic_write(
-            staged_batch / "name_mapping.csv", renaming.MAPPING_FIELDS, [staged]
-        )
-        batches, _ = app_module._renaming_batches()
-
-        response = self.client.get(
-            f"/renaming/pid/{batches[0].id}",
-            query_string={
-                "accession": "NP25-100",
-                "organ": "BRAIN",
-                "mapping_signature": renaming.mapping_signature(rows),
-            },
-        )
-
-        self.assertEqual(200, response.status_code)
-        self.assertEqual({"success": True, "pid": "AAAAAC"}, response.get_json())
-
-        reserved_response = self.client.get(
-            f"/renaming/pid/{batches[0].id}",
-            query_string=[
-                ("accession", "NP25-100"),
-                ("organ", "BRAIN"),
-                ("mapping_signature", renaming.mapping_signature(rows)),
-                ("reserved_pid", "AAAAAC"),
-            ],
-        )
-        self.assertEqual(200, reserved_response.status_code)
-        self.assertEqual(
-            {"success": True, "pid": "AAAAAD"}, reserved_response.get_json()
-        )
-
-    def test_pid_preview_rejects_stale_mapping_signature(self):
-        batches, _ = app_module._renaming_batches()
-
-        response = self.client.get(
-            f"/renaming/pid/{batches[0].id}",
-            query_string={
-                "accession": "NP25-100",
-                "organ": "OTHER",
-                "mapping_signature": "stale",
-            },
-        )
-
-        self.assertEqual(409, response.status_code)
-        self.assertFalse(response.get_json()["success"])
-        self.assertIn("changed in another session", response.get_json()["message"])
-
-    def test_organ_change_repairs_pid_owned_by_different_mrn(self):
+    def test_final_approval_consolidates_pid_after_organ_change(self):
         renaming.initialize_clone(self.clone)
         write_csv(
             self.clone / "all_iuh_identifiers.csv",
             renaming.IDENTIFIER_FIELDS,
             [{
                 "AccessionID": "NP24-1", "Organ": "BREAST",
-                "MRN": "MRN2", "PID": "AAAAAC",
+                "MRN": "MRN1", "PID": "AAAAAD",
             }],
         )
         _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
@@ -954,45 +878,32 @@ class RenamingPageTests(unittest.TestCase):
         renaming.atomic_write(
             self.batch / "name_mapping.csv", renaming.MAPPING_FIELDS, rows
         )
-        staged_batch = self.batch_base / "SS200" / "batch-2"
-        staged = dict(rows[0])
-        staged.update({
-            "AccessionID": "NP24-2", "Organ": "BREAST", "PID": "AAAAAC"
-        })
-        staged["NewName"] = renaming.build_new_name(staged)
-        renaming.atomic_write(
-            staged_batch / "name_mapping.csv", renaming.MAPPING_FIELDS, [staged]
-        )
-        write_csv(
-            staged_batch / "pending_CoPath_data.csv",
-            ["accession_id", "mrn"],
-            [{"accession_id": "NP24-2", "mrn": "MRN1"}],
-        )
         batches, _ = app_module._renaming_batches()
 
-        preview = self.client.get(
-            f"/renaming/pid/{batches[0].id}",
-            query_string={
-                "accession": "NP25-100",
-                "organ": "BREAST",
-                "mapping_signature": renaming.mapping_signature(rows),
-            },
-        )
-        approval = self.client.post(
-            f"/renaming/approve/{batches[0].id}",
-            data=self.approval_data(rows, organ="BREAST", pid="ZZZZZZ"),
-            headers={"Accept": "application/json"},
-        )
+        with mock.patch.object(
+            renaming,
+            "repair_staged_pid_assignments",
+            wraps=renaming.repair_staged_pid_assignments,
+        ) as repair:
+            approval = self.client.post(
+                f"/renaming/approve/{batches[0].id}",
+                data=self.approval_data(rows, organ="BREAST", pid="ZZZZZZ"),
+                headers={"Accept": "application/json"},
+            )
+            self.wait_for_finalization()
 
-        self.assertEqual(200, preview.status_code)
-        self.assertEqual({"success": True, "pid": "AAAAAD"}, preview.get_json())
         self.assertEqual(200, approval.status_code)
         self.assertTrue(approval.get_json()["success"])
+        repair.assert_called_once_with(
+            self.clone,
+            self.batch_base,
+            self.batch / "name_mapping.csv",
+        )
         _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
         self.assertEqual("BREAST", saved[0]["Organ"])
         self.assertEqual("AAAAAD", saved[0]["PID"])
 
-    def test_approval_overrides_submitted_pid_after_organ_change(self):
+    def test_nonfinal_organ_change_keeps_pid_until_batch_finishes(self):
         rows = self.add_second_accession()
         rows[0].update({"Organ": "OTHER", "PID": "AAAAAA"})
         rows[0]["NewName"] = renaming.build_new_name(rows[0])
@@ -1014,7 +925,7 @@ class RenamingPageTests(unittest.TestCase):
         _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
         first = next(row for row in saved if row["AccessionID"] == "NP25-100")
         self.assertEqual("BRAIN", first["Organ"])
-        self.assertEqual("AAAAAC", first["PID"])
+        self.assertEqual("AAAAAA", first["PID"])
 
     def test_approval_ignores_submitted_pid_without_organ_change(self):
         _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
@@ -1037,8 +948,8 @@ class RenamingPageTests(unittest.TestCase):
 
         with mock.patch.object(
             renaming,
-            "pid_after_organ_change",
-            side_effect=AssertionError("PID scan used for unchanged organ"),
+            "repair_staged_pid_assignments",
+            side_effect=AssertionError("PID consolidation used before batch completion"),
         ), mock.patch.object(
             app_module,
             "_adopt_batch_document",
@@ -1050,14 +961,17 @@ class RenamingPageTests(unittest.TestCase):
         ):
             response = self.client.post(
                 f"/renaming/approve/{batches[0].id}",
-                data=self.approval_data(rows, pid="ZZZZZZ"),
+                data=self.approval_data(
+                    rows, accession_id="NP25-300", organ="BREAST", pid="ZZZZZZ"
+                ),
                 headers={"Accept": "application/json"},
             )
 
         self.assertEqual(200, response.status_code)
         self.assertTrue(response.get_json()["success"])
         _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
-        first = next(row for row in saved if row["AccessionID"] == "NP25-100")
+        first = next(row for row in saved if row["AccessionID"] == "NP25-300")
+        self.assertEqual("BREAST", first["Organ"])
         self.assertEqual("AAAAAA", first["PID"])
 
     def test_multiple_accessions_render_as_complete_rows_before_expansion(self):
@@ -1165,6 +1079,7 @@ class RenamingPageTests(unittest.TestCase):
         )
 
         self.assertEqual(302, response.status_code)
+        self.wait_for_finalization()
         catalog_row = app_module.batch_catalog.get_batch(
             app_module.Config.INSTANCE_DIR, batches[0].id
         )
@@ -1204,13 +1119,52 @@ class RenamingPageTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.get_json()
         self.assertTrue(payload["success"])
-        self.assertTrue(payload["finalized"])
+        self.assertFalse(payload["finalized"])
+        self.assertTrue(payload["finalizing"])
         self.assertEqual("/renaming", payload["redirect_url"])
+        self.wait_for_finalization()
         catalog_row = app_module.batch_catalog.get_batch(
             app_module.Config.INSTANCE_DIR, batches[0].id
         )
         self.assertTrue(catalog_row["qc_complete"])
         self.assertTrue(catalog_row["renamed_complete"])
+
+    def test_final_approval_returns_while_pid_consolidation_runs(self):
+        batches, _ = app_module._renaming_batches()
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        started = threading.Event()
+        release = threading.Event()
+        original = renaming.repair_staged_pid_assignments
+
+        def blocked_consolidation(*args):
+            started.set()
+            release.wait(3)
+            return original(*args)
+
+        try:
+            with mock.patch.object(
+                renaming,
+                "repair_staged_pid_assignments",
+                side_effect=blocked_consolidation,
+            ):
+                response = self.client.post(
+                    f"/renaming/approve/{batches[0].id}",
+                    data=self.approval_data(rows),
+                    headers={"Accept": "application/json"},
+                )
+                self.assertEqual(200, response.status_code)
+                self.assertTrue(started.wait(1))
+                self.assertEqual(
+                    "finalizing",
+                    app_module._renaming_job_state(self.batch_id)["status"],
+                )
+                self.assertFalse(app_module.batch_catalog.get_batch(
+                    app_module.Config.INSTANCE_DIR, self.batch_id
+                )["renamed_complete"])
+                release.set()
+                self.wait_for_finalization()
+        finally:
+            release.set()
 
     def test_sdl_failure_leaves_batch_available_for_retry(self):
         Path(app_module.Config.SDL_FILE_PATH).unlink()
@@ -1238,6 +1192,7 @@ class RenamingPageTests(unittest.TestCase):
         )
 
         self.assertEqual(302, response.status_code)
+        self.wait_for_finalization("finalization_failed")
         catalog_row = app_module.batch_catalog.get_batch(
             app_module.Config.INSTANCE_DIR, batches[0].id
         )
@@ -1245,24 +1200,34 @@ class RenamingPageTests(unittest.TestCase):
         self.assertFalse(catalog_row["renamed_complete"])
         self.assertEqual(1, len(app_module._renaming_batches()[0]))
 
-    def test_async_finalization_error_returns_the_saved_group_state(self):
+    def test_background_finalization_failure_keeps_batch_available(self):
+        renaming.initialize_clone(self.clone)
+        write_csv(
+            self.clone / "all_iuh_identifiers.csv",
+            renaming.IDENTIFIER_FIELDS,
+            [{
+                "AccessionID": "NP24-1", "Organ": "BREAST",
+                "MRN": "MRN1", "PID": "AAAAAD",
+            }],
+        )
         Path(app_module.Config.SDL_FILE_PATH).unlink()
         batches, _ = app_module._renaming_batches()
         _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
 
         response = self.client.post(
             f"/renaming/approve/{batches[0].id}",
-            data=self.approval_data(rows),
+            data=self.approval_data(rows, organ="BREAST"),
             headers={"Accept": "application/json"},
         )
 
-        self.assertEqual(500, response.status_code)
+        self.assertEqual(200, response.status_code)
         payload = response.get_json()
-        self.assertFalse(payload["success"])
-        self.assertTrue(payload["saved"])
-        self.assertIn('class="accession-form approved"', payload["group_html"])
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["finalizing"])
+        state = self.wait_for_finalization("finalization_failed")
+        self.assertIn("Slide Digitization Log not found", state["error"])
         _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
-        self.assertEqual(renaming.mapping_signature(saved), payload["signature"])
+        self.assertEqual("AAAAAD", saved[0]["PID"])
 
 
 if __name__ == "__main__":

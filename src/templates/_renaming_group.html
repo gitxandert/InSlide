@@ -17,8 +17,8 @@
     <div class="cell">{% if group.report %}<button class="report-toggle secondary" type="button" aria-expanded="false" aria-controls="reports-{{ group_key }}">View</button>{% else %}<button class="secondary" type="button" disabled>No report</button>{% endif %}</div>
     <div class="cell approval-state">{% if group.approved %}<strong>Approved</strong>{% else %}<span>Pending</span>{% endif %}</div>
     <div class="cell actions">
-        <button class="success approve-button" type="submit" {% if job_state.status in ('preparing','retrying') %}disabled{% endif %}>Approve</button>
-        <button class="secondary retry-button" type="submit" formaction="{{ url_for('renaming_retry', batch_id=context.id) }}" {% if job_state.status in ('preparing','retrying') %}disabled{% endif %}>Requery CoPath</button>
+        <button class="success approve-button" type="submit" {% if job_state.status in ('preparing','retrying','finalizing') %}disabled{% endif %}>Approve</button>
+        <button class="secondary retry-button" type="submit" formaction="{{ url_for('renaming_retry', batch_id=context.id) }}" {% if job_state.status in ('preparing','retrying','finalizing') %}disabled{% endif %}>Requery CoPath</button>
     </div>
     <div class="expanded" id="slides-{{ group_key }}" hidden>
         <div class="slide"><strong>Original path</strong><strong>Stain</strong><strong>Block</strong><strong>Section</strong><strong>New name</strong></div>

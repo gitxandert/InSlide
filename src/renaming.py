@@ -486,7 +486,9 @@ def _reserved_pids(batch_base: Path) -> Dict[str, set]:
 
 
 def _staged_pid_state(
-    batch_base: Path, identifiers: Sequence[Dict[str, str]]
+    batch_base: Path,
+    identifiers: Sequence[Dict[str, str]],
+    target_mapping: Optional[Path] = None,
 ) -> _StagedPidState:
     """Load active staged PID observations and their writable source rows."""
     mappings = {}
@@ -502,7 +504,10 @@ def _staged_pid_state(
             mapping_headers, mapping = read_csv(mapping_path)
         except RenamingError:
             continue
-        if not mapping or all(parse_bool(row.get("Approved", "")) for row in mapping):
+        if not mapping or (
+            mapping_path != target_mapping
+            and all(parse_bool(row.get("Approved", "")) for row in mapping)
+        ):
             continue
         mrns = {
             accession: row.get("MRN", "").strip()
@@ -614,14 +619,20 @@ def _pid_pairs(
     return _canonical_pid_pairs(batch_base, identifiers, staged)
 
 
-def repair_staged_pid_assignments(clone_root: Path, batch_base: Path) -> int:
-    """Persist canonical PIDs across active staged mappings and history rows."""
+def repair_staged_pid_assignments(
+    clone_root: Path,
+    batch_base: Path,
+    target_mapping: Optional[Path] = None,
+) -> int:
+    """Persist canonical PIDs, optionally only for one completed batch."""
     identifiers = _identifier_rows(clone_root)
-    staged = _staged_pid_state(batch_base, identifiers)
+    staged = _staged_pid_state(batch_base, identifiers, target_mapping)
     pairs = _canonical_pid_pairs(batch_base, identifiers, staged)
     targets = []
 
     for path, (headers, rows, mrns) in staged.mappings.items():
+        if target_mapping is not None and path != target_mapping:
+            continue
         original = [dict(row) for row in rows]
         changed = False
         for row in rows:
@@ -639,6 +650,8 @@ def repair_staged_pid_assignments(clone_root: Path, batch_base: Path) -> int:
             targets.append((path, headers, rows, headers, original))
 
     for path, (headers, rows) in staged.histories.items():
+        if target_mapping is not None and path.parent != target_mapping.parent:
+            continue
         original = [dict(row) for row in rows]
         changed = False
         for row in rows:
@@ -664,55 +677,6 @@ def repair_staged_pid_assignments(clone_root: Path, batch_base: Path) -> int:
             atomic_write(path, headers, original)
         raise
     return len(targets)
-
-
-def pid_after_organ_change(
-    batch_root: Path,
-    clone_root: Path,
-    batch_base: Path,
-    accession: str,
-    target_organ: str,
-    additional_reserved: Iterable[str] = (),
-) -> str:
-    """Resolve authoritative PID after a staged accession changes organ."""
-    accession = clean_accession(accession)
-    target_organ = target_organ.strip().upper()
-    if not accession:
-        raise RenamingError("Accession ID is required")
-    if target_organ not in ORGANS:
-        raise RenamingError("Select a valid Organ")
-
-    repair_staged_pid_assignments(clone_root, batch_base)
-    mapping_path = batch_root / "name_mapping.csv"
-    _, mapping = read_csv(mapping_path)
-    current = next((row for row in mapping if same_accession(row_accession(row), accession)), None)
-    if current is None:
-        raise RenamingError("The accession is no longer available in this batch")
-    identifiers = _identifier_rows(clone_root)
-    reports = report_rows(batch_root, clone_root)
-    mrn = reports.get(accession_key(accession), {}).get("mrn", "").strip()
-    pairs = _pid_pairs(batch_base, identifiers)
-    if mrn and (mrn, target_organ) in pairs:
-        return pairs[(mrn, target_organ)]
-
-    current_organ = current.get("Organ", "").strip().upper()
-    current_pid = current.get("PID", "").strip().upper()
-    if not mrn and current_organ == target_organ and PID_RE.fullmatch(current_pid):
-        return current_pid
-
-    reserved = _reserved_pids(batch_base)[target_organ]
-    reserved.update(
-        row.get("PID", "").strip().upper()
-        for row in identifiers
-        if row.get("Organ", "").strip().upper() == target_organ
-    )
-    reserved.update(
-        pid.strip().upper()
-        for pid in additional_reserved
-        if PID_RE.fullmatch(pid.strip().upper())
-    )
-    valid = sorted(pid for pid in reserved if PID_RE.fullmatch(pid))
-    return increment_pid(valid[-1]) if valid else "AAAAAA"
 
 
 def _pid_for_identifiers(
@@ -870,7 +834,6 @@ def stage_longitudinal_history(
     atomic_write_json(job_path, job)
     temporary = batch_root / f".pending_CoPath_history.{uuid.uuid4().hex}.csv"
     try:
-        repair_staged_pid_assignments(clone_root, batch_base)
         query(batch_root, seeds, temporary)
         headers, queried = read_csv(temporary)
         headers = collapse_report_headers(headers)
@@ -940,7 +903,6 @@ def prepare_batch(
     batch_base: Path,
     query: Callable[[Path, Sequence[str], Path], None] = default_query,
 ) -> None:
-    repair_staged_pid_assignments(clone_root, batch_base)
     enriched_path = batch_root / "enriched.csv"
     _, slides = read_csv(enriched_path)
     required = {"AccessionID", "Stain", "BlockNumber", "original_slide_path"}
@@ -1174,7 +1136,6 @@ def retry_group(
     new_accession: str,
     query: Callable[[Path, Sequence[str], Path], None] = default_query,
 ) -> None:
-    repair_staged_pid_assignments(clone_root, batch_base)
     old_accession = clean_accession(old_accession)
     new_accession = clean_accession(new_accession)
     if not new_accession:

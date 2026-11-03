@@ -101,7 +101,11 @@
         {% if history_job is defined and history_job.status in ('pending','running','staged') %}
             <div class="notice">Longitudinal CoPath history: {{ history_job.status|title }}. Renaming may continue.</div>
         {% endif %}
-        {% if job_state.status in ('preparing','retrying') %}
+        {% if job_state.status == 'finalizing' %}
+            <div class="notice">PID consolidation and batch finalization are running in the background. You can leave this page.</div>
+        {% elif job_state.status == 'finalization_failed' %}
+            <div class="notice">Finalization failed: {{ job_state.error }}. Approve any row again to retry.</div>
+        {% elif job_state.status in ('preparing','retrying') %}
             <div class="notice">CoPath {{ job_state.status }} is running. This page will refresh when it finishes.</div>
         {% elif job_state.status == 'failed' %}
             <div class="notice">Preparation failed: {{ job_state.error }}
@@ -129,8 +133,6 @@ const sharedFieldNames = [
   'accession_id', 'organ', 'pid', 'accession_date', 'timepoint',
   'image_type', 'samp_acq_type'
 ];
-const pidLookupUrl = {{ url_for('renaming_pid', batch_id=context.id)|tojson }};
-let pidLookupQueue = Promise.resolve();
 
 const showRenamingMessage = (message, category = 'error') => {
   const item = document.createElement('li');
@@ -211,31 +213,13 @@ const replaceUpdatedGroup = (submittedForm, payload, drafts) => {
   return updatedForm;
 };
 
-const refreshDuplicatePidPreviews = (authoritativeForm) => {
-  const organ = authoritativeForm.elements.organ.value;
-  const pid = authoritativeForm.elements.pid.value;
-  document.querySelectorAll('.accession-form').forEach((form) => {
-    if (
-      form !== authoritativeForm
-      && form.elements.organ.value === organ
-      && form.elements.pid.value === pid
-    ) {
-      form.elements.organ.dispatchEvent(new Event('change', {bubbles: true}));
-    }
-  });
-};
-
 const bindRenamingForm = (form) => {
   const slideToggle = form.querySelector('.slide-toggle');
   const reportToggle = form.querySelector('.report-toggle');
   const slides = form.querySelector(`#${slideToggle.getAttribute('aria-controls')}`);
   const reports = reportToggle ? form.querySelector(`#${reportToggle.getAttribute('aria-controls')}`) : null;
-  const organInput = form.elements.organ;
   const accessionInput = form.elements.accession_id;
   const requerySuggestion = form.querySelector('.requery-suggestion');
-  const approveButton = form.querySelector('.approve-button');
-  const approvalInitiallyDisabled = approveButton.disabled;
-  let pidLookupVersion = 0;
   const close = (toggle, panel) => {
     if (!toggle || !panel) return;
     toggle.setAttribute('aria-expanded', 'false');
@@ -265,54 +249,6 @@ const bindRenamingForm = (form) => {
   };
   accessionInput.addEventListener('input', updateRequerySuggestion);
   updateRequerySuggestion();
-  organInput.addEventListener('change', () => {
-    const lookupVersion = ++pidLookupVersion;
-    form.dataset.pidPreviewOrgan = '';
-    approveButton.disabled = true;
-    const lookup = async () => {
-      try {
-        if (!form.isConnected || lookupVersion !== pidLookupVersion) return;
-        const url = new URL(pidLookupUrl, window.location.origin);
-        url.searchParams.set('accession', form.elements.old_accession.value);
-        url.searchParams.set('organ', organInput.value);
-        url.searchParams.set('mapping_signature', form.elements.mapping_signature.value);
-        document.querySelectorAll('.accession-form').forEach((candidate) => {
-          const candidatePid = candidate.elements.pid.value.trim().toUpperCase();
-          if (
-            candidate !== form
-            && candidate.dataset.pidPreviewOrgan === organInput.value
-            && /^[A-Z]{6}$/.test(candidatePid)
-          ) {
-            url.searchParams.append('reserved_pid', candidatePid);
-          }
-        });
-        const response = await fetch(url, {headers: {'Accept': 'application/json'}});
-        const payload = await response.json();
-        if (lookupVersion !== pidLookupVersion || organInput.value !== url.searchParams.get('organ')) return;
-        if (!response.ok || !payload.success) {
-          showRenamingMessage(payload.message || 'PID assignment failed.');
-          return;
-        }
-        form.elements.pid.value = payload.pid;
-        if (payload.mapping_signature) {
-          document.querySelectorAll('input[name="mapping_signature"]').forEach((input) => {
-            input.value = payload.mapping_signature;
-          });
-        }
-        form.dataset.pidPreviewOrgan = organInput.value;
-        updateNames(form);
-      } catch (error) {
-        if (lookupVersion === pidLookupVersion) {
-          showRenamingMessage('PID assignment failed. Check the connection and try again.');
-        }
-      } finally {
-        if (lookupVersion === pidLookupVersion) {
-          approveButton.disabled = approvalInitiallyDisabled;
-        }
-      }
-    };
-    pidLookupQueue = pidLookupQueue.then(lookup, lookup);
-  });
   form.addEventListener('submit', async (event) => {
     const button = event.submitter;
     if (!button || !button.classList.contains('approve-button')) return;
@@ -330,15 +266,14 @@ const bindRenamingForm = (form) => {
       });
       const payload = await response.json();
       if (payload.group_html && (payload.success || payload.saved)) {
-        const updatedForm = replaceUpdatedGroup(form, payload, drafts);
-        refreshDuplicatePidPreviews(updatedForm);
+        replaceUpdatedGroup(form, payload, drafts);
       }
       if (!response.ok || !payload.success) {
         showRenamingMessage(payload.message || 'The approval could not be saved.');
         return;
       }
       showRenamingMessage(payload.message, payload.category || 'success');
-      if (payload.finalized) window.location.assign(payload.redirect_url);
+      if (payload.redirect_url) window.location.assign(payload.redirect_url);
     } catch (error) {
       showRenamingMessage('The approval request failed. Check the connection and try again.');
     } finally {
@@ -353,11 +288,12 @@ const bindRenamingForm = (form) => {
 document.querySelectorAll('.accession-form').forEach(bindRenamingForm);
 </script>
 {% endif %}
-{% if context and job_state.status in ('preparing','retrying') %}
+{% if context and job_state.status in ('preparing','retrying','finalizing') %}
 <script nonce="{{ csp_nonce() }}">
 setInterval(async () => {
   const response = await fetch({{ url_for('renaming_status', batch_id=context.id)|tojson }});
-  if (response.ok) { const state = await response.json(); if (state.status !== {{ job_state.status|tojson }}) location.reload(); }
+  if (response.status === 404) window.location.assign({{ url_for('renaming_page')|tojson }});
+  else if (response.ok) { const state = await response.json(); if (state.status !== {{ job_state.status|tojson }}) location.reload(); }
 }, 2000);
 </script>
 {% endif %}

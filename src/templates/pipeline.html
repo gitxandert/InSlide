@@ -56,6 +56,10 @@
         .status.running { color: #795b00; background: #fff3cd; }
         .status.succeeded { color: #155724; background: #d4edda; }
         .status.failed { color: #721c24; background: #f8d7da; }
+        .status.interrupted { color: #721c24; background: #f8d7da; }
+        .abort-button { background: var(--danger); }
+        .abort-button:hover:not(:disabled) { background: #a71d2a; }
+        .console-actions { display: flex; align-items: center; gap: 10px; }
         #console { min-height: 260px; max-height: 520px; overflow: auto; margin: 0; padding: 17px; border-radius: 8px; background: #111820; color: #e7edf3; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
         @media (max-width: 680px) { .header { align-items: flex-start; flex-direction: column; padding: 15px 20px; } main { width: min(100% - 28px, 980px); padding-top: 28px; } .card { padding: 20px; } .grid { grid-template-columns: 1fr; } }
     </style>
@@ -196,7 +200,17 @@
             <section class="card" aria-live="polite">
                 <div class="console-heading">
                     <h2>Pipeline output</h2>
-                    <span id="job-status" class="status {{ job.status }}">{{ job.status }}</span>
+                    <div class="console-actions">
+                        <span id="job-status" class="status {{ job.status }}">{{ job.status }}</span>
+                        {% if job.status == 'running' and not job.cancel_requested.is_set() %}
+                            <form method="POST" action="{{ url_for('abort_pipeline_job', job_id=job.id) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="abort-button" type="submit">Abort pipeline</button>
+                            </form>
+                        {% elif job.cancel_requested.is_set() %}
+                            <span class="busy-note">Abort requested…</span>
+                        {% endif %}
+                    </div>
                 </div>
                 <pre id="console" aria-label="Pipeline output"></pre>
             </section>

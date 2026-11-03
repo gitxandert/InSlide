@@ -1,5 +1,6 @@
 import io
 import json
+import signal
 import sys
 import tempfile
 import unittest
@@ -347,6 +348,8 @@ class PipelineLauncherTests(unittest.TestCase):
         self.assertIs(app_module.subprocess.PIPE, popen.call_args.kwargs["stdout"])
         self.assertIs(app_module.subprocess.STDOUT, popen.call_args.kwargs["stderr"])
         self.assertNotIn("bufsize", popen.call_args.kwargs)
+        if app_module.os.name == "posix":
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
         self.assertEqual(12345, app_module.api_store.get_job(job.id)["launcher_pid"])
         reader_thread.start.assert_called_once_with()
 
@@ -355,6 +358,15 @@ class PipelineLauncherTests(unittest.TestCase):
         app_module._read_pipeline_output(job)
         self.assertEqual("failed", job.status)
         self.assertEqual(7, job.return_code)
+
+    def test_reader_marks_aborted_process_as_interrupted(self):
+        job = app_module.PipelineJob("job", "user", FakeProcess(return_code=-15))
+        job.cancel_requested.set()
+
+        app_module._read_pipeline_output(job)
+
+        self.assertEqual("interrupted", job.status)
+        self.assertEqual(-15, job.return_code)
 
     def test_page_filters_dates_and_streams_pipeline_output(self):
         user = app_module.User("operator", "", is_admin=False)
@@ -380,6 +392,82 @@ class PipelineLauncherTests(unittest.TestCase):
         self.assertIn(b"function updateDateOptions(", page.data)
         self.assertEqual("second line\n", output.get_json()["output"])
         self.assertEqual(len(job.output), output.get_json()["next_offset"])
+
+    def test_owner_can_abort_pipeline_process_group(self):
+        user = app_module.User("operator", "", is_admin=False)
+        process = FakeProcess(return_code=None)
+        job = app_module.PipelineJob("stoppable-job", user.id, process)
+        with app_module._pipeline_jobs_lock:
+            app_module._pipeline_jobs[job.id] = job
+            app_module._pipeline_active_job_id = job.id
+        client = app_module.app.test_client()
+
+        with mock.patch.object(app_module.user_manager, "get", return_value=user), mock.patch.object(
+            app_module.os, "killpg"
+        ) as kill_group:
+            with client.session_transaction() as flask_session:
+                flask_session["_user_id"] = user.id
+                flask_session["_fresh"] = True
+            response = client.post(f"/pipeline/jobs/{job.id}/abort")
+
+        self.assertEqual(302, response.status_code)
+        self.assertTrue(job.cancel_requested.is_set())
+        kill_group.assert_called_once_with(process.pid, signal.SIGTERM)
+
+    def test_abort_clears_ghost_pipeline_whose_process_already_exited(self):
+        job = app_module.PipelineJob(
+            "ghost-job", "operator", FakeProcess(return_code=0)
+        )
+        with app_module._pipeline_jobs_lock:
+            app_module._pipeline_jobs[job.id] = job
+            app_module._pipeline_active_job_id = job.id
+
+        aborted = app_module._abort_pipeline_job(job)
+
+        self.assertTrue(aborted)
+        self.assertEqual("interrupted", job.status)
+        self.assertIsNone(app_module._pipeline_active_job_id)
+
+    def test_admin_can_see_and_abort_another_users_pipeline(self):
+        admin = app_module.User("admin", "", is_admin=True)
+        process = FakeProcess(return_code=None)
+        job = app_module.PipelineJob("admin-stoppable-job", "operator", process)
+        with app_module._pipeline_jobs_lock:
+            app_module._pipeline_jobs[job.id] = job
+            app_module._pipeline_active_job_id = job.id
+        client = app_module.app.test_client()
+
+        with mock.patch.object(app_module.user_manager, "get", return_value=admin), mock.patch.object(
+            app_module, "_pipeline_date_options", return_value=([], [])
+        ), mock.patch.object(app_module.os, "killpg"):
+            with client.session_transaction() as flask_session:
+                flask_session["_user_id"] = admin.id
+                flask_session["_fresh"] = True
+            page = client.get("/pipeline")
+            response = client.post(f"/pipeline/jobs/{job.id}/abort")
+
+        self.assertIn(b"Abort pipeline", page.data)
+        self.assertEqual(302, response.status_code)
+        self.assertTrue(job.cancel_requested.is_set())
+
+    def test_user_cannot_abort_another_users_pipeline(self):
+        user = app_module.User("operator", "", is_admin=False)
+        job = app_module.PipelineJob(
+            "hidden-job", "someone-else", FakeProcess(return_code=None)
+        )
+        with app_module._pipeline_jobs_lock:
+            app_module._pipeline_jobs[job.id] = job
+            app_module._pipeline_active_job_id = job.id
+        client = app_module.app.test_client()
+
+        with mock.patch.object(app_module.user_manager, "get", return_value=user):
+            with client.session_transaction() as flask_session:
+                flask_session["_user_id"] = user.id
+                flask_session["_fresh"] = True
+            response = client.post(f"/pipeline/jobs/{job.id}/abort")
+
+        self.assertEqual(404, response.status_code)
+        self.assertFalse(job.cancel_requested.is_set())
 
     def test_authenticated_page_and_launch(self):
         user = app_module.User("operator", "", is_admin=False)

@@ -33,6 +33,7 @@ import os
 import queue
 import re
 import secrets
+import signal
 import shutil
 import sqlite3
 import stat
@@ -2448,7 +2449,7 @@ def _start_renaming_job(
     """Start one background preparation or accession retry for a batch."""
     with _renaming_jobs_lock:
         existing = _renaming_jobs.get(context.id, {})
-        if existing.get("status") in {"preparing", "retrying"}:
+        if existing.get("status") in {"preparing", "retrying", "finalizing"}:
             return False
         if (
             not force
@@ -2503,6 +2504,45 @@ def _start_renaming_job(
             _renaming_jobs[context.id] = state
         if state["status"] == "ready":
             _start_longitudinal_job(context)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
+
+def _start_renaming_finalization(context: BatchContext) -> bool:
+    """Finalize one approved batch without holding up its operator."""
+    with _renaming_jobs_lock:
+        existing = _renaming_jobs.get(context.id, {})
+        if existing.get("status") in {"preparing", "retrying", "finalizing"}:
+            return False
+        _renaming_jobs[context.id] = {"status": "finalizing", "error": ""}
+
+    def worker() -> None:
+        try:
+            _wait_for_document_export(context.id, "name_mapping")
+            with _renaming_clone_lock:
+                renaming.repair_staged_pid_assignments(
+                    Path(Config.COPATH_CLONE),
+                    Path(Config.INSLIDE_BATCHES),
+                    context.root / "name_mapping.csv",
+                )
+                _adopt_batch_document(context.id, context.root, "name_mapping")
+                renaming.finalize_batch(context.root, Path(Config.COPATH_CLONE))
+                _update_sdl_after_renaming(context.root)
+                context.mark_renamed_complete()
+            try:
+                _tq_prepare_catalog()
+            except Exception:
+                app.logger.exception(
+                    "Could not refresh transfer catalog after finalizing batch %s",
+                    context.id,
+                )
+            state = {"status": "complete", "error": ""}
+        except Exception as exc:
+            app.logger.exception("Renaming finalization failed for %s", context.id)
+            state = {"status": "finalization_failed", "error": str(exc)}
+        with _renaming_jobs_lock:
+            _renaming_jobs[context.id] = state
 
     threading.Thread(target=worker, daemon=True).start()
     return True
@@ -5523,6 +5563,7 @@ class PipelineJob:
         self.return_code: Optional[int] = None
         self.output = ""
         self.output_path = output_path
+        self.cancel_requested = threading.Event()
 
 
 _pipeline_jobs: Dict[str, PipelineJob] = {}
@@ -5909,8 +5950,12 @@ def _read_pipeline_output(job: PipelineJob) -> None:
         return_code = job.process.wait()
         with _pipeline_jobs_lock:
             job.return_code = return_code
-            job.status = "succeeded" if return_code == 0 else "failed"
-        if return_code == 0:
+            job.status = (
+                "interrupted"
+                if job.cancel_requested.is_set()
+                else ("succeeded" if return_code == 0 else "failed")
+            )
+        if return_code == 0 and not job.cancel_requested.is_set():
             try:
                 command = list(getattr(job.process, "args", ()) or ())
                 if "--output-dir" in command:
@@ -5983,6 +6028,7 @@ def _start_pipeline_job(
             raise RuntimeError("Another Label-Check pipeline is already running.") from exc
 
         try:
+            process_options = {"start_new_session": True} if os.name == "posix" else {}
             process = subprocess.Popen(
                 command,
                 cwd=Path(__file__).resolve().parent.parent,
@@ -5990,6 +6036,7 @@ def _start_pipeline_job(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                **process_options,
             )
         except OSError:
             api_store.update_job(
@@ -6019,6 +6066,64 @@ def _pipeline_job_for_user(job_id: str) -> Optional[PipelineJob]:
         if job.owner_id != str(current_user.id) and not current_user.is_admin:
             return None
         return job
+
+
+def _active_pipeline_job_for_user() -> Optional[PipelineJob]:
+    with _pipeline_jobs_lock:
+        job = _pipeline_jobs.get(_pipeline_active_job_id or "")
+        if job is None:
+            return None
+        if job.owner_id != str(current_user.id) and not current_user.is_admin:
+            return None
+        return job
+
+
+def _abort_pipeline_job(job: PipelineJob) -> bool:
+    """Request termination of a running pipeline and its child processes."""
+    global _pipeline_active_job_id
+    with _pipeline_jobs_lock:
+        if job.status != "running":
+            return False
+        already_requested = job.cancel_requested.is_set()
+        job.cancel_requested.set()
+        process = job.process
+
+    if not already_requested:
+        message = "\nAbort requested by user.\n"
+        with _pipeline_jobs_lock:
+            job.output += message
+        if job.output_path:
+            try:
+                with open(job.output_path, "a", encoding="utf-8") as output_file:
+                    output_file.write(message)
+            except OSError:
+                app.logger.exception("Could not record pipeline abort request")
+
+    return_code = process.poll()
+    try:
+        if return_code is None:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+    except ProcessLookupError:
+        pass
+    except OSError:
+        app.logger.exception("Could not terminate Label-Check pipeline")
+    if return_code is not None:
+        with _pipeline_jobs_lock:
+            job.return_code = return_code
+            job.status = "interrupted"
+            if _pipeline_active_job_id == job.id:
+                _pipeline_active_job_id = None
+        if job.output_path:
+            api_store.update_job(
+                job.id,
+                status="interrupted",
+                return_code=return_code,
+                completed_at=_iso_utc(),
+            )
+    return True
 
 
 def _pipeline_is_busy() -> bool:
@@ -6197,7 +6302,7 @@ def response_security_metadata(response):
             ),
         )
     if request.endpoint in {
-        "pipeline_launcher", "renaming_page", "renaming_approve", "renaming_pid", "qc",
+        "pipeline_launcher", "renaming_page", "renaming_approve", "qc",
     }:
         started = getattr(g, "request_started_at", None)
         if started is not None:
@@ -7444,47 +7549,6 @@ def _renaming_groups_with_image_links(
     return groups
 
 
-@app.route("/renaming/pid/<batch_id>", methods=["GET"])
-@login_required
-def renaming_pid(batch_id: str):
-    context = _renaming_context(batch_id)
-    if context is None:
-        return jsonify({
-            "success": False,
-            "message": "The batch is no longer available for renaming.",
-        }), 404
-    accession = request.args.get("accession", "").strip()
-    organ = request.args.get("organ", "").strip().upper()
-    reserved_pids = request.args.getlist("reserved_pid")
-    expected_signature = request.args.get("mapping_signature", "")
-    try:
-        _, rows, _ = _load_batch_document(context.id, "name_mapping")
-        if renaming.mapping_signature(rows) != expected_signature:
-            raise renaming.RenamingError(
-                "The mapping changed in another session; reload and try again"
-            )
-        _wait_for_document_export(context.id, "name_mapping")
-        with _renaming_clone_lock:
-            pid = renaming.pid_after_organ_change(
-                context.root,
-                Path(Config.COPATH_CLONE),
-                Path(Config.INSLIDE_BATCHES),
-                accession,
-                organ,
-                reserved_pids,
-            )
-            _adopt_batch_document(context.id, context.root, "name_mapping")
-            _, rows, _ = _load_batch_document(context.id, "name_mapping")
-            signature = renaming.mapping_signature(rows)
-        payload = {"success": True, "pid": pid}
-        if signature != expected_signature:
-            payload["mapping_signature"] = signature
-        return jsonify(payload)
-    except renaming.RenamingError as exc:
-        status = 409 if "changed in another session" in str(exc) else 400
-        return jsonify({"success": False, "message": str(exc)}), status
-
-
 @app.route("/renaming/approve/<batch_id>", methods=["POST"])
 @login_required
 def renaming_approve(batch_id: str):
@@ -7512,9 +7576,11 @@ def renaming_approve(batch_id: str):
     try:
         if not values["AccessionID"]:
             raise renaming.RenamingError("Accession ID is required")
-        if _renaming_job_state(batch_id).get("status") in {"preparing", "retrying"}:
+        if _renaming_job_state(batch_id).get("status") in {
+            "preparing", "retrying", "finalizing",
+        }:
             raise renaming.RenamingError(
-                "Wait for the active CoPath job to finish before approving names"
+                "Wait for the active renaming job to finish before approving names"
             )
         slide_values: Dict[str, Dict[str, str]] = {}
         try:
@@ -7555,26 +7621,10 @@ def renaming_approve(batch_id: str):
                     "The accession is no longer available in this batch"
                 )
             if not target_exists:
-                current_organ = current.get("Organ", "").strip().upper()
                 current_pid = current.get("PID", "").strip().upper()
-                if current_organ == values["Organ"] and renaming.PID_RE.fullmatch(
-                    current_pid
-                ):
-                    values["PID"] = current_pid
-                else:
-                    _wait_for_document_export(context.id, "name_mapping")
-                    values["PID"] = renaming.pid_after_organ_change(
-                        context.root,
-                        Path(Config.COPATH_CLONE),
-                        Path(Config.INSLIDE_BATCHES),
-                        old_accession,
-                        values["Organ"],
-                    )
-                    _adopt_batch_document(context.id, context.root, "name_mapping")
-                    _, current_rows, _ = _load_batch_document(
-                        context.id, "name_mapping"
-                    )
-                    current_signature = renaming.mapping_signature(current_rows)
+                if not renaming.PID_RE.fullmatch(current_pid):
+                    raise renaming.RenamingError("The current PID is invalid")
+                values["PID"] = current_pid
             updated, merged = renaming.update_group_rows(
                 current_rows, old_accession, values, slide_values,
                 current_signature,
@@ -7601,28 +7651,23 @@ def renaming_approve(batch_id: str):
             message = f"Approved names for {values['AccessionID']}."
             category = "success"
         if updated and all(renaming.parse_bool(row["Approved"]) for row in updated):
-            _wait_for_document_export(context.id, "name_mapping")
-            with _renaming_clone_lock:
-                renaming.finalize_batch(context.root, Path(Config.COPATH_CLONE))
-                _update_sdl_after_renaming(context.root)
-                context.mark_renamed_complete()
-            try:
-                _tq_prepare_catalog()
-            except Exception:
-                app.logger.exception(
-                    "Could not refresh transfer catalog after finalizing batch %s",
-                    context.id,
+            if not _start_renaming_finalization(context):
+                raise renaming.RenamingError(
+                    "Batch finalization is already running"
                 )
-            message = "All names are approved and the batch has been finalized."
+            message = (
+                "All names are approved. Finalization is running in the background."
+            )
             if wants_json:
-                flash(message, "success")
+                flash(message, "info")
                 return jsonify({
                     "success": True,
-                    "finalized": True,
+                    "finalized": False,
+                    "finalizing": True,
                     "message": message,
                     "redirect_url": url_for("renaming_page"),
                 })
-            flash(message, "success")
+            flash(message, "info")
             return redirect(url_for("renaming_page"))
         signature = renaming.mapping_signature(updated)
         if wants_json:
@@ -7699,6 +7744,9 @@ def pipeline_launcher():
     job_id = session.get("pipeline_job_id")
     if job_id:
         job = _pipeline_job_for_user(job_id)
+    active_job = _active_pipeline_job_for_user()
+    if active_job is not None:
+        job = active_job
     date_options, inventory_warnings = _pipeline_date_options()
     return render_template(
         "pipeline.html",
@@ -7801,6 +7849,19 @@ def pipeline_job_output(job_id: str):
             "return_code": return_code,
         }
     )
+
+
+@app.route("/pipeline/jobs/<job_id>/abort", methods=["POST"])
+@login_required
+def abort_pipeline_job(job_id: str):
+    job = _pipeline_job_for_user(job_id)
+    if job is None:
+        abort(404)
+    if _abort_pipeline_job(job):
+        flash("Pipeline abort requested.", "success")
+    else:
+        flash("This pipeline is no longer running.", "warning")
+    return redirect(url_for("pipeline_launcher"))
 
 
 @app.route("/inventories", methods=["GET"])
