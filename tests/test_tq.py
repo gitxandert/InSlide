@@ -1058,7 +1058,7 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(1, len(backups))
         self.assertEqual(malformed, backups[0].read_text(encoding="utf-8"))
 
-    def test_metadata_csv_aggregates_accessions_and_uploads_first(self):
+    def test_metadata_csv_has_one_row_per_slide_and_uploads_first(self):
         slides = [dict(slide) for slide in self.catalog()]
         other = dict(slides[0])
         other.update(
@@ -1083,20 +1083,18 @@ class TQTransferTests(unittest.TestCase):
             with metadata_path.open("r", newline="", encoding="utf-8") as handle:
                 reader = csv.DictReader(handle)
                 self.assertEqual(
-                    ["accession_id", "pid", "num_slides"], reader.fieldnames
+                    ["accession_id", "organ", "pid", "filename"],
+                    reader.fieldnames,
                 )
                 self.assertEqual(
                     [
                         {
-                            "accession_id": "NP25-100",
-                            "pid": "AAAAAA",
-                            "num_slides": "2",
-                        },
-                        {
-                            "accession_id": "NP25-200",
-                            "pid": "AAAAAB",
-                            "num_slides": "1",
-                        },
+                            "accession_id": slide["accession"],
+                            "pid": slide["pid"],
+                            "organ": slide["organ"],
+                            "filename": slide["destination_name"],
+                        }
+                        for slide in slides
                     ],
                     list(reader),
                 )
@@ -1122,12 +1120,12 @@ class TQTransferTests(unittest.TestCase):
             metadata_path.unlink(missing_ok=True)
             manifest_path.unlink(missing_ok=True)
 
-    def test_metadata_csv_rejects_multiple_pids_for_one_accession(self):
+    def test_metadata_csv_rejects_missing_slide_fields(self):
         slides = [dict(slide) for slide in self.catalog()]
-        slides[1]["pid"] = "AAAAAB"
+        slides[1]["organ"] = ""
         metadata_dir = Path(app_module.Config.INSTANCE_DIR) / "tq_manifests"
 
-        with self.assertRaisesRegex(app_module.TQError, "multiple PIDs"):
+        with self.assertRaisesRegex(app_module.TQError, "PID, organ, and filename"):
             app_module._tq_write_metadata_csv(slides)
 
         self.assertEqual([], list(metadata_dir.glob("metadata-*.csv")))
@@ -1209,6 +1207,39 @@ class TQTransferTests(unittest.TestCase):
             metadata_path.unlink(missing_ok=True)
             copath_path.unlink(missing_ok=True)
             manifest_path.unlink(missing_ok=True)
+
+    def test_upload_includes_metadata_in_first_batch_only(self):
+        slides = [dict(slide) for slide in self.catalog()]
+        for slide in slides:
+            slide["staging_dir"] = "StudyA"
+            slide["destination_dir"] = app_module._tq_destination_dir(
+                "StudyA", slide
+            )
+        batches = [
+            app_module.TQBatch(index, [slide])
+            for index, slide in enumerate(slides, start=1)
+        ]
+        job = app_module.TQJob(
+            "metadata-once", self.user.id, None, slides, slides, batches=batches
+        )
+        job.metadata_path = self.root / "metadata.csv"
+        manifest_path = self.root / "manifest.csv"
+
+        with (
+            mock.patch.object(
+                app_module, "_tq_write_manifest", return_value=manifest_path
+            ) as write_manifest,
+            mock.patch.object(
+                app_module, "_tq_start_process", return_value=FakeProcess()
+            ),
+            mock.patch.object(app_module, "_tq_stream_process_output"),
+            mock.patch.object(app_module, "_tq_read_pusher_results"),
+        ):
+            for batch in batches:
+                app_module._tq_upload_batch(job, batch)
+
+        self.assertEqual(job.metadata_path, write_manifest.call_args_list[0].args[1])
+        self.assertIsNone(write_manifest.call_args_list[1].args[1])
 
     def test_failed_upload_cleans_metadata_and_manifest(self):
         slide = dict(self.catalog()[0])
@@ -1610,7 +1641,8 @@ class TQTransferTests(unittest.TestCase):
                 {
                     "accession_id": "NP25-100",
                     "pid": "AAAAAA",
-                    "num_slides": "1",
+                    "organ": "BRAIN",
+                    "filename": slide["destination_name"],
                 }
             ],
             captured["metadata"],

@@ -3702,7 +3702,7 @@ TQ_LOG_FIELDS = (
     "digitization_date",
     "status",
 )
-TQ_METADATA_FIELDS = ("accession_id", "pid", "num_slides")
+TQ_METADATA_FIELDS = ("accession_id", "organ", "pid", "filename")
 _tq_state_lock = threading.Lock()
 _tq_config_lock = threading.Lock()
 _tq_catalog_lock = threading.Lock()
@@ -3757,6 +3757,7 @@ class TQJob:
         self.all_slides = all_slides
         self.manifest_path = manifest_path
         self.metadata_path = metadata_path
+        self.metadata_included = False
         self.copath_path = copath_path
         self.include_copath = copath_path is not None
         self.missing_copath_accessions = tuple(missing_copath_accessions)
@@ -4545,31 +4546,27 @@ def _tq_write_metadata_csv(slides: List[Dict[str, str]]) -> Path:
         prefix="metadata-", suffix=".csv", dir=directory
     )
     path = Path(path_value)
-    accessions: Dict[str, Dict[str, Any]] = {}
+    rows = []
     try:
         for slide in slides:
-            accession = slide.get("accession", "").strip()
-            accession_identity = renaming.accession_key(accession)
-            pid = slide.get("pid", "").strip().upper()
-            if not accession or not pid:
+            row = {
+                "accession_id": slide.get("accession", "").strip(),
+                "organ": slide.get("organ", "").strip().upper(),
+                "pid": slide.get("pid", "").strip().upper(),
+                "filename": slide.get("destination_name", "").strip(),
+            }
+            if not all(row.values()):
                 raise TQError(
-                    "Transfer metadata requires an accession ID and PID for every slide."
+                    "Transfer metadata requires an accession ID, PID, organ, and "
+                    "filename for every slide."
                 )
-            summary = accessions.setdefault(
-                accession_identity,
-                {"accession_id": accession, "pid": pid, "num_slides": 0},
-            )
-            if summary["pid"] != pid:
-                raise TQError(
-                    f"Transfer metadata found multiple PIDs for accession {accession}."
-                )
-            summary["num_slides"] += 1
+            rows.append(row)
 
         with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as handle:
             descriptor = -1
             writer = csv.DictWriter(handle, fieldnames=TQ_METADATA_FIELDS)
             writer.writeheader()
-            writer.writerows(accessions[key] for key in sorted(accessions))
+            writer.writerows(rows)
             handle.flush()
             os.fsync(handle.fileno())
     except Exception:
@@ -4659,7 +4656,7 @@ def _tq_write_copath_csv(
 
 def _tq_write_manifest(
     slides: List[Dict[str, str]],
-    metadata_path: Path,
+    metadata_path: Optional[Path],
     copath_path: Optional[Path] = None,
 ) -> Path:
     directory = Path(Config.INSTANCE_DIR) / "tq_manifests"
@@ -4674,13 +4671,14 @@ def _tq_write_manifest(
                 fieldnames=("original_path", "destination_dir", "destination_name"),
             )
             writer.writeheader()
-            writer.writerow(
-                {
-                    "original_path": str(metadata_path),
-                    "destination_dir": slides[0]["staging_dir"],
-                    "destination_name": "metadata.csv",
-                }
-            )
+            if metadata_path is not None:
+                writer.writerow(
+                    {
+                        "original_path": str(metadata_path),
+                        "destination_dir": slides[0]["staging_dir"],
+                        "destination_name": "metadata.csv",
+                    }
+                )
             if copath_path is not None:
                 writer.writerow(
                     {
@@ -5060,8 +5058,9 @@ def _tq_upload_batch(job: TQJob, batch: TQBatch) -> None:
             f"Batch {batch.number}: Starting TQ upload for "
             f"{len(batch.slides)} slide(s).\n",
         )
+        metadata_path = None if job.metadata_included else job.metadata_path
         manifest_path = _tq_write_manifest(
-            batch.slides, job.metadata_path, job.copath_path
+            batch.slides, metadata_path, job.copath_path
         )
         job.manifest_path = manifest_path
         command = [
@@ -5072,6 +5071,8 @@ def _tq_upload_batch(job: TQJob, batch: TQBatch) -> None:
         ]
         job.tq_log_offsets = _tq_snapshot_pusher_logs()
         job.process = _tq_start_process(job, command)
+        if metadata_path is not None:
+            job.metadata_included = True
         _tq_stream_process_output(job, job.process)
         return_code = job.process.wait()
         _tq_read_pusher_results(job)

@@ -267,11 +267,11 @@ deidentification removes embedded label and macro images and uses the approved
 renamed filename. Without deidentification, InSlide copies each SVS byte-for-byte
 and uploads it under its original basename, retaining all embedded associated
 images. Staged files use unique transfer and batch subdirectories beneath
-`<IMAGE_STAGING_HOST>\<destination directory>`. Each batch manifest gives its
-staged slide paths and the same transfer-wide metadata CSV to TQ, uploading that
-CSV as `<destination directory>/metadata.csv` before the batch's slides. It contains
-`accession_id,pid,num_slides`, with one row per accession
-and the number of selected slides for that accession. The transfer review page
+`<IMAGE_STAGING_HOST>\<destination directory>`. The first batch that reaches
+upload includes the transfer-wide metadata CSV, uploaded as
+`<destination directory>/metadata.csv` before that batch's slides. Later batches
+do not upload it again. It contains `accession_id,organ,pid,filename`, with one
+row per selected slide. The transfer review page
 also offers an unchecked **Include CoPath data** option. When selected, the
 transfer uploads `<destination directory>/copath_data.csv` after `metadata.csv`
 and before the slides. It contains one full stored CoPath row per selected
