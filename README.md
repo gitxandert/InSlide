@@ -258,9 +258,11 @@ read-only permissions. The remaining paths are ordinary Windows bind mounts.
 
 Create and share `IMAGE_STAGING_HOST` (normally `D:\image_staging`) with Docker
 Desktop. InSlide splits each transfer into operator-sized batches (10 slides by
-default). One worker stages a complete batch while one worker deidentifies the
-previous staged batch and one worker uploads another ready batch. Batch objects
-move through FIFO queues; batch numbers are display-only.
+default). One worker stages batches while one worker deidentifies staged batches
+and one worker uploads ready batches. Each worker continues without waiting for
+slower downstream work, so every selected slide may be staged before earlier
+batches finish uploading. Batch objects move through FIFO queues; batch numbers
+are display-only.
 
 Deidentification is off unless the operator explicitly selects it. Selected
 deidentification removes embedded label and macro images and uses the approved

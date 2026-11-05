@@ -5142,8 +5142,8 @@ def _tq_finalize_pipeline(job: TQJob) -> None:
 
 def _run_tq_job(job: TQJob) -> None:
     global _tq_active_job_id
-    staged_batches: queue.Queue = queue.Queue(maxsize=1)
-    upload_batches: queue.Queue = queue.Queue(maxsize=1)
+    staged_batches: queue.Queue = queue.Queue()
+    upload_batches: queue.Queue = queue.Queue()
     finished = object()
 
     def stage() -> None:

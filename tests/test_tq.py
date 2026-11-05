@@ -1369,7 +1369,7 @@ class TQTransferTests(unittest.TestCase):
             )
 
     def test_pipeline_overlaps_stages_and_passes_same_batch_objects(self):
-        slides = [{"original_path": f"slide-{index}.svs"} for index in range(3)]
+        slides = [{"original_path": f"slide-{index}.svs"} for index in range(4)]
         batches = [
             app_module.TQBatch(index + 1, [slide])
             for index, slide in enumerate(slides)
@@ -1384,32 +1384,27 @@ class TQTransferTests(unittest.TestCase):
             batch_size=1,
             batches=batches,
         )
-        stage_two = app_module.threading.Event()
-        stage_three = app_module.threading.Event()
-        deidentified_two = app_module.threading.Event()
+        all_staged = app_module.threading.Event()
+        all_deidentified = app_module.threading.Event()
         overlap = {}
         seen = {"stage": [], "deidentify": [], "upload": []}
 
         def stage(_job, batch):
             seen["stage"].append(id(batch))
-            if batch.number == 2:
-                stage_two.set()
-            if batch.number == 3:
-                stage_three.set()
+            if batch.number == 4:
+                all_staged.set()
 
         def deidentify(_job, batch):
             seen["deidentify"].append(id(batch))
             if batch.number == 1:
-                overlap["deidentify_during_staging"] = stage_two.wait(1)
-            if batch.number == 2:
-                deidentified_two.set()
+                overlap["staging_runs_ahead"] = all_staged.wait(1)
+            if batch.number == 4:
+                all_deidentified.set()
 
         def upload(_job, batch):
             seen["upload"].append(id(batch))
             if batch.number == 1:
-                overlap["upload_during_other_stages"] = (
-                    deidentified_two.wait(1) and stage_three.wait(1)
-                )
+                overlap["deidentification_runs_ahead"] = all_deidentified.wait(1)
 
         with (
             mock.patch.object(app_module, "_tq_write_metadata_csv", return_value=self.root / "metadata.csv"),
@@ -1424,8 +1419,8 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(identities, seen["stage"])
         self.assertEqual(identities, seen["deidentify"])
         self.assertEqual(identities, seen["upload"])
-        self.assertTrue(overlap["deidentify_during_staging"])
-        self.assertTrue(overlap["upload_during_other_stages"])
+        self.assertTrue(overlap["staging_runs_ahead"])
+        self.assertTrue(overlap["deidentification_runs_ahead"])
 
     def test_failed_batch_does_not_stop_later_batch(self):
         slides = [{"original_path": f"slide-{index}.svs"} for index in range(2)]
