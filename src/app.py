@@ -6727,9 +6727,87 @@ _TQ_DATE_FILTERS = {
     "digitization_start",
     "digitization_end",
 }
+_TQ_MAX_ACCESSION_ENTRIES = 10_000
+_TQ_MAX_ACCESSION_LENGTH = 200
+_TQ_MAX_ACCESSION_TEXT_LENGTH = (
+    _TQ_MAX_ACCESSION_ENTRIES * (_TQ_MAX_ACCESSION_LENGTH + 2) + 1_000
+)
 
 
-def _tq_search_payload(payload: object) -> Tuple[Dict[str, object], Optional[List[str]]]:
+def _tq_accession_lines(value: object, *, skip_header: bool = False) -> List[str]:
+    if not isinstance(value, str):
+        raise ValueError("Invalid accession search.")
+    lines = value.removeprefix("\ufeff").splitlines()
+    if skip_header and lines:
+        lines = lines[1:]
+    accessions = [line.strip() for line in lines if line.strip()]
+    if any(len(accession) > _TQ_MAX_ACCESSION_LENGTH for accession in accessions):
+        raise ValueError("Accession IDs must not exceed 200 characters.")
+    return accessions
+
+
+def _tq_accession_search(
+    value: object,
+) -> Tuple[Optional[List[str]], Optional[List[str]]]:
+    if value is None:
+        return None, None
+    if not isinstance(value, dict) or set(value) - {"manual", "file"}:
+        raise ValueError("Invalid accession search.")
+
+    manual_text = value.get("manual", "")
+    if not isinstance(manual_text, str):
+        raise ValueError("Invalid accession search.")
+    raw_file = value.get("file")
+    filename = ""
+    file_text = ""
+    if raw_file is not None:
+        if not isinstance(raw_file, dict) or set(raw_file) != {"name", "text"}:
+            raise ValueError("Invalid accession file.")
+        filename = raw_file["name"]
+        file_text = raw_file["text"]
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or len(filename) > 255
+            or not isinstance(file_text, str)
+        ):
+            raise ValueError("Invalid accession file.")
+        if Path(filename).suffix.casefold() not in {".txt", ".csv"}:
+            raise ValueError("Accession file must be a .txt or .csv file.")
+    if len(manual_text) + len(file_text) > _TQ_MAX_ACCESSION_TEXT_LENGTH:
+        raise ValueError("Accession search is too large.")
+
+    manual_accessions = _tq_accession_lines(manual_text)
+    file_accessions = (
+        _tq_accession_lines(
+            file_text, skip_header=Path(filename).suffix.casefold() == ".csv"
+        )
+        if raw_file is not None
+        else None
+    )
+    entry_count = len(manual_accessions) + len(file_accessions or [])
+    if entry_count > _TQ_MAX_ACCESSION_ENTRIES:
+        raise ValueError("Accession search may contain at most 10,000 entries.")
+    if not manual_accessions and raw_file is None:
+        return None, None
+
+    accession_keys = list(
+        dict.fromkeys(
+            renaming.accession_key(accession)
+            for accession in manual_accessions + (file_accessions or [])
+        )
+    )
+    file_keys = (
+        [renaming.accession_key(accession) for accession in file_accessions]
+        if file_accessions is not None
+        else None
+    )
+    return accession_keys, file_keys
+
+
+def _tq_search_payload(
+    payload: object,
+) -> Tuple[Dict[str, object], Optional[List[str]], Optional[List[str]]]:
     if not isinstance(payload, dict):
         raise ValueError("Invalid search request.")
     if "selected_ids" in payload:
@@ -6743,7 +6821,7 @@ def _tq_search_payload(payload: object) -> Tuple[Dict[str, object], Optional[Lis
             )
         ):
             raise ValueError("Invalid slide selection.")
-        return {}, selected_ids
+        return {}, selected_ids, None
 
     raw_filters = payload.get("filters", {})
     if not isinstance(raw_filters, dict):
@@ -6810,7 +6888,17 @@ def _tq_search_payload(payload: object) -> Tuple[Dict[str, object], Optional[Lis
             text_groups.append(
                 {"operator": group_operator, "conditions": conditions}
             )
-    return {"exact": exact, "dates": dates, "text_groups": text_groups}, None
+    accession_keys, file_accession_keys = _tq_accession_search(
+        payload.get("accessions")
+    )
+    filters: Dict[str, object] = {
+        "exact": exact,
+        "dates": dates,
+        "text_groups": text_groups,
+    }
+    if accession_keys is not None:
+        filters["accession_keys"] = accession_keys
+    return filters, None, file_accession_keys
 
 
 @app.route("/tq/catalog/options", methods=["GET"])
@@ -6828,13 +6916,24 @@ def tq_catalog_options():
 def tq_catalog_search():
     """Return slides matching submitted filters or selected IDs."""
     try:
-        filters, selected_ids = _tq_search_payload(request.get_json(silent=True))
+        filters, selected_ids, file_accession_keys = _tq_search_payload(
+            request.get_json(silent=True)
+        )
     except ValueError as exc:
         return jsonify({"success": False, "message": str(exc)}), 400
     slides, warnings = _tq_stored_catalog(
         filters=filters, slide_ids=selected_ids
     )
-    response = jsonify({"slides": slides, "warnings": warnings})
+    payload = {"slides": slides, "warnings": warnings}
+    if file_accession_keys is not None:
+        found_keys = {
+            renaming.accession_key(slide["accession"]) for slide in slides
+        }
+        payload["file_accessions"] = {
+            "requested": len(file_accession_keys),
+            "found": sum(key in found_keys for key in file_accession_keys),
+        }
+    response = jsonify(payload)
     response.headers["Cache-Control"] = "no-store"
     return response
 

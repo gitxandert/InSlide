@@ -1395,6 +1395,18 @@ class BatchCatalog:
             parameters.extend(selected_ids)
 
         active_filters = filters or {}
+        requested_accession_keys = active_filters.get("accession_keys")
+        accession_keys = None
+        if requested_accession_keys is not None:
+            accession_keys = list(
+                dict.fromkeys(str(key) for key in requested_accession_keys)
+            )
+            if not accession_keys:
+                return []
+            conditions.append(
+                "s.accession_key IN "
+                "(SELECT accession_key FROM requested_transfer_accessions)"
+            )
         exact = active_filters.get("exact", {})
         if isinstance(exact, Mapping):
             for key, column in exact_columns.items():
@@ -1451,6 +1463,16 @@ class BatchCatalog:
             parameters.extend(text_parameters)
 
         with self.connection(instance_dir) as connection:
+            if accession_keys is not None:
+                connection.execute(
+                    "CREATE TEMP TABLE requested_transfer_accessions "
+                    "(accession_key TEXT PRIMARY KEY)"
+                )
+                connection.executemany(
+                    "INSERT INTO requested_transfer_accessions(accession_key) "
+                    "VALUES(?)",
+                    ((key,) for key in accession_keys),
+                )
             rows = connection.execute(
                 f"""
                 SELECT s.*, b.public_id AS batch_public_id,

@@ -202,12 +202,14 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(2, len(slides))
         return slides
 
-    def search(self, filters=None, selected_ids=None):
+    def search(self, filters=None, selected_ids=None, accessions=None):
         payload = (
             {"selected_ids": selected_ids}
             if selected_ids is not None
             else {"filters": filters or {}}
         )
+        if accessions is not None:
+            payload["accessions"] = accessions
         return self.client.post("/tq/catalog/search", json=payload)
 
     def write_copath_record(self, **values):
@@ -425,6 +427,11 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b'class="filter-row exact-filter-row"', response.data)
         self.assertIn(b'class="filter-row date-filter-row"', response.data)
         self.assertIn(b'id="text-filter-groups"', response.data)
+        self.assertIn(b'id="accession-ids"', response.data)
+        self.assertIn(b'id="accession-file" type="file" accept=".txt,.csv"', response.data)
+        self.assertIn(b'id="accession-file-summary"', response.data)
+        self.assertIn(b"text:await file.text()", response.data)
+        self.assertIn(b"Found ${data.file_accessions.found}/${data.file_accessions.requested}", response.data)
         self.assertIn(b'<button id="search-button" type="submit">', response.data)
         self.assertIn(b"All batches", response.data)
         self.assertIn(b"All types", response.data)
@@ -468,6 +475,99 @@ class TQTransferTests(unittest.TestCase):
 
         all_slides = self.search()
         self.assertEqual(2, len(all_slides.get_json()["slides"]))
+
+    def test_accession_file_search_parses_csv_and_reports_found_rows(self):
+        self.catalog()
+
+        response = self.search(
+            accessions={
+                "manual": "missing-manual\n",
+                "file": {
+                    "name": "cohort.CSV",
+                    "text": "\ufeffaccession_id\r\n np25-100 \r\nmissing-file\nNP25-100\n\n",
+                },
+            }
+        )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.get_json()
+        self.assertEqual(2, len(payload["slides"]))
+        self.assertEqual({"requested": 3, "found": 2}, payload["file_accessions"])
+        self.assertEqual([], payload["warnings"])
+
+    def test_accession_search_combines_with_existing_filters(self):
+        self.catalog()
+
+        response = self.search(
+            filters={
+                "text_groups": [
+                    {
+                        "operator": "",
+                        "conditions": [
+                            {
+                                "operator": "",
+                                "field": "section_count",
+                                "term": "002",
+                            }
+                        ],
+                    }
+                ]
+            },
+            accessions={
+                "manual": "missing",
+                "file": {"name": "cohort.txt", "text": "NP25-100\n"},
+            },
+        )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.get_json()
+        self.assertEqual(["002"], [slide["section_count"] for slide in payload["slides"]])
+        self.assertEqual({"requested": 1, "found": 1}, payload["file_accessions"])
+
+    def test_empty_accession_file_does_not_run_unfiltered_search(self):
+        self.catalog()
+
+        response = self.search(
+            accessions={
+                "manual": "",
+                "file": {"name": "cohort.csv", "text": "accession_id\n\n"},
+            }
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual([], response.get_json()["slides"])
+        self.assertEqual(
+            {"requested": 0, "found": 0},
+            response.get_json()["file_accessions"],
+        )
+
+    def test_accession_search_validates_file_and_entry_limits(self):
+        self.catalog()
+
+        wrong_type = self.search(
+            accessions={
+                "file": {"name": "cohort.xlsx", "text": "NP25-100"}
+            }
+        )
+        long_id = self.search(accessions={"manual": "x" * 201})
+        too_many = self.search(accessions={"manual": "x\n" * 10_001})
+
+        self.assertEqual(400, wrong_type.status_code)
+        self.assertIn(".txt or .csv", wrong_type.get_json()["message"])
+        self.assertEqual(400, long_id.status_code)
+        self.assertEqual(400, too_many.status_code)
+        self.assertIn("10,000", too_many.get_json()["message"])
+
+    def test_accession_search_supports_ten_thousand_entries(self):
+        self.catalog()
+        accessions = ["NP25-100"] + [
+            f"missing-{index}" for index in range(9_999)
+        ]
+
+        response = self.search(accessions={"manual": "\n".join(accessions)})
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, len(response.get_json()["slides"]))
 
     def test_catalog_search_rejects_invalid_filters(self):
         self.catalog()
