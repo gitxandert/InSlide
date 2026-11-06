@@ -1308,7 +1308,7 @@ class TQTransferTests(unittest.TestCase):
             copath_path.unlink(missing_ok=True)
             manifest_path.unlink(missing_ok=True)
 
-    def test_upload_includes_metadata_in_first_batch_only(self):
+    def test_upload_includes_transfer_csvs_in_first_batch_only(self):
         slides = [dict(slide) for slide in self.catalog()]
         for slide in slides:
             slide["staging_dir"] = "StudyA"
@@ -1323,6 +1323,7 @@ class TQTransferTests(unittest.TestCase):
             "metadata-once", self.user.id, None, slides, slides, batches=batches
         )
         job.metadata_path = self.root / "metadata.csv"
+        job.copath_path = self.root / "copath.csv"
         manifest_path = self.root / "manifest.csv"
 
         with (
@@ -1339,7 +1340,9 @@ class TQTransferTests(unittest.TestCase):
                 app_module._tq_upload_batch(job, batch)
 
         self.assertEqual(job.metadata_path, write_manifest.call_args_list[0].args[1])
+        self.assertEqual(job.copath_path, write_manifest.call_args_list[0].args[2])
         self.assertIsNone(write_manifest.call_args_list[1].args[1])
+        self.assertIsNone(write_manifest.call_args_list[1].args[2])
 
     def test_failed_upload_cleans_metadata_and_manifest(self):
         slide = dict(self.catalog()[0])

@@ -3759,6 +3759,7 @@ class TQJob:
         self.metadata_path = metadata_path
         self.metadata_included = False
         self.copath_path = copath_path
+        self.copath_included = False
         self.include_copath = copath_path is not None
         self.missing_copath_accessions = tuple(missing_copath_accessions)
         self.deidentify = deidentify
@@ -5059,8 +5060,9 @@ def _tq_upload_batch(job: TQJob, batch: TQBatch) -> None:
             f"{len(batch.slides)} slide(s).\n",
         )
         metadata_path = None if job.metadata_included else job.metadata_path
+        copath_path = None if job.copath_included else job.copath_path
         manifest_path = _tq_write_manifest(
-            batch.slides, metadata_path, job.copath_path
+            batch.slides, metadata_path, copath_path
         )
         job.manifest_path = manifest_path
         command = [
@@ -5073,6 +5075,8 @@ def _tq_upload_batch(job: TQJob, batch: TQBatch) -> None:
         job.process = _tq_start_process(job, command)
         if metadata_path is not None:
             job.metadata_included = True
+        if copath_path is not None:
+            job.copath_included = True
         _tq_stream_process_output(job, job.process)
         return_code = job.process.wait()
         _tq_read_pusher_results(job)

@@ -13,7 +13,6 @@ SCRIPT_PATH = (
     / "src" / "copath_utilities" / "query_keywords_dates.py"
 )
 sys.path.insert(0, str(SCRIPT_PATH.parent))
-sys.modules.setdefault("pyodbc", mock.Mock())
 SPEC = importlib.util.spec_from_file_location("query_keywords_dates", SCRIPT_PATH)
 query_keywords_dates = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(query_keywords_dates)
@@ -23,37 +22,24 @@ parse_keyword_expression = query_keywords_dates.parse_keyword_expression
 
 
 class QueryKeywordsDatesTests(unittest.TestCase):
-    def test_main_executes_generated_query_and_writes_csv(self):
-        connection = mock.Mock()
-        results = mock.Mock()
-        output_path = Path(tempfile.gettempdir()) / "keyword-results.csv"
-        args = SimpleNamespace(
-            keywords="idh",
-            after=None,
-            before=None,
-            search_in=None,
-            output_file=str(output_path),
-        )
+    def test_main_writes_generated_query_to_sql_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            requested_path = Path(temp_dir) / "keyword-results.csv"
+            output_path = requested_path.with_suffix(".sql")
+            args = SimpleNamespace(
+                keywords="idh",
+                after=None,
+                before=None,
+                search_in=None,
+                output_file=str(requested_path),
+            )
 
-        with mock.patch.object(
-            query_keywords_dates, "parse_args", return_value=args
-        ), mock.patch.object(
-            query_keywords_dates,
-            "prepared_connection_string",
-            return_value="connection-string",
-        ), mock.patch.object(
-            query_keywords_dates.pyodbc, "connect", return_value=connection
-        ) as connect, mock.patch.object(
-            query_keywords_dates.pd, "read_sql", return_value=results
-        ) as read_sql:
-            self.assertEqual(0, query_keywords_dates.main())
+            with mock.patch.object(
+                query_keywords_dates, "parse_args", return_value=args
+            ):
+                self.assertIsNone(query_keywords_dates.main())
 
-        connect.assert_called_once_with("connection-string")
-        query = read_sql.call_args.args[0]
-        self.assertIn("w.word IN (N'idh')", query)
-        read_sql.assert_called_once_with(query, connection)
-        connection.close.assert_called_once_with()
-        results.to_csv.assert_called_once_with(str(output_path), index=False)
+            self.assertIn("w.word IN (N'idh')", output_path.read_text())
 
     def test_keyword_query_uses_only_word_index_and_specimen_table(self):
         query = build_query("idh-wt", None, None, None)
