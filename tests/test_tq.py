@@ -891,7 +891,7 @@ class TQTransferTests(unittest.TestCase):
         self.assertTrue(start.call_args.kwargs["deidentify"])
         self.assertEqual(50, start.call_args.kwargs["batch_size"])
 
-    def test_resume_restarts_only_unfinished_batches_from_originals(self):
+    def test_resume_restarts_only_unfinished_batches_from_last_checkpoint(self):
         slides = [dict(slide) for slide in self.catalog()]
         successful = slides[0]
         failed = slides[1]
@@ -937,9 +937,9 @@ class TQTransferTests(unittest.TestCase):
             "transfer-1",
             "attempt-1",
             2,
-            "uploading",
+            "deidentifying",
             "failed",
-            "network",
+            "deidentification failed",
         )
         app_module.batch_catalog.finish_transfer_attempt(
             app_module.Config.INSTANCE_DIR,
@@ -986,7 +986,11 @@ class TQTransferTests(unittest.TestCase):
         self.assertTrue(start.call_args.kwargs["deidentify"])
         self.assertEqual(2, start.call_args.kwargs["batch_size"])
         self.assertEqual("transfer-1", start.call_args.kwargs["transfer_id"])
-        self.assertEqual([2], [batch.number for batch in start.call_args.kwargs["batches"]])
+        resumed_batch = start.call_args.kwargs["batches"][0]
+        self.assertEqual(2, resumed_batch.number)
+        self.assertTrue(resumed_batch.staged)
+        self.assertFalse(resumed_batch.ready)
+        self.assertEqual(("attempt-1",), resumed_batch.staging_ids)
         with self.client.session_transaction() as session:
             self.assertEqual("retry-job", session["tq_job_id"])
 
@@ -1524,6 +1528,50 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(identities, seen["upload"])
         self.assertTrue(overlap["staging_runs_ahead"])
         self.assertTrue(overlap["deidentification_runs_ahead"])
+
+    def test_resume_after_download_reuses_staged_files_for_deidentification(self):
+        slide = dict(self.catalog()[0])
+        slide["staging_dir"] = "StudyA"
+        initial_batch = app_module.TQBatch(1, [slide])
+        app_module._tq_prepare_job_batches("attempt-1", [initial_batch])
+        Path(slide["staged_path"]).parent.mkdir(parents=True)
+        Path(slide["staged_path"]).write_bytes(b"staged slide")
+
+        resumed_slide = dict(self.catalog()[0])
+        resumed_slide["staging_dir"] = "StudyA"
+        resumed_batch = app_module.TQBatch(
+            1,
+            [resumed_slide],
+            staged=True,
+            staging_ids=("attempt-1",),
+        )
+        app_module._tq_prepare_job_batches("attempt-2", [resumed_batch])
+        job = app_module.TQJob(
+            "attempt-2",
+            self.user.id,
+            None,
+            [resumed_slide],
+            [resumed_slide],
+            batches=[resumed_batch],
+        )
+
+        with (
+            mock.patch.object(
+                app_module,
+                "_tq_write_metadata_csv",
+                return_value=self.root / "metadata.csv",
+            ),
+            mock.patch.object(app_module, "_tq_download_slides") as download,
+            mock.patch.object(app_module, "_tq_deidentify_slides") as deidentify,
+            mock.patch.object(app_module, "_tq_upload_batch") as upload,
+            mock.patch.object(app_module, "_tq_finalize_pipeline"),
+        ):
+            app_module._run_tq_job(job)
+
+        self.assertEqual(slide["staged_path"], resumed_slide["staged_path"])
+        download.assert_not_called()
+        deidentify.assert_called_once_with(job, resumed_batch)
+        upload.assert_called_once_with(job, resumed_batch)
 
     def test_failed_batch_does_not_stop_later_batch(self):
         slides = [{"original_path": f"slide-{index}.svs"} for index in range(2)]

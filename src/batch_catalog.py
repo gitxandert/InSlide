@@ -1728,7 +1728,7 @@ class BatchCatalog:
                 raise ValueError("Another transfer is already running.")
             batches = connection.execute(
                 """
-                SELECT batch_number FROM transfer_job_batches
+                SELECT batch_number,stage FROM transfer_job_batches
                 WHERE transfer_id=? AND status<>'completed' ORDER BY batch_number
                 """,
                 (transfer_id,),
@@ -1758,7 +1758,7 @@ class BatchCatalog:
             placeholders = ",".join("?" for _ in batch_numbers)
             connection.execute(
                 f"""
-                UPDATE transfer_job_batches SET status='pending',stage='pending',
+                UPDATE transfer_job_batches SET status='pending',
                     started_at=NULL,completed_at=NULL,updated_at=?,last_error=''
                 WHERE transfer_id=? AND batch_number IN ({placeholders})
                 """,
@@ -1768,9 +1768,12 @@ class BatchCatalog:
                 """
                 INSERT INTO transfer_attempt_batches(
                     attempt_id,batch_number,status,stage,updated_at
-                ) VALUES(?,?,'pending','pending',?)
+                ) VALUES(?,?,'pending',?,?)
                 """,
-                [(attempt_id, number, now) for number in batch_numbers],
+                [
+                    (attempt_id, int(batch["batch_number"]), batch["stage"], now)
+                    for batch in batches
+                ],
             )
             connection.execute(
                 """

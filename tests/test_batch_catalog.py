@@ -167,6 +167,9 @@ class BatchCatalogTests(unittest.TestCase):
                 self.instance, "transfer-1", "attempt-2", "admin", "second.log"
             ),
         )
+        resumed = self.catalog.get_transfer(self.instance, "transfer-1")
+        self.assertEqual("uploading", resumed["batches"][1]["stage"])
+        self.assertEqual("uploading", resumed["attempts"][1]["batches"][0]["stage"])
         self.catalog.update_transfer_batch(
             self.instance, "transfer-1", "attempt-2", 2, "finished", "completed"
         )

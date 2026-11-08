@@ -38,10 +38,10 @@
             <td>{{ batch.batch_number }}</td><td>{{ batch.slides|length }}</td><td class="status">{{ batch.status }}</td><td>{{ batch.stage }}</td><td>{{ 'Yes' if batch.finished else 'No' }}</td><td>{{ batch.updated_at }}</td><td class="error">{{ batch.last_error }}</td>
         </tr>{% endfor %}</tbody></table>
         {% if transfer.status in ('failed','interrupted') and unfinished %}
-        <div class="warning"><strong>{{ unfinished|length }} unfinished batch(es) will restart from original slides.</strong> A slide uploaded before interruption but before its batch completed may upload again.</div>
+        <div class="warning"><strong>{{ unfinished|length }} unfinished batch(es) will resume from their last successful stage.</strong> A batch interrupted during upload restarts that upload, so a slide may upload again.</div>
         <form class="resume-form" method="POST" action="{{ url_for('tq_resume', transfer_id=transfer.transfer_id) }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <label><input type="checkbox" name="confirm_resume" value="1" required> I understand every unfinished batch restarts from its beginning.</label>
+            <label><input type="checkbox" name="confirm_resume" value="1" required> I understand an interrupted upload may upload a slide again.</label>
             <button type="submit">Resume unfinished batches</button>
         </form>
         {% endif %}

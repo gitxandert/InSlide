@@ -3725,6 +3725,8 @@ class TQBatch:
     slides: List[Dict[str, Any]]
     ready: bool = False
     staging_directory: Optional[Path] = None
+    staged: bool = False
+    staging_ids: Tuple[str, ...] = ()
 
 
 class TQJob:
@@ -3956,6 +3958,33 @@ def _tq_validate_destinations(slides: List[Dict[str, str]]) -> None:
 
 def _tq_prepare_job_batches(job_id: str, batches: List[TQBatch]) -> None:
     for batch in batches:
+        if batch.staged:
+            for staging_id in batch.staging_ids:
+                staging_directory = (
+                    f"{batch.slides[0]['staging_dir']}/transfer-{staging_id}/"
+                    f"batch-{batch.number:04d}"
+                )
+                batch.staging_directory = _tq_staging_root().joinpath(
+                    *staging_directory.split("/")
+                )
+                for index, slide in enumerate(batch.slides, start=1):
+                    slide["staging_batch_dir"] = staging_directory
+                    slide["staging_path_dir"] = (
+                        f"{staging_directory}/slide-{index:04d}"
+                    )
+                    _tq_prepare_staging_paths([slide])
+                if all(
+                    Path(slide["staged_path"]).is_file()
+                    for slide in batch.slides
+                ):
+                    break
+            else:
+                batch.staged = False
+                batch.ready = False
+
+            if batch.staged:
+                continue
+
         if batch.ready:
             try:
                 for slide in batch.slides:
@@ -5156,7 +5185,7 @@ def _run_tq_job(job: TQJob) -> None:
                 if job.cancel_requested.is_set():
                     break
                 try:
-                    if batch.ready:
+                    if batch.staged or batch.ready:
                         _tq_append_output(
                             job,
                             f"Batch {batch.number}: reusing staged slide(s).\n",
@@ -7142,13 +7171,30 @@ def _resume_tq_transfer(transfer: Dict[str, Any]):
         raise TQError("Only failed or interrupted transfers can be resumed.")
     if not unfinished:
         raise TQError("This transfer has no unfinished batches to resume.")
-    batches = [
-        TQBatch(
-            int(batch["batch_number"]),
-            [dict(slide) for slide in batch["slides"]],
+    batches = []
+    for batch in unfinished:
+        batch_number = int(batch["batch_number"])
+        staged = batch["stage"] in {"deidentifying", "ready", "uploading"}
+        staging_ids = [
+            attempt["attempt_id"]
+            for attempt in reversed(transfer["attempts"])
+            if any(
+                int(attempt_batch["batch_number"]) == batch_number
+                and attempt_batch["stage"] in {
+                    "deidentifying", "ready", "uploading"
+                }
+                for attempt_batch in attempt["batches"]
+            )
+        ]
+        batches.append(
+            TQBatch(
+                batch_number,
+                [dict(slide) for slide in batch["slides"]],
+                ready=batch["stage"] in {"ready", "uploading"},
+                staged=staged,
+                staging_ids=tuple(staging_ids) if staged else (),
+            )
         )
-        for batch in unfinished
-    ]
     slides = [slide for batch in batches for slide in batch.slides]
     all_slides = [
         dict(slide)
@@ -7225,7 +7271,7 @@ def tq_resume(transfer_id: str):
     if transfer is None:
         abort(404)
     if request.form.get("confirm_resume") != "1":
-        flash("Confirm that unfinished batches will restart from their original slides.", "error")
+        flash("Confirm that unfinished batches will resume from their last checkpoint.", "error")
         return redirect(url_for("tq_history_detail", transfer_id=transfer_id))
     try:
         job, batch_count, slide_count = _resume_tq_transfer(transfer)
