@@ -1,8 +1,12 @@
 import argparse
 from datetime import date, timedelta
-from pathlib import Path
 import re
 import sys
+
+import pandas as pd
+import pyodbc
+
+from copath_connection import prepared_connection_string
 
 
 DIAGNOSIS_TEXT_TYPES = [
@@ -79,8 +83,8 @@ ORDER BY s.accession_date DESC;
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Create a CoPath SQL query that finds indexed diagnosis words "
-            "and returns accession IDs and dates."
+            "Query CoPath for indexed diagnosis words and return accession "
+            "IDs and dates."
         )
     )
     parser.add_argument(
@@ -113,7 +117,7 @@ def parse_args():
     parser.add_argument(
         "-o",
         "--output_file",
-        help="Optional output SQL filename",
+        help="Output CSV filename (defaults to a name based on the filters)",
     )
     return parser.parse_args()
 
@@ -367,7 +371,7 @@ def default_output_filename(
         components.append(f"after_{after.isoformat()}")
     if before:
         components.append(f"before_{before.isoformat()}")
-    return "_".join(components) + "_query.sql"
+    return "_".join(components) + "_results.csv"
 
 
 def main():
@@ -381,19 +385,32 @@ def main():
         query = build_query(args.keywords, after, before, search_targets)
     except Exception as exc:
         print(exc)
-        sys.exit(1)
+        return 1
 
     output_file = args.output_file or default_output_filename(
         args.keywords,
         after,
         before,
     )
-    output_path = Path(output_file).with_suffix(".sql")
-    with output_path.open("w", encoding="utf-8") as handle:
-        handle.write(query)
+    try:
+        connection = pyodbc.connect(prepared_connection_string())
+        results = pd.read_sql(query, connection)
+    except Exception as exc:
+        print(f"Error connecting to database: {exc}")
+        return 1
+    finally:
+        if "connection" in locals():
+            connection.close()
 
-    print(f"Wrote SQL query to {output_path}")
+    try:
+        results.to_csv(output_file, index=False)
+    except Exception as exc:
+        print(f"Error writing results: {exc}")
+        return 1
+
+    print(f"CoPath keyword/date results exported to {output_file}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
