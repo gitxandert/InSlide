@@ -291,6 +291,17 @@ batches are excluded; unfinished batches resume after their last successful
 stage with the same deidentification choice and batch size. Missing staged files
 fall back to downloading the affected batch again.
 
+To repair output filename conflicts caused by rescanning slides on later dates,
+preview and then apply the catalog changes inside the running container:
+
+```bash
+docker compose exec inslide python resolve_output_filename_conflicts.py
+docker compose exec inslide python resolve_output_filename_conflicts.py --apply
+```
+
+The oldest scan keeps its filename. Later scans receive unused section numbers;
+the application exports updated `name_mapping.csv` files in the background.
+
 Transfer history is durable in `batch_catalog.sqlite3`. Open **Transfers →
 History** to inspect each batch's last checkpoint, completion state, errors, and
 attempt output. If InSlide stops during a transfer, startup marks its active
