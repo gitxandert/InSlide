@@ -25,6 +25,35 @@
 .sidebar-collapsed #sidebar-toggle { position: absolute; left: 48px; top: 14px; width: 22px; }
 .sidebar-collapsed.app-shell-page > header, .sidebar-collapsed.app-shell-page > .header { margin-left: var(--app-sidebar-collapsed); }
 .sidebar-collapsed.app-shell-page > main, .sidebar-collapsed.app-shell-page > .container { margin-left: calc(var(--app-sidebar-collapsed) + 24px); }
+.sheet-scroll {
+    position: relative;
+    max-width: 100%;
+    max-height: min(70vh, 720px);
+    overflow: auto !important;
+    scrollbar-gutter: stable;
+}
+.sheet-scroll table { min-width: 100%; }
+.sheet-scroll table[data-resizable-sheet="true"] td { overflow: hidden; text-overflow: ellipsis; }
+.sheet-scroll th { position: sticky; top: 0; z-index: 3; }
+.sheet-scroll .column-search-row th { top: 38px; }
+.sheet-column-resizer {
+    all: unset;
+    position: absolute;
+    inset: 0 -4px 0 auto;
+    z-index: 5;
+    width: 9px;
+    cursor: col-resize;
+    touch-action: none;
+}
+.sheet-column-resizer::after {
+    content: "";
+    position: absolute;
+    inset: 20% 4px;
+    border-left: 1px solid rgba(70, 90, 110, .45);
+}
+.sheet-column-resizer:hover::after,
+.sheet-column-resizer:focus-visible::after { border-left: 2px solid #007bff; }
+body.sheet-resizing { cursor: col-resize; user-select: none; }
 @media (max-width: 700px) {
     .app-sidebar { width: var(--app-sidebar-collapsed); }
     .app-sidebar .nav-label { display: none; }

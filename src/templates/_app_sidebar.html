@@ -39,6 +39,84 @@
         toggle.textContent = next ? '›' : '‹';
     });
 
+    function enhanceSheet(table) {
+        const headers = Array.from(table.querySelectorAll('thead tr:first-child > th'));
+        if (!headers.length || table.dataset.resizableSheet === 'true') return;
+        table.dataset.resizableSheet = 'true';
+        let wrapper = table.parentElement;
+        if (!wrapper.matches('.table-wrapper, .table-card')) {
+            wrapper = document.createElement('div');
+            table.before(wrapper);
+            wrapper.appendChild(table);
+        }
+        wrapper.classList.add('sheet-scroll');
+
+        let colgroup = table.querySelector(':scope > colgroup');
+        if (!colgroup) {
+            colgroup = document.createElement('colgroup');
+            table.prepend(colgroup);
+        }
+        while (colgroup.children.length < headers.length) {
+            colgroup.appendChild(document.createElement('col'));
+        }
+        const columns = Array.from(colgroup.children).slice(0, headers.length);
+        let widths = null;
+        const setWidth = (index, width) => {
+            widths[index] = Math.max(72, width);
+            columns[index].style.width = `${widths[index]}px`;
+            table.style.width = `${widths.reduce((total, value) => total + value, 0)}px`;
+        };
+        const initializeWidths = () => {
+            if (widths) return;
+            widths = headers.map(header => header.getBoundingClientRect().width);
+            table.style.tableLayout = 'fixed';
+            widths.forEach((width, index) => { columns[index].style.width = `${width}px`; });
+            table.style.width = `${widths.reduce((total, value) => total + value, 0)}px`;
+        };
+
+        headers.forEach((header, index) => {
+            const handle = document.createElement('button');
+            const label = header.textContent.trim() || `Column ${index + 1}`;
+            handle.type = 'button';
+            handle.className = 'sheet-column-resizer';
+            handle.setAttribute('aria-label', `Resize ${label} column`);
+            handle.addEventListener('pointerdown', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                initializeWidths();
+                const startX = event.clientX;
+                const startWidth = widths[index];
+                handle.setPointerCapture(event.pointerId);
+                document.body.classList.add('sheet-resizing');
+                const move = moveEvent => setWidth(index, startWidth + moveEvent.clientX - startX);
+                const finish = () => {
+                    document.body.classList.remove('sheet-resizing');
+                    handle.removeEventListener('pointermove', move);
+                    handle.removeEventListener('pointerup', finish);
+                    handle.removeEventListener('pointercancel', finish);
+                };
+                handle.addEventListener('pointermove', move);
+                handle.addEventListener('pointerup', finish);
+                handle.addEventListener('pointercancel', finish);
+            });
+            handle.addEventListener('keydown', event => {
+                if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+                event.preventDefault();
+                initializeWidths();
+                setWidth(index, widths[index] + (event.key === 'ArrowRight' ? 16 : -16));
+            });
+            header.appendChild(handle);
+        });
+        wrapper.addEventListener('pointerover', event => {
+            const cell = event.target.closest('td');
+            if (cell && !cell.title) cell.title = cell.textContent.trim();
+        });
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+        document.querySelectorAll('table').forEach(enhanceSheet);
+    });
+
     let lastActivity = Date.now();
     const markActive = () => { lastActivity = Date.now(); };
     ['keydown', 'pointermove', 'pointerdown', 'touchstart', 'scroll'].forEach(eventName =>

@@ -71,6 +71,8 @@ class TQTransferTests(unittest.TestCase):
                 "BlockNumber",
                 "ParsingQCPassed",
                 "original_slide_path",
+                "label_path",
+                "macro_path",
             ],
             [
                 {
@@ -78,17 +80,23 @@ class TQTransferTests(unittest.TestCase):
                     "Stain": "HE",
                     "BlockNumber": "B4",
                     "ParsingQCPassed": "TRUE",
-                    "original_slide_path": "one.svs",
+                    "original_slide_path": r"D:\scanner\misc\one.svs",
+                    "label_path": "label/one.png",
+                    "macro_path": "macro/one.png",
                 },
                 {
                     "AccessionID": "NP25-100",
                     "Stain": "HE",
                     "BlockNumber": "B4",
                     "ParsingQCPassed": "TRUE",
-                    "original_slide_path": "two.svs",
+                    "original_slide_path": r"D:\scanner\misc\two.svs",
+                    "label_path": "label/two.png",
+                    "macro_path": "macro/two.png",
                 },
             ],
         )
+        (self.batch / "label" / "one.png").write_bytes(b"label image")
+        (self.batch / "macro" / "one.png").write_bytes(b"macro image")
         write_csv(
             self.batch / "completed_stages.csv",
             ["QC", "Renamed"],
@@ -266,6 +274,41 @@ class TQTransferTests(unittest.TestCase):
         )
         with self.assertRaises(app_module.TQError):
             app_module._tq_destination_dir("../outside", slides[0])
+
+    def test_search_returns_image_links_without_loading_copath_data(self):
+        self.catalog()
+
+        with mock.patch.object(
+            app_module.batch_catalog, "accession_history"
+        ) as accession_history:
+            response = self.search()
+
+        slide = response.get_json()["slides"][0]
+        accession_history.assert_not_called()
+        self.assertEqual("SS12797", slide["scanner_name"])
+        self.assertEqual("2026-07-20", slide["batch_label"])
+        self.assertNotIn("copath_data", slide)
+        for key in ("label_image_url", "macro_image_url"):
+            image = self.client.get(slide[key])
+            self.assertEqual(200, image.status_code)
+            image.close()
+
+    def test_search_omits_unsafe_or_mismatched_image_paths(self):
+        slides = self.catalog()
+        app_module.batch_catalog.update_document_rows(
+            app_module.Config.INSTANCE_DIR,
+            slides[0]["batch_id"],
+            "enriched",
+            {
+                0: {"label_path": "../secret.png"},
+                1: {"original_slide_path": "other.svs"},
+            },
+        )
+
+        response_slides = self.search().get_json()["slides"]
+
+        self.assertEqual("", response_slides[0]["label_image_url"])
+        self.assertEqual("", response_slides[1]["macro_image_url"])
 
     def test_catalog_includes_untyped_accessions_as_none(self):
         workbook = load_workbook(self.sdl_path)
@@ -660,7 +703,8 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(7000, len(catalog.get_json()["slides"]))
         self.assertNotIn(b'class="slide-checkbox"', page.data)
         self.assertIn(b"const overscan = 8", page.data)
-        self.assertIn(b"filteredSlides.length * rowHeight", page.data)
+        self.assertIn(b"displayRows.length * rowHeight", page.data)
+        self.assertIn(b"expandedGroups.clear()", page.data)
 
     def test_draft_accepts_selection_larger_than_rendered_viewport(self):
         prototype = self.catalog()[0]

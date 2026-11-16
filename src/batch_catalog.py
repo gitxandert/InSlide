@@ -1476,12 +1476,18 @@ class BatchCatalog:
             rows = connection.execute(
                 f"""
                 SELECT s.*, b.public_id AS batch_public_id,
+                       b.scanner_name AS scanner_name,
+                       b.batch_name AS batch_label,
                        b.scanner_name || '/' || b.batch_name AS batch_name,
+                       e.data_json AS enriched_json,
                        GROUP_CONCAT(t.slide_type, char(31)) AS sdl_types
                 FROM transfer_slides s
                 JOIN batches b ON b.id=s.batch_id
                 JOIN transfer_sources source
                   ON source.batch_id=b.id AND source.source_kind='mapping'
+                LEFT JOIN batch_document_rows e
+                  ON e.batch_id=b.id AND e.kind='enriched'
+                 AND e.row_index=s.source_row
                 LEFT JOIN transfer_slide_types t ON t.slide_id=s.slide_id
                 WHERE {' AND '.join(f'({item})' for item in conditions)}
                 GROUP BY s.slide_id
@@ -1492,6 +1498,23 @@ class BatchCatalog:
         result = []
         for raw in rows:
             row = dict(raw)
+            enriched = (
+                json.loads(row.pop("enriched_json"))
+                if row.get("enriched_json")
+                else {}
+            )
+            same_slide = (
+                str(enriched.get("original_slide_path", ""))
+                .replace("\\", "/")
+                .casefold()
+                == str(row["raw_original_path"]).replace("\\", "/").casefold()
+            )
+            row["label_path"] = (
+                str(enriched.get("label_path", "")) if same_slide else ""
+            )
+            row["macro_path"] = (
+                str(enriched.get("macro_path", "")) if same_slide else ""
+            )
             row["id"] = row.pop("slide_id")
             row["batch_id"] = row.pop("batch_public_id")
             row["sdl_types"] = (row.get("sdl_types") or "NONE").split(chr(31))

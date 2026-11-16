@@ -58,20 +58,33 @@
         .messages .error,.notice.error { border-color:#f1aeb5; background:#f8d7da; }
         .messages .success { border-color:#a3cfbb; background:#d1e7dd; }
         .muted { color:var(--muted); }
-        .table-wrap { margin-top:14px; overflow-x:auto; border:1px solid var(--border); border-radius:8px; }
-        .virtual-table { min-width:2150px; }
-        .grid-row { display:grid; grid-template-columns:44px 210px 170px 130px 170px 120px 100px 120px 130px 100px 100px 125px 95px 95px 340px; align-items:center; }
-        .table-header { height:44px; background:#eef2f6; border-bottom:1px solid var(--border); font-size:.78rem; font-weight:700; }
-        .table-header button { padding:0; color:var(--text); background:transparent; text-align:left; font-size:inherit; }
-        .table-header button::after { content:" ↕"; color:var(--muted); }
-        .table-header button[data-direction="asc"]::after { content:" ↑"; color:var(--primary); }
-        .table-header button[data-direction="desc"]::after { content:" ↓"; color:var(--primary); }
+        .table-wrap { height:min(62vh,650px); min-height:320px; margin-top:14px; overflow:auto; scrollbar-gutter:stable; border:1px solid var(--border); border-radius:8px; background:white; }
+        .virtual-table { --grid-columns:44px 210px 150px 170px 140px 170px 120px 100px 120px 130px 100px 100px 125px 95px 95px 340px 90px 90px; min-width:2389px; }
+        .grid-row { display:grid; grid-template-columns:var(--grid-columns); align-items:center; }
+        .table-header { position:sticky; top:0; z-index:6; height:44px; background:#eef2f6; border-bottom:1px solid var(--border); font-size:.78rem; font-weight:700; }
+        .table-header .grid-cell { position:relative; display:flex; align-items:center; height:100%; }
+        .sort-button { padding:0; color:var(--text); background:transparent; text-align:left; font-size:inherit; }
+        .sort-button::after { content:" ↕"; color:var(--muted); }
+        .sort-button[data-direction="asc"]::after { content:" ↑"; color:var(--primary); }
+        .sort-button[data-direction="desc"]::after { content:" ↓"; color:var(--primary); }
+        .grid-resizer { all:unset; position:absolute; inset:0 -4px 0 auto; z-index:7; width:9px; cursor:col-resize; touch-action:none; }
+        .grid-resizer::after { content:""; position:absolute; inset:20% 4px; border-left:1px solid rgba(70,90,110,.45); }
+        .grid-resizer:hover::after,.grid-resizer:focus-visible::after { border-left:2px solid var(--primary); }
         .grid-cell { min-width:0; padding:8px 10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .grid-cell input { width:auto; }
-        .virtual-scroll { height:min(62vh,650px); min-height:320px; overflow-y:auto; background:white; }
-        .virtual-spacer { position:relative; }
+        .virtual-spacer { position:relative; min-height:275px; }
         .data-row { position:absolute; left:0; right:0; height:var(--row-height); border-bottom:1px solid var(--border); }
         .data-row:hover { background:#f5f9ff; }
+        .group-row { background:#f7f9fc; }
+        .group-row.batch { background:#fafbfd; }
+        .group-row.accession { background:white; }
+        .group-cell { grid-column:1 / -1; display:flex; align-items:center; gap:12px; height:100%; padding:8px 12px; overflow:hidden; }
+        .group-toggle { display:flex; align-items:center; min-width:0; padding:5px 8px; color:var(--text); background:transparent; text-align:left; }
+        .group-row.batch .group-toggle { margin-left:24px; }
+        .group-row.accession .group-toggle { margin-left:48px; }
+        .group-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .group-count { color:var(--muted); font-weight:400; }
+        .copath-link,.image-link { color:var(--primary-dark); font-weight:700; }
         .path-cell { font:12px ui-monospace,Consolas,monospace; color:var(--muted); }
         .loading { padding:40px; text-align:center; color:var(--muted); }
         .status { padding:5px 10px; border-radius:999px; background:#e8eef5; font-size:.78rem; font-weight:700; text-transform:uppercase; }
@@ -195,22 +208,26 @@
 
     <section class="card" id="catalog-card">
         <div id="catalog-error" class="notice error" hidden></div>
-        <div class="table-wrap">
-            <div class="virtual-table">
+        <div id="virtual-scroll" class="table-wrap" tabindex="0" aria-label="Transfer search results">
+            <div id="virtual-table" class="virtual-table">
                 <div class="grid-row table-header">
                     <div class="grid-cell">{% if not review %}<input id="select-filtered" type="checkbox" aria-label="Select all filtered slides">{% endif %}</div>
-                    {% for key, label in (
-                        ('destination_name','Destination name'),('batch_name','Batch'),('accession','Accession'),
-                        ('sdl_types','Type'),('organ','Organ'),('pid','PID'),('accession_date','Accession date'),
-                        ('digitization_date','Digitization date'),('stain','Stain'),('image_type','Image type'),
-                        ('samp_acq_type','Sample type'),('block_number','Block'),('section_count','Sections'),
-                        ('original_path','Original path')) %}
-                    <div class="grid-cell"><button type="button" data-sort="{{ key }}">{{ label }}</button></div>
+                    {% for key, label, sortable in (
+                        ('destination_name','Destination name',True),('scanner_name','Scanner',False),
+                        ('batch_label','Batch',False),('accession','Accession',False),
+                        ('sdl_types','Type',True),('organ','Organ',True),('pid','PID',True),
+                        ('accession_date','Accession date',True),('digitization_date','Digitization date',True),
+                        ('stain','Stain',True),('image_type','Image type',True),
+                        ('samp_acq_type','Sample type',True),('block_number','Block',True),
+                        ('section_count','Sections',True),('original_path','Original path',True),
+                        ('label_image_url','Label',False),('macro_image_url','Macro',False)) %}
+                    <div class="grid-cell">
+                        {% if sortable %}<button class="sort-button" type="button" data-sort="{{ key }}">{{ label }}</button>{% else %}<span>{{ label }}</span>{% endif %}
+                        <button class="grid-resizer" type="button" data-resize-column="{{ loop.index }}" aria-label="Resize {{ label }} column"></button>
+                    </div>
                     {% endfor %}
                 </div>
-                <div id="virtual-scroll" class="virtual-scroll" tabindex="0">
-                    <div id="virtual-spacer" class="virtual-spacer"><div class="loading">Choose filters, then Search.</div></div>
-                </div>
+                <div id="virtual-spacer" class="virtual-spacer"><div class="loading">Choose filters, then Search.</div></div>
             </div>
         </div>
     </section>
@@ -242,17 +259,24 @@ const draftSelectedIds = new Set({{ selected_ids|list|tojson }});
 const catalogOptionsUrl = {{ url_for('tq_catalog_options')|tojson }};
 const catalogSearchUrl = {{ url_for('tq_catalog_search')|tojson }};
 const draftUrl = {{ url_for('tq_save_draft')|tojson }};
+const accessionHistoryUrl = {{ url_for('sdl_accession_history', accession='__ACCESSION__')|tojson }};
 const rowHeight = 58;
+const headerHeight = 44;
 const overscan = 8;
 let allSlides = [];
 let filteredSlides = [];
-let sortKey = '';
+let hierarchy = [];
+let displayRows = [];
+let sortKey = 'destination_name';
 let sortDirection = 'asc';
+const expandedGroups = new Set();
+const naturalCollator = new Intl.Collator(undefined,{numeric:true,sensitivity:'base'});
 let draftTimer;
 let searchRequest;
 let hasSearched = false;
 let filtersChanged = false;
 const scrollElement = document.getElementById('virtual-scroll');
+const virtualTable = document.getElementById('virtual-table');
 const spacerElement = document.getElementById('virtual-spacer');
 const resultCount = document.getElementById('result-count');
 const textFilterGroups = document.getElementById('text-filter-groups');
@@ -350,42 +374,122 @@ function filterPayload() {
         digitization_end:document.getElementById('digitization-end')?.value || ''
     },text_groups:textFilterPayload()};
 }
-function sortSlides() {
-    if (!sortKey) return;
+function groupKey(level,...parts) { return `${level}:${parts.map(normalized).join('\u001f')}`; }
+function groupValue(map,key,label) {
+    if (!map.has(key)) map.set(key,{label,children:new Map(),slides:[]});
+    return map.get(key);
+}
+function compareSlides(left,right) {
     const direction = sortDirection === 'asc' ? 1 : -1;
-    filteredSlides.sort((left,right) => {
-        const comparison = normalized(displayValue(left,sortKey)).localeCompare(normalized(displayValue(right,sortKey)),undefined,{numeric:true});
-        return comparison ? comparison * direction : left.id.localeCompare(right.id) * direction;
+    const comparison = naturalCollator.compare(displayValue(left,sortKey),displayValue(right,sortKey));
+    if (comparison) return comparison * direction;
+    const destination = naturalCollator.compare(left.destination_name || '',right.destination_name || '');
+    return destination || left.id.localeCompare(right.id);
+}
+function rebuildDisplayRows() {
+    displayRows = [];
+    hierarchy.forEach((scanner) => {
+        const scannerKey = groupKey('scanner',scanner.label);
+        displayRows.push({kind:'group',level:'scanner',key:scannerKey,label:scanner.label,count:scanner.count});
+        if (!expandedGroups.has(scannerKey)) return;
+        scanner.batches.forEach((batch) => {
+            const batchKey = groupKey('batch',scanner.label,batch.label);
+            displayRows.push({kind:'group',level:'batch',key:batchKey,label:batch.label,count:batch.count});
+            if (!expandedGroups.has(batchKey)) return;
+            batch.accessions.forEach((accession) => {
+                const accessionKey = groupKey('accession',scanner.label,batch.label,accession.label);
+                displayRows.push({kind:'group',level:'accession',key:accessionKey,label:accession.label,count:accession.slides.length});
+                if (expandedGroups.has(accessionKey)) {
+                    accession.slides.forEach((slide) => displayRows.push({kind:'slide',slide}));
+                }
+            });
+        });
     });
+}
+function buildHierarchy() {
+    const scanners = new Map();
+    filteredSlides.forEach((slide) => {
+        const scannerLabel = slide.scanner_name || String(slide.batch_name || '').split('/')[0] || 'Unknown scanner';
+        const batchLabel = slide.batch_label || String(slide.batch_name || '').split('/').slice(1).join('/') || 'Unknown batch';
+        const scanner = groupValue(scanners,normalized(scannerLabel),scannerLabel);
+        const batch = groupValue(scanner.children,normalized(batchLabel),batchLabel);
+        const accession = groupValue(batch.children,normalized(slide.accession),slide.accession || 'Unknown accession');
+        accession.slides.push(slide);
+    });
+    hierarchy = Array.from(scanners.values()).sort((left,right) => naturalCollator.compare(left.label,right.label));
+    hierarchy.forEach((scanner) => {
+        scanner.batches = Array.from(scanner.children.values()).sort((left,right) => naturalCollator.compare(left.label,right.label));
+        scanner.count = 0;
+        scanner.batches.forEach((batch) => {
+            batch.accessions = Array.from(batch.children.values()).sort((left,right) => naturalCollator.compare(left.label,right.label));
+            batch.count = 0;
+            batch.accessions.forEach((accession) => {
+                accession.slides.sort(compareSlides);
+                batch.count += accession.slides.length;
+            });
+            scanner.count += batch.count;
+        });
+    });
+    rebuildDisplayRows();
 }
 function makeCell(value,className='') {
     const cell = document.createElement('div'); cell.className = `grid-cell ${className}`; cell.textContent = value || '—'; cell.title = String(value ?? ''); return cell;
 }
+function makeLinkCell(url,label) {
+    const cell = document.createElement('div'); cell.className = 'grid-cell';
+    if (!url) { cell.textContent = '—'; return cell; }
+    const link = document.createElement('a'); link.className = 'image-link'; link.href = url; link.target = '_blank'; link.rel = 'noopener'; link.textContent = label; link.title = `Open ${label.toLocaleLowerCase()} image`; cell.appendChild(link); return cell;
+}
+function renderGroup(item,index) {
+    const row = document.createElement('div'); row.className = `grid-row data-row group-row ${item.level}`; row.style.transform = `translateY(${index * rowHeight}px)`;
+    const cell = document.createElement('div'); cell.className = 'group-cell';
+    const toggle = document.createElement('button'); toggle.type = 'button'; toggle.className = 'group-toggle';
+    const expanded = expandedGroups.has(item.key); toggle.setAttribute('aria-expanded',String(expanded));
+    toggle.setAttribute('aria-label',`${expanded ? 'Collapse' : 'Expand'} ${item.level} ${item.label}`);
+    const marker = document.createElement('span'); marker.textContent = expanded ? '▾ ' : '▸ ';
+    const label = document.createElement('strong'); label.className = 'group-label'; label.textContent = `${item.level[0].toUpperCase()}${item.level.slice(1)}: ${item.label}`;
+    const count = document.createElement('span'); count.className = 'group-count'; count.textContent = `${item.count} slide(s)`;
+    toggle.append(marker,label); cell.append(toggle,count);
+    if (item.level === 'accession') {
+        const link = document.createElement('a'); link.className = 'copath-link';
+        const encoded = item.label.split('/').map(encodeURIComponent).join('/');
+        link.href = accessionHistoryUrl.replace('__ACCESSION__',encoded); link.target = '_blank'; link.rel = 'noopener'; link.textContent = 'CoPath / history'; cell.appendChild(link);
+    }
+    toggle.addEventListener('click',() => {
+        if (expanded) expandedGroups.delete(item.key); else expandedGroups.add(item.key);
+        rebuildDisplayRows(); renderRows();
+    });
+    row.appendChild(cell); return row;
+}
+function renderSlide(slide,index) {
+    const row = document.createElement('div'); row.className = 'grid-row data-row'; row.style.transform = `translateY(${index * rowHeight}px)`;
+    const selection = document.createElement('div'); selection.className = 'grid-cell';
+    if (!reviewMode) {
+        const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = 'slide-checkbox'; checkbox.value = slide.id; checkbox.checked = draftSelectedIds.has(slide.id); checkbox.setAttribute('aria-label',`Select ${slide.destination_name}`);
+        checkbox.addEventListener('change',() => { if (checkbox.checked) draftSelectedIds.add(slide.id); else draftSelectedIds.delete(slide.id); updateCounts(); scheduleDraftSave(); }); selection.appendChild(checkbox);
+    }
+    row.append(
+        selection, makeCell(slide.destination_name), makeCell(slide.scanner_name), makeCell(slide.batch_label), makeCell(slide.accession),
+        makeCell(displayValue(slide,'sdl_types')), makeCell(slide.organ), makeCell(slide.pid), makeCell(displayValue(slide,'accession_date')),
+        makeCell(slide.digitization_date || 'Unknown'), makeCell(slide.stain), makeCell(slide.image_type), makeCell(slide.samp_acq_type),
+        makeCell(slide.block_number), makeCell(slide.section_count), makeCell(slide.original_path,'path-cell'),
+        makeLinkCell(slide.label_image_url,'Label'), makeLinkCell(slide.macro_image_url,'Macro')
+    );
+    return row;
+}
 function renderRows() {
-    spacerElement.replaceChildren(); spacerElement.style.height = `${filteredSlides.length * rowHeight}px`;
+    spacerElement.replaceChildren(); spacerElement.style.height = `${displayRows.length * rowHeight}px`;
     if (!filteredSlides.length) {
+        spacerElement.style.height = '';
         const empty = document.createElement('div'); empty.className = 'loading';
         empty.textContent = !hasSearched ? 'Choose filters, then Search.' : (reviewMode ? 'No selected slides remain available.' : 'No slides match current filters.');
         spacerElement.appendChild(empty); return;
     }
-    const first = Math.max(0,Math.floor(scrollElement.scrollTop / rowHeight) - overscan);
+    const first = Math.max(0,Math.floor(Math.max(0,scrollElement.scrollTop - headerHeight) / rowHeight) - overscan);
     const visibleCount = Math.ceil(scrollElement.clientHeight / rowHeight) + overscan * 2;
-    const last = Math.min(filteredSlides.length,first + visibleCount);
+    const last = Math.min(displayRows.length,first + visibleCount);
     for (let index = first; index < last; index += 1) {
-        const slide = filteredSlides[index]; const row = document.createElement('div'); row.className = 'grid-row data-row'; row.style.transform = `translateY(${index * rowHeight}px)`;
-        const selection = document.createElement('div'); selection.className = 'grid-cell';
-        if (!reviewMode) {
-            const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = 'slide-checkbox'; checkbox.value = slide.id; checkbox.checked = draftSelectedIds.has(slide.id); checkbox.setAttribute('aria-label',`Select ${slide.destination_name}`);
-            checkbox.addEventListener('change',() => { if (checkbox.checked) draftSelectedIds.add(slide.id); else draftSelectedIds.delete(slide.id); updateCounts(); scheduleDraftSave(); }); selection.appendChild(checkbox);
-        }
-        row.append(selection);
-        row.append(
-            makeCell(slide.destination_name), makeCell(slide.batch_name), makeCell(slide.accession), makeCell(displayValue(slide,'sdl_types')),
-            makeCell(slide.organ), makeCell(slide.pid), makeCell(displayValue(slide,'accession_date')), makeCell(slide.digitization_date || 'Unknown'),
-            makeCell(slide.stain), makeCell(slide.image_type), makeCell(slide.samp_acq_type), makeCell(slide.block_number),
-            makeCell(slide.section_count), makeCell(slide.original_path,'path-cell')
-        );
-        spacerElement.appendChild(row);
+        const item = displayRows[index]; spacerElement.appendChild(item.kind === 'group' ? renderGroup(item,index) : renderSlide(item.slide,index));
     }
 }
 function updateCounts() {
@@ -437,7 +541,7 @@ async function loadSlides(payload,fileName='') {
             if (removed) scheduleDraftSave('review');
         }
         if (fileName && data.file_accessions && accessionFileSummary) accessionFileSummary.textContent = `Found ${data.file_accessions.found}/${data.file_accessions.requested} accession IDs in ${fileName}`;
-        sortSlides(); scrollElement.scrollTop = 0; renderRows(); updateCounts(); showWarnings(data.warnings);
+        expandedGroups.clear(); buildHierarchy(); scrollElement.scrollTop = 0; renderRows(); updateCounts(); showWarnings(data.warnings);
     } catch (error) {
         if (error.name !== 'AbortError') { showCatalogError(error); if (!hasSearched) resultCount.textContent = 'Search failed.'; }
     } finally {
@@ -445,7 +549,38 @@ async function loadSlides(payload,fileName='') {
     }
 }
 
-scrollElement.addEventListener('scroll',renderRows,{passive:true});
+const gridColumnWidths = [44,210,150,170,140,170,120,100,120,130,100,100,125,95,95,340,90,90];
+function applyGridWidths() {
+    virtualTable.style.setProperty('--grid-columns',gridColumnWidths.map((width) => `${width}px`).join(' '));
+    const width = gridColumnWidths.reduce((total,value) => total + value,0);
+    virtualTable.style.width = `${width}px`; virtualTable.style.minWidth = `${width}px`;
+}
+document.querySelectorAll('[data-resize-column]').forEach((handle) => {
+    const index = Number.parseInt(handle.dataset.resizeColumn,10);
+    const setWidth = (width) => { gridColumnWidths[index] = Math.max(72,width); applyGridWidths(); };
+    handle.addEventListener('pointerdown',(event) => {
+        event.preventDefault(); event.stopPropagation();
+        const startX = event.clientX; const startWidth = gridColumnWidths[index];
+        handle.setPointerCapture(event.pointerId); document.body.classList.add('sheet-resizing');
+        const move = (moveEvent) => setWidth(startWidth + moveEvent.clientX - startX);
+        const finish = () => {
+            document.body.classList.remove('sheet-resizing');
+            handle.removeEventListener('pointermove',move); handle.removeEventListener('pointerup',finish); handle.removeEventListener('pointercancel',finish);
+        };
+        handle.addEventListener('pointermove',move); handle.addEventListener('pointerup',finish); handle.addEventListener('pointercancel',finish);
+    });
+    handle.addEventListener('keydown',(event) => {
+        if (!['ArrowLeft','ArrowRight'].includes(event.key)) return;
+        event.preventDefault(); setWidth(gridColumnWidths[index] + (event.key === 'ArrowRight' ? 16 : -16));
+    });
+});
+applyGridWidths();
+let lastVirtualScrollTop = scrollElement.scrollTop;
+scrollElement.addEventListener('scroll',() => {
+    if (scrollElement.scrollTop === lastVirtualScrollTop) return;
+    lastVirtualScrollTop = scrollElement.scrollTop; renderRows();
+},{passive:true});
+window.addEventListener('resize',renderRows);
 resetTextFilters();
 document.querySelectorAll('[data-exact],input[type="date"]').forEach((control) => control.addEventListener('change',markFiltersChanged));
 textFilterGroups?.addEventListener('input',(event) => { if (event.target.matches('.text-filter-value')) markFiltersChanged(); });
@@ -462,7 +597,7 @@ document.getElementById('search-form')?.addEventListener('submit',async (event) 
     } catch (error) { showCatalogError(error); if (!hasSearched) resultCount.textContent = 'Search failed.'; }
 });
 document.querySelectorAll('[data-sort]').forEach((button) => {
-    button.addEventListener('click',() => { const nextKey = button.dataset.sort; sortDirection = sortKey === nextKey && sortDirection === 'asc' ? 'desc' : 'asc'; sortKey = nextKey; document.querySelectorAll('[data-sort]').forEach((item) => item.removeAttribute('data-direction')); button.dataset.direction = sortDirection; sortSlides(); renderRows(); });
+    button.addEventListener('click',() => { const nextKey = button.dataset.sort; sortDirection = sortKey === nextKey && sortDirection === 'asc' ? 'desc' : 'asc'; sortKey = nextKey; document.querySelectorAll('[data-sort]').forEach((item) => item.removeAttribute('data-direction')); button.dataset.direction = sortDirection; buildHierarchy(); renderRows(); });
 });
 document.getElementById('select-filtered')?.addEventListener('change',(event) => { filteredSlides.forEach((slide) => event.target.checked ? draftSelectedIds.add(slide.id) : draftSelectedIds.delete(slide.id)); renderRows(); updateCounts(); scheduleDraftSave(); });
 document.getElementById('review-form')?.addEventListener('submit',(event) => { event.preventDefault(); window.clearTimeout(draftTimer); const form = event.currentTarget; persistDraft('select').then(() => HTMLFormElement.prototype.submit.call(form)).catch(showCatalogError); });

@@ -6957,6 +6957,25 @@ def tq_catalog_search():
     slides, warnings = _tq_stored_catalog(
         filters=filters, slide_ids=selected_ids
     )
+    for slide in slides:
+        for source_key, response_key in (
+            ("label_path", "label_image_url"),
+            ("macro_path", "macro_image_url"),
+        ):
+            value = str(slide.pop(source_key, "")).strip().replace("\\", "/")
+            path = Path(value)
+            slide[response_key] = (
+                url_for(
+                    "serve_relative_image",
+                    batch=slide["batch_id"],
+                    filepath=path.as_posix(),
+                )
+                if value
+                and not path.is_absolute()
+                and not PureWindowsPath(value).is_absolute()
+                and ".." not in path.parts
+                else ""
+            )
     payload = {"slides": slides, "warnings": warnings}
     if file_accession_keys is not None:
         found_keys = {

@@ -164,6 +164,7 @@ class TableSearchRouteTests(unittest.TestCase):
         self.assertIn(b"await fetch(url", response.data)
         self.assertNotIn(b"requestSubmit()", response.data)
         self.assertIn(b"updateTable(link.href)", response.data)
+        self.assertIn(b"sheet-column-resizer", response.data)
 
     def test_sdl_statistics_follow_filters(self):
         full_page = self.client.get("/sdl")
@@ -202,6 +203,7 @@ class TableSearchRouteTests(unittest.TestCase):
         self.assertIn(b"await fetch(url", response.data)
         self.assertNotIn(b"requestSubmit()", response.data)
         self.assertIn(b"updateTable(link.href)", response.data)
+        self.assertIn(b"sheet-column-resizer", response.data)
 
 
 if __name__ == "__main__":
