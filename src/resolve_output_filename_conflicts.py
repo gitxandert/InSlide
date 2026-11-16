@@ -7,7 +7,7 @@ import datetime as dt
 import os
 import sqlite3
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Optional
@@ -51,18 +51,31 @@ def _date(value: str) -> Optional[dt.date]:
 def _scan_sort_key(
     relative_path: str, row: dict[str, str], row_index: int
 ) -> tuple[object, ...]:
+    scan_date = _scan_date(relative_path, row)
+    return (
+        scan_date is None,
+        scan_date or dt.date.max,
+        relative_path.casefold(),
+        row_index,
+    )
+
+
+def _scan_date(relative_path: str, row: dict[str, str]) -> Optional[dt.date]:
     original_path = row.get("OriginalPath", "")
     parent = (
         PureWindowsPath(original_path).parent.name
         if "\\" in original_path
         else Path(original_path).parent.name
     )
-    scan_date = _date(parent) or _date(PurePosixPath(relative_path).name)
+    return _date(parent) or _date(PurePosixPath(relative_path).name)
+
+
+def _scan_group(relative_path: str, row: dict[str, str]) -> tuple[object, ...]:
+    scan_date = _scan_date(relative_path, row)
     return (
-        scan_date is None,
-        scan_date or dt.date.max,
-        relative_path.casefold(),
-        row_index,
+        ("date", scan_date, relative_path.casefold())
+        if scan_date is not None
+        else ("batch", relative_path.casefold())
     )
 
 
@@ -108,8 +121,8 @@ def _load_documents(instance_dir: Path) -> list[MappingDocument]:
 def plan_repairs(instance_dir: Path) -> RepairPlan:
     documents = _load_documents(instance_dir)
     occurrences: dict[str, list[tuple[MappingDocument, int]]] = defaultdict(list)
-    used_sections: dict[tuple[str, ...], set[int]] = defaultdict(set)
-    occupied_names = set()
+    families: dict[tuple[str, ...], list[tuple[MappingDocument, int]]] = defaultdict(list)
+    occupied_names: Counter[str] = Counter()
 
     for document in documents:
         for row_index, row in enumerate(document.rows):
@@ -117,47 +130,70 @@ def plan_repairs(instance_dir: Path) -> RepairPlan:
             if name:
                 key = name.casefold()
                 occurrences[key].append((document, row_index))
-                occupied_names.add(key)
-            section = row.get("SectionCount", "")
-            if renaming.SECTION_RE.fullmatch(section):
-                used_sections[_filename_family(row)].add(int(section))
+                occupied_names[key] += 1
+            families[_filename_family(row)].append((document, row_index))
 
     conflicts = [
         group for _, group in sorted(occurrences.items()) if len(group) > 1
     ]
     changes = []
-    for group in conflicts:
+    conflicting_families = {
+        _filename_family(document.rows[row_index])
+        for group in conflicts
+        for document, row_index in group
+    }
+    for family in sorted(conflicting_families):
         ordered = sorted(
-            group,
+            families[family],
             key=lambda item: _scan_sort_key(
                 item[0].relative_path, item[0].rows[item[1]], item[1]
             ),
         )
-        for document, row_index in ordered[1:]:
+        first_document, first_row_index = ordered[0]
+        first_scan = _scan_group(
+            first_document.relative_path, first_document.rows[first_row_index]
+        )
+        preserved = [
+            item for item in ordered
+            if _scan_group(item[0].relative_path, item[0].rows[item[1]]) == first_scan
+        ]
+        later = [item for item in ordered if item not in preserved]
+        sections = [
+            int(document.rows[row_index]["SectionCount"])
+            for document, row_index in preserved
+            if renaming.SECTION_RE.fullmatch(
+                document.rows[row_index].get("SectionCount", "")
+            )
+        ]
+        next_section = max(sections, default=-1) + 1
+        for document, row_index in later:
+            old_key = document.rows[row_index].get("NewName", "").strip().casefold()
+            if old_key:
+                occupied_names[old_key] -= 1
+
+        for document, row_index in later:
             row = document.rows[row_index]
             old_name = row["NewName"]
-            family = _filename_family(row)
-            for section in range(1000):
-                if section in used_sections[family]:
-                    continue
+            for section in range(next_section, 1000):
                 candidate_row = dict(row)
                 candidate_row["SectionCount"] = f"{section:03d}"
                 candidate_name = renaming.build_new_name(candidate_row)
-                if candidate_name.casefold() in occupied_names:
+                if occupied_names[candidate_name.casefold()]:
                     continue
                 row["SectionCount"] = candidate_row["SectionCount"]
                 row["NewName"] = candidate_name
-                used_sections[family].add(section)
-                occupied_names.add(candidate_name.casefold())
-                changes.append(
-                    FilenameChange(
-                        document.public_id,
-                        document.relative_path,
-                        row_index,
-                        old_name,
-                        candidate_name,
+                occupied_names[candidate_name.casefold()] += 1
+                next_section = section + 1
+                if candidate_name != old_name:
+                    changes.append(
+                        FilenameChange(
+                            document.public_id,
+                            document.relative_path,
+                            row_index,
+                            old_name,
+                            candidate_name,
+                        )
                     )
-                )
                 break
             else:
                 raise ValueError(

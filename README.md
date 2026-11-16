@@ -299,8 +299,9 @@ docker compose exec inslide python resolve_output_filename_conflicts.py
 docker compose exec inslide python resolve_output_filename_conflicts.py --apply
 ```
 
-The oldest scan keeps its filename. Later scans receive unused section numbers;
-the application exports updated `name_mapping.csv` files in the background.
+The oldest scan keeps its filenames. Every slide in later scans receives the next
+section number after that scan; the application exports updated
+`name_mapping.csv` files in the background.
 
 Transfer history is durable in `batch_catalog.sqlite3`. Open **Transfers →
 History** to inspect each batch's last checkpoint, completion state, errors, and

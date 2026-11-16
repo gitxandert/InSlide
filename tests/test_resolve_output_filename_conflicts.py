@@ -69,13 +69,17 @@ class ResolveOutputFilenameConflictsTests(unittest.TestCase):
         )
         new_id = self.add_batch(
             "SS100/2026-02-01",
-            [self.row("2026-02-01", 0), self.row("2026-02-01", 1)],
+            [
+                self.row("2026-02-01", 0),
+                self.row("2026-02-01", 1),
+                self.row("2026-02-01", 2),
+            ],
         )
 
         plan = resolver.plan_repairs(self.instance)
 
         self.assertEqual(2, plan.conflict_count)
-        self.assertEqual(["002", "003"], [
+        self.assertEqual(["002", "003", "004"], [
             document.rows[change.row_index]["SectionCount"]
             for change in plan.changes
             for document in plan.documents
@@ -84,7 +88,10 @@ class ResolveOutputFilenameConflictsTests(unittest.TestCase):
         _, stored_new, new_state = self.catalog.load_document(
             self.instance, new_id, "name_mapping"
         )
-        self.assertEqual(["000", "001"], [row["SectionCount"] for row in stored_new])
+        self.assertEqual(
+            ["000", "001", "002"],
+            [row["SectionCount"] for row in stored_new],
+        )
         self.assertEqual(1, new_state["desired_version"])
 
         self.assertEqual(1, resolver.apply_repairs(self.instance, plan))
@@ -96,7 +103,10 @@ class ResolveOutputFilenameConflictsTests(unittest.TestCase):
             self.instance, new_id, "name_mapping"
         )
         self.assertEqual(["000", "001"], [row["SectionCount"] for row in stored_old])
-        self.assertEqual(["002", "003"], [row["SectionCount"] for row in stored_new])
+        self.assertEqual(
+            ["002", "003", "004"],
+            [row["SectionCount"] for row in stored_new],
+        )
         self.assertEqual("current", old_state["status"])
         self.assertEqual("pending", new_state["status"])
         self.assertEqual([], resolver.plan_repairs(self.instance).changes)
