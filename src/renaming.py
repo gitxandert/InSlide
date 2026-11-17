@@ -29,7 +29,7 @@ MAPPING_FIELDS = (
     "AccessionID", "Organ", "PID", "AccessionDate", "Timepoint", "Stain",
     "ImageType", "SampAcqType", "BlockNumber", "SectionCount", "OriginalPath",
     "NewName", "Approved", "SourceSize", "Disposition", "DuplicateOfBatch",
-    "DuplicateOfPath", "ConflictName",
+    "DuplicateOfPath", "ConflictName", "NameEdited",
 )
 DISPOSITIONS = {"active", "duplicate", "missing_source"}
 DERIVED_COPATH_FIELDS = ("organ", "PID", "_accdate", "timepoint", "image_type", "_sampacqtype")
@@ -808,6 +808,7 @@ def repair_staged_pid_assignments(
     clone_root: Path,
     batch_base: Path,
     target_mapping: Optional[Path] = None,
+    transform_mapping: Optional[Callable[[List[Dict[str, str]], List[Dict[str, str]]], None]] = None,
 ) -> int:
     """Persist canonical PIDs, optionally only for one completed batch."""
     identifiers = _identifier_rows(clone_root)
@@ -819,7 +820,6 @@ def repair_staged_pid_assignments(
         if target_mapping is not None and path != target_mapping:
             continue
         original = [dict(row) for row in rows]
-        changed = False
         for row in rows:
             accession = row_accession(row)
             key = (
@@ -830,9 +830,13 @@ def repair_staged_pid_assignments(
             if canonical and row.get("PID", "").strip().upper() != canonical:
                 row["PID"] = canonical
                 row["NewName"] = build_new_name(row)
-                changed = True
-        if changed:
-            targets.append((path, headers, rows, headers, original))
+        if transform_mapping is not None:
+            transform_mapping(rows, original)
+        if rows != original:
+            targets.append((
+                path, list(dict.fromkeys([*headers, *MAPPING_FIELDS])), rows,
+                headers, original,
+            ))
 
     for path, (headers, rows) in staged.histories.items():
         if target_mapping is not None and path.parent != target_mapping.parent:
@@ -1178,7 +1182,7 @@ def prepare_batch(
             "Approved": "False", "SourceSize": str(
                 sizes[normalized_slide_path(slide.get("original_slide_path", ""))]
             ),
-            "Disposition": "active", "DuplicateOfBatch": "",
+            "Disposition": "active", "NameEdited": "False", "DuplicateOfBatch": "",
             "DuplicateOfPath": "", "ConflictName": "",
         }
         mapping_rows.append(row)
@@ -1316,6 +1320,10 @@ def update_group_rows(
             continue
         if mapping_disposition(row) != "active":
             continue
+        before = {field: row.get(field, "") for field in (
+            "AccessionID", "Organ", "AccessionDate", "Timepoint", "Stain",
+            "ImageType", "SampAcqType", "BlockNumber", "SectionCount",
+        )}
         row["AccessionID"] = new_accession
         source = target if target_exists and target else values
         for field in ("Organ", "PID", "AccessionDate", "Timepoint", "ImageType", "SampAcqType"):
@@ -1325,6 +1333,8 @@ def update_group_rows(
             row[field] = submitted.get(field, row[field]).strip()
         row["Approved"] = "False" if target_exists else "True"
         row["NewName"] = build_new_name(row)
+        if any(row[field] != value for field, value in before.items()):
+            row["NameEdited"] = "True"
     if target_exists:
         for row in rows:
             if row_accession_key(row) == new_key:

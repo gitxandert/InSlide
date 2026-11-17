@@ -2565,10 +2565,34 @@ def _start_renaming_finalization(context: BatchContext) -> bool:
         try:
             _wait_for_document_export(context.id, "name_mapping")
             with _renaming_clone_lock:
+                def check_final_names(rows, original):
+                    selected = [
+                        index for index, row in enumerate(rows)
+                        if renaming.parse_bool(row.get("NameEdited", ""))
+                        or row.get("PID") != original[index].get("PID")
+                    ]
+                    if selected:
+                        selected_indices = set(selected)
+                        reserved = [
+                            {**row, "_BatchID": context.id}
+                            for index, row in enumerate(rows)
+                            if index not in selected_indices
+                        ]
+                        renaming.assign_catalog_names(
+                            [rows[index] for index in selected],
+                            [*_renaming_prior_rows(context.id), *reserved],
+                            context.id,
+                            preserve_sections=True,
+                        )
+                    errors = renaming.validate_mapping_rows([dict(row) for row in rows])
+                    if errors:
+                        raise renaming.RenamingError("; ".join(errors))
+
                 renaming.repair_staged_pid_assignments(
                     Path(Config.COPATH_CLONE),
                     Path(Config.INSLIDE_BATCHES),
                     context.root / "name_mapping.csv",
+                    check_final_names,
                 )
                 _adopt_batch_document(context.id, context.root, "name_mapping")
                 renaming.finalize_batch(context.root, Path(Config.COPATH_CLONE))

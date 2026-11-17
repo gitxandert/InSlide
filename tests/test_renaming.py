@@ -403,6 +403,21 @@ class RenamingDataTests(unittest.TestCase):
             self.clone, self.batch_base
         ))
 
+    def test_final_name_check_failure_does_not_write_mapping(self):
+        renaming.prepare_batch(self.batch, self.clone, self.batch_base, self.query)
+        path = self.batch / "name_mapping.csv"
+        original = path.read_bytes()
+
+        def reject(rows, before):
+            rows[0]["SectionCount"] = "999"
+            raise renaming.RenamingError("final name conflict")
+
+        with self.assertRaisesRegex(renaming.RenamingError, "final name conflict"):
+            renaming.repair_staged_pid_assignments(
+                self.clone, self.batch_base, path, reject,
+            )
+        self.assertEqual(original, path.read_bytes())
+
     def test_duplicate_staged_pid_for_different_mrns_is_renumbered(self):
         renaming.initialize_clone(self.clone)
         for index in (1, 2):
@@ -1046,14 +1061,77 @@ class RenamingPageTests(unittest.TestCase):
 
         self.assertEqual(200, approval.status_code)
         self.assertTrue(approval.get_json()["success"])
-        repair.assert_called_once_with(
+        self.assertEqual(1, repair.call_count)
+        self.assertEqual((
             self.clone,
             self.batch_base,
             self.batch / "name_mapping.csv",
-        )
+        ), repair.call_args.args[:3])
+        self.assertTrue(callable(repair.call_args.args[3]))
         _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
         self.assertEqual("BREAST", saved[0]["Organ"])
         self.assertEqual("AAAAAD", saved[0]["PID"])
+
+    def test_final_pid_change_rechecks_edited_name_against_catalog(self):
+        renaming.initialize_clone(self.clone)
+        write_csv(self.clone / "all_iuh_identifiers.csv", renaming.IDENTIFIER_FIELDS, [{
+            "AccessionID": "NP24-1", "Organ": "BREAST", "MRN": "MRN1", "PID": "AAAAAD",
+        }])
+        old = {
+            "AccessionID": "NP24-1", "Organ": "BREAST", "PID": "AAAAAD",
+            "AccessionDate": "20250304", "Timepoint": "XXXX", "Stain": "HE",
+            "ImageType": "WSI", "SampAcqType": "RE", "BlockNumber": "B4",
+            "SectionCount": "001", "OriginalPath": "old.svs", "Approved": "True",
+            "SourceSize": "100", "Disposition": "active",
+        }
+        old["NewName"] = renaming.build_new_name(old)
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        rows[0]["SourceSize"] = "200"
+        app_module._replace_batch_document(
+            self.batch_id, "name_mapping", renaming.MAPPING_FIELDS, rows,
+        )
+        with mock.patch.object(
+            app_module, "_renaming_prior_rows", return_value=[{**old, "_BatchID": "old"}],
+        ):
+            response = self.client.post(
+                f"/renaming/approve/{self.batch_id}",
+                data=self.approval_data(rows, organ="BREAST"),
+                headers={"Accept": "application/json"},
+            )
+            self.assertEqual(200, response.status_code)
+            self.wait_for_finalization()
+        _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual("True", saved[0]["NameEdited"])
+        self.assertEqual("AAAAAD", saved[0]["PID"])
+        self.assertEqual("002", saved[0]["SectionCount"])
+        self.assertNotEqual(old["NewName"], saved[0]["NewName"])
+
+    def test_final_pid_change_rechecks_unedited_name(self):
+        renaming.initialize_clone(self.clone)
+        write_csv(self.clone / "all_iuh_identifiers.csv", renaming.IDENTIFIER_FIELDS, [{
+            "AccessionID": "NP24-1", "Organ": "BRAIN", "MRN": "MRN1", "PID": "AAAAAD",
+        }])
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        rows[0]["SourceSize"] = "200"
+        app_module._replace_batch_document(
+            self.batch_id, "name_mapping", renaming.MAPPING_FIELDS, rows,
+        )
+        old = dict(rows[0], PID="AAAAAD", SourceSize="100", OriginalPath="old.svs")
+        old["NewName"] = renaming.build_new_name(old)
+        with mock.patch.object(
+            app_module, "_renaming_prior_rows", return_value=[{**old, "_BatchID": "old"}],
+        ):
+            response = self.client.post(
+                f"/renaming/approve/{self.batch_id}",
+                data=self.approval_data(rows),
+                headers={"Accept": "application/json"},
+            )
+            self.assertEqual(200, response.status_code)
+            self.wait_for_finalization()
+        _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertFalse(renaming.parse_bool(saved[0]["NameEdited"]))
+        self.assertEqual("AAAAAD", saved[0]["PID"])
+        self.assertEqual("002", saved[0]["SectionCount"])
 
     def test_nonfinal_organ_change_keeps_pid_until_batch_finishes(self):
         rows = self.add_second_accession()
