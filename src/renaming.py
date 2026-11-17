@@ -423,7 +423,12 @@ def mapping_ready(rows: Sequence[Dict[str, str]]) -> bool:
 def normalized_slide_path(value: str) -> str:
     raw = os.fspath(value)
     normalized = os.path.normpath(str(runtime_path(raw))).replace("\\", "/")
-    if re.match(r"^[A-Za-z]:[\\/]", raw) or raw.startswith("\\\\"):
+    scanner_root = os.environ.get("GT450_IMAGES_CONTAINER_ROOT", "").rstrip("/")
+    if (
+        re.match(r"^[A-Za-z]:[\\/]", raw)
+        or raw.startswith("\\\\")
+        or scanner_root and (normalized == scanner_root or normalized.startswith(scanner_root + "/"))
+    ):
         return normalized.casefold()
     return normalized
 

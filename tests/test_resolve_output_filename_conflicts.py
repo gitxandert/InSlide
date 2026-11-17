@@ -1,5 +1,6 @@
 import contextlib
 import io
+import os
 import sys
 import tempfile
 import unittest
@@ -217,6 +218,23 @@ class ResolveOutputFilenameConflictsTests(unittest.TestCase):
         self.assertIn("1 same basename", output.getvalue())
         self.assertIn("1 no basename match", output.getvalue())
         self.assertIn("inventory: /other/slide-0.svs", output.getvalue())
+
+    def test_scanner_directory_case_does_not_mark_source_missing(self):
+        row = self.row("2026-01-01", 0)
+        row["OriginalPath"] = "/data/gt450-images/SS100/2026-01-01/slide-0.svs"
+        self.add_batch("SS100/2026-01-01", [row])
+        inventory_root = Path(self.temporary.name) / "inventories"
+        renaming.atomic_write(
+            inventory_root / "SS100_inventory.csv",
+            ["full_path", "size_in_bytes"],
+            [{"full_path": "/data/gt450-images/ss100/2026-01-01/slide-0.svs",
+              "size_in_bytes": "100"}],
+        )
+        with mock.patch.dict(os.environ, {"GT450_IMAGES_CONTAINER_ROOT": "/data/gt450-images"}):
+            plan = resolver.plan_inventory_repairs(self.instance, inventory_root)
+        self.assertEqual(0, plan.conflict_count)
+        self.assertEqual("100", plan.documents[0].rows[0]["SourceSize"])
+        self.assertEqual("active", plan.documents[0].rows[0]["Disposition"])
 
     def test_exhausted_section_numbers_fail_before_writes(self):
         old_id = self.add_batch(
