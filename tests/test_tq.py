@@ -1535,27 +1535,27 @@ class TQTransferTests(unittest.TestCase):
             batch_size=1,
             batches=batches,
         )
-        all_staged = app_module.threading.Event()
-        all_deidentified = app_module.threading.Event()
+        next_staged = app_module.threading.Event()
+        next_deidentified = app_module.threading.Event()
         overlap = {}
         seen = {"stage": [], "deidentify": [], "upload": []}
 
         def stage(_job, batch):
             seen["stage"].append(id(batch))
-            if batch.number == 4:
-                all_staged.set()
+            if batch.number == 2:
+                next_staged.set()
 
         def deidentify(_job, batch):
             seen["deidentify"].append(id(batch))
             if batch.number == 1:
-                overlap["staging_runs_ahead"] = all_staged.wait(1)
-            if batch.number == 4:
-                all_deidentified.set()
+                overlap["staging_overlaps"] = next_staged.wait(1)
+            if batch.number == 2:
+                next_deidentified.set()
 
         def upload(_job, batch):
             seen["upload"].append(id(batch))
             if batch.number == 1:
-                overlap["deidentification_runs_ahead"] = all_deidentified.wait(1)
+                overlap["deidentification_overlaps"] = next_deidentified.wait(1)
 
         with (
             mock.patch.object(app_module, "_tq_write_metadata_csv", return_value=self.root / "metadata.csv"),
@@ -1570,8 +1570,8 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(identities, seen["stage"])
         self.assertEqual(identities, seen["deidentify"])
         self.assertEqual(identities, seen["upload"])
-        self.assertTrue(overlap["staging_runs_ahead"])
-        self.assertTrue(overlap["deidentification_runs_ahead"])
+        self.assertTrue(overlap["staging_overlaps"])
+        self.assertTrue(overlap["deidentification_overlaps"])
 
     def test_resume_after_download_reuses_staged_files_for_deidentification(self):
         slide = dict(self.catalog()[0])
