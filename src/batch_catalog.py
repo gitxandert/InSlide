@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 QUEUE_STATUSES = {"pending", "leased", "completed"}
 DOCUMENT_KINDS = {"enriched", "name_mapping"}
 
@@ -193,6 +193,7 @@ class BatchCatalog:
                         path TEXT NOT NULL,
                         size INTEGER,
                         mtime_ns INTEGER,
+                        mapping_version INTEGER,
                         status TEXT NOT NULL CHECK(status IN ('ready','warning','error')),
                         error TEXT NOT NULL DEFAULT '',
                         indexed_at TEXT NOT NULL
@@ -215,6 +216,12 @@ class BatchCatalog:
                         section_count TEXT NOT NULL,
                         destination_name TEXT NOT NULL,
                         digitization_date TEXT NOT NULL DEFAULT '',
+                        source_size INTEGER,
+                        disposition TEXT NOT NULL DEFAULT 'active'
+                            CHECK(disposition IN ('active','duplicate','missing_source')),
+                        duplicate_of_batch TEXT NOT NULL DEFAULT '',
+                        duplicate_of_path TEXT NOT NULL DEFAULT '',
+                        conflict_name TEXT NOT NULL DEFAULT '',
                         UNIQUE(batch_id, source_row)
                     );
                     CREATE TABLE IF NOT EXISTS transfer_slide_types (
@@ -369,10 +376,42 @@ class BatchCatalog:
                     )
                     connection.execute(
                         "UPDATE catalog_metadata SET value=? WHERE key='schema_version'",
-                        (str(SCHEMA_VERSION),),
+                        ("4",),
                     )
-                    version = str(SCHEMA_VERSION)
+                    version = "4"
                 if int(version) == 4:
+                    connection.execute(
+                        "UPDATE catalog_metadata SET value=? WHERE key='schema_version'",
+                        ("5",),
+                    )
+                    version = "5"
+                if int(version) == 5:
+                    columns = {
+                        row[1] for row in connection.execute(
+                            "PRAGMA table_info(transfer_slides)"
+                        )
+                    }
+                    additions = {
+                        "source_size": "INTEGER",
+                        "disposition": "TEXT NOT NULL DEFAULT 'active'",
+                        "duplicate_of_batch": "TEXT NOT NULL DEFAULT ''",
+                        "duplicate_of_path": "TEXT NOT NULL DEFAULT ''",
+                        "conflict_name": "TEXT NOT NULL DEFAULT ''",
+                    }
+                    for column, declaration in additions.items():
+                        if column not in columns:
+                            connection.execute(
+                                f"ALTER TABLE transfer_slides ADD COLUMN {column} {declaration}"
+                            )
+                    source_columns = {
+                        row[1] for row in connection.execute(
+                            "PRAGMA table_info(transfer_sources)"
+                        )
+                    }
+                    if "mapping_version" not in source_columns:
+                        connection.execute(
+                            "ALTER TABLE transfer_sources ADD COLUMN mapping_version INTEGER"
+                        )
                     connection.execute(
                         "UPDATE catalog_metadata SET value=? WHERE key='schema_version'",
                         (str(SCHEMA_VERSION),),
@@ -1309,14 +1348,16 @@ class BatchCatalog:
             connection.executemany(
                 """
                 INSERT INTO transfer_sources(
-                    source_key,source_kind,batch_id,path,size,mtime_ns,status,error,indexed_at
-                ) VALUES(?,?,?,?,?,?,?,?,?)
+                    source_key,source_kind,batch_id,path,size,mtime_ns,mapping_version,
+                    status,error,indexed_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
                         row["source_key"], row["source_kind"],
                         batch_ids.get(str(row.get("batch_id") or "")), row["path"],
-                        row.get("size"), row.get("mtime_ns"), row["status"],
+                        row.get("size"), row.get("mtime_ns"),
+                        row.get("mapping_version"), row["status"],
                         row.get("error", ""), utc_now(),
                     )
                     for row in source_rows
@@ -1327,8 +1368,9 @@ class BatchCatalog:
                 INSERT INTO transfer_slides(
                     slide_id,batch_id,source_row,raw_original_path,original_path,
                     accession,accession_key,organ,pid,accession_date,stain,image_type,
-                    samp_acq_type,block_number,section_count,destination_name,digitization_date
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    samp_acq_type,block_number,section_count,destination_name,digitization_date,
+                    source_size,disposition,duplicate_of_batch,duplicate_of_path,conflict_name
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -1338,6 +1380,9 @@ class BatchCatalog:
                         row["accession_date"], row["stain"], row["image_type"],
                         row["samp_acq_type"], row["block_number"], row["section_count"],
                         row["destination_name"], row["digitization_date"],
+                        row.get("source_size"), row.get("disposition", "active"),
+                        row.get("duplicate_of_batch", ""),
+                        row.get("duplicate_of_path", ""), row.get("conflict_name", ""),
                     )
                     for row in slide_rows
                 ],
@@ -1383,6 +1428,8 @@ class BatchCatalog:
             "b.renamed_complete=1",
             "b.validity='ready'",
             "source.status='ready'",
+            "s.disposition='active'",
+            "source.mapping_version=mapping.desired_version",
         ]
         parameters: list[object] = []
         selected_ids = None if slide_ids is None else list(slide_ids)
@@ -1485,6 +1532,8 @@ class BatchCatalog:
                 JOIN batches b ON b.id=s.batch_id
                 JOIN transfer_sources source
                   ON source.batch_id=b.id AND source.source_kind='mapping'
+                JOIN batch_documents mapping
+                  ON mapping.batch_id=b.id AND mapping.kind='name_mapping'
                 LEFT JOIN batch_document_rows e
                   ON e.batch_id=b.id AND e.kind='enriched'
                  AND e.row_index=s.source_row
@@ -1574,8 +1623,12 @@ class BatchCatalog:
                     JOIN batches b ON b.id=s.batch_id
                     JOIN transfer_sources source
                       ON source.batch_id=b.id AND source.source_kind='mapping'
+                    JOIN batch_documents mapping
+                      ON mapping.batch_id=b.id AND mapping.kind='name_mapping'
                     WHERE b.renamed_complete=1 AND b.validity='ready'
-                      AND source.status='ready' AND {column}<>''
+                      AND source.status='ready' AND s.disposition='active'
+                      AND source.mapping_version=mapping.desired_version
+                      AND {column}<>''
                     ORDER BY value COLLATE NOCASE
                     """
                 ).fetchall()
@@ -1588,8 +1641,12 @@ class BatchCatalog:
                 JOIN batches b ON b.id=s.batch_id
                 JOIN transfer_sources source
                   ON source.batch_id=b.id AND source.source_kind='mapping'
+                JOIN batch_documents mapping
+                  ON mapping.batch_id=b.id AND mapping.kind='name_mapping'
                 WHERE b.renamed_complete=1 AND b.validity='ready'
-                  AND source.status='ready' AND t.slide_type<>''
+                  AND source.status='ready' AND s.disposition='active'
+                  AND source.mapping_version=mapping.desired_version
+                  AND t.slide_type<>''
                 ORDER BY value COLLATE NOCASE
                 """
             ).fetchall()

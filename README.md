@@ -264,7 +264,7 @@ slower downstream work, so every selected slide may be staged before earlier
 batches finish uploading. Batch objects move through FIFO queues; batch numbers
 are display-only.
 
-Deidentification is off unless the operator explicitly selects it. Selected
+Deidentification is selected by default for new transfer drafts. Selected
 deidentification removes embedded label and macro images and uses the approved
 renamed filename. Without deidentification, InSlide copies each SVS byte-for-byte
 and uploads it under its original basename, retaining all embedded associated
@@ -291,17 +291,20 @@ batches are excluded; unfinished batches resume after their last successful
 stage with the same deidentification choice and batch size. Missing staged files
 fall back to downloading the affected batch again.
 
-To repair output filename conflicts caused by rescanning slides on later dates,
-preview and then apply the catalog changes inside the running container:
+To audit historical mappings against the scanner inventories, preview and then
+apply the catalog changes inside the running container:
 
 ```bash
 docker compose exec inslide python resolve_output_filename_conflicts.py
 docker compose exec inslide python resolve_output_filename_conflicts.py --apply
 ```
 
-The oldest scan keeps its filenames. Every slide in later scans receives the next
-section number after that scan; the application exports updated
-`name_mapping.csv` files in the background.
+The audit keeps existing unique filenames, continues section numbers for later
+distinct slides, marks equal-sized filename conflicts as duplicates, and marks
+inventory-missing source paths as `missing_source`. Duplicate and missing rows
+remain in digitization history but are excluded from transfer discovery. Apply
+creates a SQLite backup and CSV report under `instance/catalog_audits/` before
+queuing updated `name_mapping.csv` exports.
 
 Transfer history is durable in `batch_catalog.sqlite3`. Open **Transfers →
 History** to inspect each batch's last checkpoint, completion state, errors, and

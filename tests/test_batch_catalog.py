@@ -121,14 +121,14 @@ class BatchCatalogTests(unittest.TestCase):
             }
         finally:
             connection.close()
-        self.assertEqual("5", version)
+        self.assertEqual("6", version)
         self.assertIn("transfer_slides", tables)
         self.assertIn("transfer_sources", tables)
         self.assertIn("transfer_jobs", tables)
         self.assertIn("transfer_attempts", tables)
         self.assertIn("batch_documents", tables)
         self.assertTrue(
-            (legacy_instance / "batch_catalog.sqlite3.pre-v5.backup").is_file()
+            (legacy_instance / "batch_catalog.sqlite3.pre-v6.backup").is_file()
         )
 
     def test_transfer_checkpoint_survives_restart_and_resumes_unfinished_batches(self):

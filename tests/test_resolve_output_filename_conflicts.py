@@ -131,6 +131,65 @@ class ResolveOutputFilenameConflictsTests(unittest.TestCase):
 
         self.assertEqual([], resolver.plan_repairs(self.instance).changes)
 
+    def test_inventory_audit_marks_duplicates_and_missing_sources(self):
+        old = self.row("2026-01-01", 0)
+        new_duplicate = self.row("2026-02-01", 0)
+        missing = self.row("2026-02-01", 1)
+        old_id = self.add_batch("SS200/2026-01-01", [old])
+        new_id = self.add_batch(
+            "SS100/2026-02-01", [new_duplicate, missing]
+        )
+        inventory_root = Path(self.temporary.name) / "inventories"
+        renaming.atomic_write(
+            inventory_root / "SS100_inventory.csv",
+            ["full_path", "size_in_bytes"],
+            [
+                {
+                    "full_path": new_duplicate["OriginalPath"],
+                    "size_in_bytes": "100",
+                },
+            ],
+        )
+        renaming.atomic_write(
+            inventory_root / "SS200_inventory.csv",
+            ["full_path", "size_in_bytes"],
+            [{"full_path": old["OriginalPath"], "size_in_bytes": "100"}],
+        )
+
+        plan = resolver.plan_inventory_repairs(self.instance, inventory_root)
+
+        planned_old = next(
+            document for document in plan.documents if document.public_id == old_id
+        ).rows[0]
+        planned_new = next(
+            document for document in plan.documents if document.public_id == new_id
+        ).rows
+        self.assertEqual("active", planned_old["Disposition"])
+        self.assertEqual("duplicate", planned_new[0]["Disposition"])
+        self.assertEqual(old_id, planned_new[0]["DuplicateOfBatch"])
+        self.assertEqual(old["OriginalPath"], planned_new[0]["DuplicateOfPath"])
+        self.assertEqual(old["NewName"], planned_new[0]["ConflictName"])
+        self.assertEqual("", planned_new[0]["SectionCount"])
+        self.assertEqual("missing_source", planned_new[1]["Disposition"])
+        self.assertEqual(missing["NewName"], planned_new[1]["NewName"])
+        _, stored_new, _ = self.catalog.load_document(
+            self.instance, new_id, "name_mapping"
+        )
+        self.assertEqual("", stored_new[0]["Disposition"])
+
+        self.assertEqual(2, resolver.apply_repairs(self.instance, plan))
+
+        _, stored_new, _ = self.catalog.load_document(
+            self.instance, new_id, "name_mapping"
+        )
+        self.assertEqual(
+            ["duplicate", "missing_source"],
+            [row["Disposition"] for row in stored_new],
+        )
+        audit_dir = self.instance / "catalog_audits"
+        self.assertEqual(1, len(list(audit_dir.glob("batch_catalog_*.sqlite3"))))
+        self.assertEqual(1, len(list(audit_dir.glob("slide_repairs_*.csv"))))
+
     def test_exhausted_section_numbers_fail_before_writes(self):
         old_id = self.add_batch(
             "SS100/2026-01-01",

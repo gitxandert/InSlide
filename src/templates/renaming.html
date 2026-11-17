@@ -42,6 +42,8 @@
         .expanded[hidden] { display:none; }
         .slide { display:grid; grid-template-columns:minmax(320px,2fr) minmax(140px,1fr) 130px 110px minmax(330px,2fr); gap:10px; align-items:center; margin:7px 0; }
         .slide input { width:100%; padding:7px; border:1px solid #b8c0cc; border-radius:5px; }
+        .duplicate-slide { padding:8px; border-radius:6px; background:#e5e7eb; color:#4b5563; }
+        .duplicate-section { font-family:monospace; font-weight:700; }
         .path,.new-name { overflow-wrap:anywhere; font-family:monospace; font-size:.83rem; }
         .image-links { display:flex; gap:10px; margin-top:5px; font-size:.83rem; }
         .report-content { padding:4px 14px 12px; border:1px solid var(--border); border-radius:6px; background:white; }
@@ -97,7 +99,12 @@
         </div>
         {% else %}<p class="empty">No QC-complete batches are waiting for renaming.</p>{% endif %}
     {% else %}
-        <div class="toolbar"><h2>{{ context.display_name }}</h2><span class="state" id="job-state">{{ job_state.status|default('ready')|title }}</span></div>
+        <div class="toolbar"><h2>{{ context.display_name }}</h2><span class="state" id="job-state">{{ job_state.status|default('ready')|title }}</span>
+        {% if groups and not groups|selectattr('has_active')|list %}
+            <form method="post" action="{{ url_for('renaming_finish_duplicates', batch_id=context.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="success" type="submit">Finish duplicate-only batch</button>
+            </form>
+        {% endif %}</div>
         {% if history_job is defined and history_job.status in ('pending','running','staged') %}
             <div class="notice">Longitudinal CoPath history: {{ history_job.status|title }}. Renaming may continue.</div>
         {% endif %}
@@ -142,7 +149,7 @@ const showRenamingMessage = (message, category = 'error') => {
 };
 
 const updateNames = (form) => {
-  form.querySelectorAll('.new-name').forEach((output) => {
+  form.querySelectorAll('.slide:not(.duplicate-slide) .new-name').forEach((output) => {
     const row = output.closest('.slide');
     const original = row.querySelector('input[name^="original_path_"]').value;
     const dot = original.lastIndexOf('.');
@@ -161,7 +168,7 @@ const captureDrafts = (submittedForm) => {
       sharedFieldNames.map((name) => [name, form.elements[name].value])
     );
     const slides = new Map();
-    form.querySelectorAll('.slide input[name^="original_path_"]').forEach((pathInput) => {
+    form.querySelectorAll('.slide:not(.duplicate-slide) input[name^="original_path_"]').forEach((pathInput) => {
       const index = pathInput.name.split('_').pop();
       slides.set(pathInput.value, {
         stain: form.elements[`stain_${index}`].value,
@@ -179,7 +186,7 @@ const restoreDraft = (form, draft) => {
   Object.entries(draft.shared).forEach(([name, value]) => {
     if (form.elements[name]) form.elements[name].value = value;
   });
-  form.querySelectorAll('.slide input[name^="original_path_"]').forEach((pathInput) => {
+  form.querySelectorAll('.slide:not(.duplicate-slide) input[name^="original_path_"]').forEach((pathInput) => {
     const values = draft.slides.get(pathInput.value);
     if (!values) return;
     const index = pathInput.name.split('_').pop();

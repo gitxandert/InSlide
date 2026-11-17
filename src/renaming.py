@@ -13,11 +13,12 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from container_paths import runtime_path
 from copath_queue import QueueProtocolError, submit_query
 
 
@@ -27,8 +28,10 @@ SAMPLE_TYPES = ("RE", "BP", "XX")
 MAPPING_FIELDS = (
     "AccessionID", "Organ", "PID", "AccessionDate", "Timepoint", "Stain",
     "ImageType", "SampAcqType", "BlockNumber", "SectionCount", "OriginalPath",
-    "NewName", "Approved",
+    "NewName", "Approved", "SourceSize", "Disposition", "DuplicateOfBatch",
+    "DuplicateOfPath", "ConflictName",
 )
+DISPOSITIONS = {"active", "duplicate", "missing_source"}
 DERIVED_COPATH_FIELDS = ("organ", "PID", "_accdate", "timepoint", "image_type", "_sampacqtype")
 REPORT_FIELDS = (
     "final_diagnosis", "addendum_diagnosis", "note", "addendum_comment",
@@ -404,10 +407,189 @@ def build_new_name(row: Dict[str, str]) -> str:
     )
 
 
+def mapping_disposition(row: Mapping[str, str]) -> str:
+    return row.get("Disposition", "").strip() or "active"
+
+
+def active_mapping_rows(rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    return [row for row in rows if mapping_disposition(row) == "active"]
+
+
+def mapping_ready(rows: Sequence[Dict[str, str]]) -> bool:
+    active = active_mapping_rows(rows)
+    return bool(active) and all(parse_bool(row.get("Approved", "")) for row in active)
+
+
+def normalized_slide_path(value: str) -> str:
+    raw = os.fspath(value)
+    normalized = os.path.normpath(str(runtime_path(raw))).replace("\\", "/")
+    if re.match(r"^[A-Za-z]:[\\/]", raw) or raw.startswith("\\\\"):
+        return normalized.casefold()
+    return normalized
+
+
+def inventory_sizes(
+    inventory_path: Path, paths: Iterable[str]
+) -> Dict[str, int]:
+    wanted = {normalized_slide_path(path): path for path in paths}
+    found: Dict[str, int] = {}
+    with inventory_path.open("r", newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle, strict=True)
+        required = {"full_path", "size_in_bytes"}
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            raise RenamingError(
+                f"{inventory_path.name} must contain full_path and size_in_bytes"
+            )
+        for inventory_row in reader:
+            key = normalized_slide_path(inventory_row.get("full_path", ""))
+            if key not in wanted:
+                continue
+            try:
+                size = int((inventory_row.get("size_in_bytes") or "").strip())
+                if size < 0:
+                    raise ValueError
+            except ValueError as exc:
+                raise RenamingError(
+                    f"{inventory_path.name} has an invalid size for "
+                    f"{inventory_row.get('full_path', '')}"
+                ) from exc
+            if key in found and found[key] != size:
+                raise RenamingError(
+                    f"{inventory_path.name} has conflicting sizes for "
+                    f"{inventory_row.get('full_path', '')}"
+                )
+            found[key] = size
+    missing = [original for key, original in wanted.items() if key not in found]
+    if missing:
+        raise RenamingError(
+            "Scanner inventory is missing post-QC slide(s): "
+            + ", ".join(sorted(missing))
+        )
+    return found
+
+
+def filename_family(row: Mapping[str, str]) -> Tuple[str, ...]:
+    fields = (
+        "Organ", "PID", "AccessionDate", "Timepoint", "Stain", "ImageType",
+        "SampAcqType", "BlockNumber",
+    )
+    return (
+        *(str(row.get(field, "")).casefold() for field in fields),
+        Path(row.get("OriginalPath", "")).suffix.casefold(),
+    )
+
+
+def assign_catalog_names(
+    rows: List[Dict[str, str]],
+    prior_rows: Sequence[Mapping[str, str]],
+    batch_id: str,
+    *,
+    preserve_sections: bool = False,
+) -> None:
+    """Classify duplicates and continue section counts from catalog mappings."""
+    next_sections: Dict[Tuple[str, ...], int] = defaultdict(int)
+    canonical: Dict[Tuple[str, ...], Dict[int, Mapping[str, str]]] = defaultdict(dict)
+    occupied = set()
+    for prior in prior_rows:
+        family = filename_family(prior)
+        name = str(prior.get("NewName", "")).strip()
+        section = str(prior.get("SectionCount", ""))
+        if name:
+            occupied.add(name.casefold())
+        if SECTION_RE.fullmatch(section):
+            next_sections[family] = max(next_sections[family], int(section) + 1)
+        if mapping_disposition(prior) == "active":
+            try:
+                size = int(str(prior.get("SourceSize", "")))
+            except ValueError:
+                continue
+            canonical[family].setdefault(size, prior)
+
+    current_names = Counter(
+        build_new_name(row).casefold()
+        for row in rows
+        if preserve_sections and SECTION_RE.fullmatch(row.get("SectionCount", ""))
+    )
+    reserved_current = {
+        name for name, count in current_names.items()
+        if count == 1 and name not in occupied
+    }
+    for row in rows:
+        family = filename_family(row)
+        try:
+            size: Optional[int] = int(row.get("SourceSize", ""))
+        except ValueError:
+            size = None
+        duplicate = canonical[family].get(size) if size is not None else None
+        if duplicate is not None:
+            if SECTION_RE.fullmatch(row.get("SectionCount", "")):
+                reserved_current.discard(build_new_name(row).casefold())
+            row.update({
+                "Disposition": "duplicate",
+                "DuplicateOfBatch": str(duplicate.get("_BatchID", "")),
+                "DuplicateOfPath": str(duplicate.get("OriginalPath", "")),
+                "ConflictName": str(
+                    duplicate.get("NewName") or duplicate.get("ConflictName", "")
+                ),
+                "SectionCount": "",
+                "NewName": "",
+                "Approved": "False",
+            })
+            continue
+
+        row.update({
+            "Disposition": "active", "DuplicateOfBatch": "",
+            "DuplicateOfPath": "", "ConflictName": "",
+        })
+        existing_section = row.get("SectionCount", "")
+        if preserve_sections and SECTION_RE.fullmatch(existing_section):
+            existing_name = build_new_name(row)
+            if existing_name.casefold() in reserved_current:
+                row["NewName"] = existing_name
+                reserved_current.remove(existing_name.casefold())
+                occupied.add(existing_name.casefold())
+                next_sections[family] = max(
+                    next_sections[family], int(existing_section) + 1
+                )
+                if size is not None:
+                    canonical[family][size] = {**row, "_BatchID": batch_id}
+                continue
+        for section in range(next_sections[family], 1000):
+            row["SectionCount"] = f"{section:03d}"
+            name = build_new_name(row)
+            if name.casefold() in occupied or name.casefold() in reserved_current:
+                continue
+            row["NewName"] = name
+            next_sections[family] = section + 1
+            occupied.add(name.casefold())
+            if size is not None:
+                canonical[family][size] = {**row, "_BatchID": batch_id}
+            break
+        else:
+            raise RenamingError(
+                f"No unused SectionCount remains for {row.get('AccessionID', '')}"
+            )
+
+
 def validate_mapping_rows(rows: Sequence[Dict[str, str]]) -> List[str]:
     errors: List[str] = []
     names = []
     for row in rows:
+        disposition = mapping_disposition(row)
+        if disposition not in DISPOSITIONS:
+            errors.append(f"Invalid slide disposition: {disposition}")
+            continue
+        if not row.get("OriginalPath", "").strip():
+            errors.append("OriginalPath is required")
+        if disposition != "active":
+            if disposition == "duplicate" and not all(
+                row.get(field, "").strip()
+                for field in (
+                    "SourceSize", "DuplicateOfBatch", "DuplicateOfPath", "ConflictName"
+                )
+            ):
+                errors.append("Duplicate slides require size and source provenance")
+            continue
         accession = row.get("AccessionID", "")
         if not clean_accession(accession):
             errors.append("AccessionID is required")
@@ -433,8 +615,6 @@ def validate_mapping_rows(rows: Sequence[Dict[str, str]]) -> List[str]:
                 errors.append(f"{accession}: {field} is required and must be filename-safe")
         if not SECTION_RE.fullmatch(row.get("SectionCount", "")):
             errors.append(f"{accession}: SectionCount must be exactly three digits")
-        if not row.get("OriginalPath", "").strip():
-            errors.append(f"{accession}: OriginalPath is required")
         row["NewName"] = build_new_name(row)
         names.append(row["NewName"].casefold())
     duplicates = {name for name in names if names.count(name) > 1}
@@ -506,7 +686,7 @@ def _staged_pid_state(
             continue
         if not mapping or (
             mapping_path != target_mapping
-            and all(parse_bool(row.get("Approved", "")) for row in mapping)
+            and mapping_ready(mapping)
         ):
             continue
         mrns = {
@@ -902,6 +1082,10 @@ def prepare_batch(
     clone_root: Path,
     batch_base: Path,
     query: Callable[[Path, Sequence[str], Path], None] = default_query,
+    *,
+    inventory_path: Optional[Path] = None,
+    prior_rows: Sequence[Mapping[str, str]] = (),
+    batch_id: str = "",
 ) -> None:
     enriched_path = batch_root / "enriched.csv"
     _, slides = read_csv(enriched_path)
@@ -969,22 +1153,31 @@ def prepare_batch(
             "SampAcqType": (source or {}).get("_sampacqtype") or derive_sample_type(source),
         }
 
-    counters: Dict[Tuple[str, ...], int] = defaultdict(int)
+    paths = [slide.get("original_slide_path", "") for slide in slides]
+    sizes = (
+        inventory_sizes(inventory_path, paths)
+        if inventory_path is not None
+        else {
+            normalized_slide_path(path): "" for path in paths
+        }
+    )
     mapping_rows: List[Dict[str, str]] = []
     for slide in slides:
         accession = display_accessions[row_accession_key(slide)]
         shared = accession_values[accession_key(accession)]
         stain = (slide.get("Stain") or "XX").strip()
         block = (slide.get("BlockNumber") or "XX").strip()
-        key = (accession_key(accession), *shared.values(), stain, block)
         row = {
             "AccessionID": accession, **shared, "Stain": stain, "BlockNumber": block,
-            "SectionCount": f"{counters[key]:03d}",
-            "OriginalPath": slide.get("original_slide_path", ""), "Approved": "False",
+            "SectionCount": "", "OriginalPath": slide.get("original_slide_path", ""),
+            "Approved": "False", "SourceSize": str(
+                sizes[normalized_slide_path(slide.get("original_slide_path", ""))]
+            ),
+            "Disposition": "active", "DuplicateOfBatch": "",
+            "DuplicateOfPath": "", "ConflictName": "",
         }
-        counters[key] += 1
-        row["NewName"] = build_new_name(row)
         mapping_rows.append(row)
+    assign_catalog_names(mapping_rows, prior_rows, batch_id)
     errors = validate_mapping_rows(mapping_rows)
     if errors:
         raise RenamingError("; ".join(errors))
@@ -1045,9 +1238,13 @@ def group_mapping(rows: Sequence[Dict[str, str]], reports: Dict[str, Dict[str, s
     for key, slides in grouped.items():
         accession = display_accessions[key]
         report = reports.get(key, {})
+        active = active_mapping_rows(slides)
         result.append({
-            "accession": accession, "shared": slides[0], "slides": slides,
-            "approved": all(parse_bool(row["Approved"]) for row in slides),
+            "accession": accession, "shared": (active or slides)[0], "slides": slides,
+            "approved": bool(active) and all(
+                parse_bool(row["Approved"]) for row in active
+            ),
+            "has_active": bool(active),
             "report": compile_report(report),
         })
     return result
@@ -1057,6 +1254,8 @@ def renumber_merged_mapping(rows: Sequence[Dict[str, str]]) -> None:
     """Assign unique section numbers and names after accession groups merge."""
     counters: Dict[Tuple[str, ...], int] = defaultdict(int)
     for row in rows:
+        if mapping_disposition(row) != "active":
+            continue
         key = (
             row["Organ"], row["PID"], row["AccessionDate"], row["Timepoint"],
             row["Stain"], row["ImageType"], row["SampAcqType"], row["BlockNumber"],
@@ -1091,6 +1290,8 @@ def update_group_rows(
     values: Dict[str, str],
     slide_values: Dict[str, Dict[str, str]],
     expected_signature: str,
+    *,
+    validate: bool = True,
 ) -> Tuple[List[Dict[str, str]], bool]:
     """Apply one approval to central mapping rows without touching a file."""
     if mapping_signature(rows) != expected_signature:
@@ -1108,6 +1309,8 @@ def update_group_rows(
     for row in rows:
         if row_accession_key(row) != old_key:
             continue
+        if mapping_disposition(row) != "active":
+            continue
         row["AccessionID"] = new_accession
         source = target if target_exists and target else values
         for field in ("Organ", "PID", "AccessionDate", "Timepoint", "ImageType", "SampAcqType"):
@@ -1122,9 +1325,10 @@ def update_group_rows(
             if row_accession_key(row) == new_key:
                 row["Approved"] = "False"
         renumber_merged_mapping(rows)
-    errors = validate_mapping_rows(rows)
-    if errors:
-        raise RenamingError("; ".join(errors))
+    if validate:
+        errors = validate_mapping_rows(rows)
+        if errors:
+            raise RenamingError("; ".join(errors))
     return rows, target_exists
 
 
@@ -1242,13 +1446,18 @@ def retry_group(
         }
     for row in mapping:
         if row_accession_key(row) == old_key:
+            if mapping_disposition(row) != "active":
+                continue
             row["AccessionID"] = new_accession
             row.update(shared)
             row["Approved"] = "False"
             row["NewName"] = build_new_name(row)
     if target:
         for row in mapping:
-            if row_accession_key(row) == new_key:
+            if (
+                row_accession_key(row) == new_key
+                and mapping_disposition(row) == "active"
+            ):
                 row["Approved"] = "False"
         renumber_merged_mapping(mapping)
     errors = validate_mapping_rows(mapping)
@@ -1285,13 +1494,16 @@ def retry_group(
 def finalize_batch(batch_root: Path, clone_root: Path) -> None:
     mapping_path = batch_root / "name_mapping.csv"
     _, mapping = read_csv(mapping_path)
-    if not mapping or not all(parse_bool(row["Approved"]) for row in mapping):
+    if not mapping_ready(mapping):
         return
     accession_org, clone_rows, clone_headers = _clone_rows(clone_root)
     identifier_rows = _identifier_rows(clone_root)
     identifiers = {row_accession_key(row): dict(row) for row in identifier_rows}
     reports = report_rows(batch_root, clone_root)
-    approved_by_accession = {accession_key(row["AccessionID"]): row for row in mapping}
+    approved_by_accession = {
+        accession_key(row["AccessionID"]): row
+        for row in mapping if mapping_disposition(row) == "active"
+    }
     backup_root = batch_root / "renaming_backups" / dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     touched: List[Tuple[Path, Optional[Path]]] = []
     try:

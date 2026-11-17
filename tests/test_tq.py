@@ -752,7 +752,7 @@ class TQTransferTests(unittest.TestCase):
             b'type="checkbox" value="1" checked'
         )
         self.assertNotIn(checked_markup, response.data)
-        self.assertNotIn(
+        self.assertIn(
             b'id="deidentify" name="deidentify" type="checkbox" value="1" checked',
             response.data,
         )

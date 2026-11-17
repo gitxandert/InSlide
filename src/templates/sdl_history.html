@@ -5,7 +5,8 @@
 {% for slide in data.slides %}
 <section>
   <h3>{{ slide.relative_path }} — {{ slide.original_path }}</h3>
-  <p>Label-Check: {{ 'Yes' if slide.validity == 'ready' else 'No' }} · QC: {{ 'Yes' if slide.qc_complete else 'No' }} · Renamed: {{ 'Yes' if slide.renamed_complete else 'No' }} · CoPath job: {{ slide.history_status }}</p>
+  <p>Status: {{ slide.disposition|replace('_', ' ')|title }} · Label-Check: {{ 'Yes' if slide.validity == 'ready' else 'No' }} · QC: {{ 'Yes' if slide.qc_complete else 'No' }} · Renamed: {{ 'Yes' if slide.renamed_complete else 'No' }} · CoPath job: {{ slide.history_status }}</p>
+  {% if slide.disposition == 'duplicate' %}<p>Duplicate of {{ slide.duplicate_of_path }} ({{ slide.source_size }} bytes); conflicting name: {{ slide.conflict_name }}</p>{% endif %}
   <pre>{{ slide.extracted_fields }}</pre>
   {% for label, url in slide.images %}<p>{{ label }} image: <a href="{{ url }}">Open</a></p>{% endfor %}
   {% if slide.copath_path %}<p>CoPath source: {{ slide.copath_path }}</p>{% endif %}

@@ -1,8 +1,9 @@
-"""Resolve duplicate output filenames across finalized slide mappings."""
+"""Audit finalized slide mappings against scanner inventories."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import os
 import sqlite3
@@ -32,6 +33,7 @@ class FilenameChange:
     row_index: int
     old_name: str
     new_name: str
+    disposition: str = ""
 
 
 @dataclass
@@ -39,6 +41,28 @@ class RepairPlan:
     documents: list[MappingDocument]
     changes: list[FilenameChange]
     conflict_count: int
+
+
+def _inventory_rows(path: Path) -> dict[str, int]:
+    result = {}
+    with path.open("r", newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle, strict=True)
+        if not reader.fieldnames or not {"full_path", "size_in_bytes"}.issubset(
+            reader.fieldnames
+        ):
+            raise ValueError(f"{path}: missing full_path or size_in_bytes")
+        for row in reader:
+            key = renaming.normalized_slide_path(row.get("full_path", ""))
+            try:
+                size = int((row.get("size_in_bytes") or "").strip())
+                if size < 0:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(f"{path}: invalid size for {row.get('full_path', '')}") from exc
+            if key in result and result[key] != size:
+                raise ValueError(f"{path}: conflicting sizes for {row.get('full_path', '')}")
+            result[key] = size
+    return result
 
 
 def _date(value: str) -> Optional[dt.date]:
@@ -76,6 +100,18 @@ def _scan_group(relative_path: str, row: dict[str, str]) -> tuple[object, ...]:
         ("date", scan_date, relative_path.casefold())
         if scan_date is not None
         else ("batch", relative_path.casefold())
+    )
+
+
+def _document_sort_key(document: MappingDocument) -> tuple[object, ...]:
+    dates = [
+        scan_date for row in document.rows
+        if (scan_date := _scan_date(document.relative_path, row)) is not None
+    ]
+    return (
+        not dates,
+        min(dates) if dates else dt.date.max,
+        document.relative_path.casefold(),
     )
 
 
@@ -221,6 +257,65 @@ def plan_repairs(instance_dir: Path) -> RepairPlan:
     return RepairPlan(documents, changes, len(conflicts))
 
 
+def plan_inventory_repairs(instance_dir: Path, inventory_root: Path) -> RepairPlan:
+    documents = sorted(_load_documents(instance_dir), key=_document_sort_key)
+    inventories = {
+        path.name.removesuffix("_inventory.csv"): _inventory_rows(path)
+        for path in inventory_root.glob("SS*_inventory.csv")
+    }
+    prior_rows: list[dict[str, str]] = []
+    changes: list[FilenameChange] = []
+    issue_count = 0
+    for document in documents:
+        scanner = PurePosixPath(document.relative_path).parts[0]
+        inventory = inventories.get(scanner)
+        if inventory is None:
+            raise ValueError(f"scanner inventory is missing for {scanner}")
+        original = [dict(row) for row in document.rows]
+        for row in document.rows:
+            key = renaming.normalized_slide_path(row.get("OriginalPath", ""))
+            size = inventory.get(key)
+            if size is None:
+                row.update({
+                    "Disposition": "missing_source", "SourceSize": "",
+                    "DuplicateOfBatch": "", "DuplicateOfPath": "",
+                    "ConflictName": "",
+                })
+                issue_count += 1
+            else:
+                row["SourceSize"] = str(size)
+                if not row.get("Disposition", "").strip():
+                    row["Disposition"] = "active"
+        eligible = [
+            row for row in document.rows
+            if renaming.mapping_disposition(row) != "missing_source"
+        ]
+        renaming.assign_catalog_names(
+            eligible, prior_rows, document.public_id, preserve_sections=True
+        )
+        for row_index, (before, after) in enumerate(zip(original, document.rows)):
+            if before != after:
+                changes.append(FilenameChange(
+                    document.public_id,
+                    document.relative_path,
+                    row_index,
+                    before.get("NewName", ""),
+                    after.get("NewName") or after.get("ConflictName", ""),
+                    renaming.mapping_disposition(after),
+                ))
+                if renaming.mapping_disposition(after) == "duplicate":
+                    issue_count += 1
+        document.fields = list(dict.fromkeys([*document.fields, *renaming.MAPPING_FIELDS]))
+        errors = renaming.validate_mapping_rows([dict(row) for row in document.rows])
+        if errors:
+            raise ValueError(f"{document.relative_path}: {'; '.join(errors)}")
+        prior_rows.extend(
+            {**row, "_BatchID": document.public_id, "_BatchPath": document.relative_path}
+            for row in document.rows
+        )
+    return RepairPlan(documents, changes, issue_count)
+
+
 def apply_repairs(instance_dir: Path, plan: RepairPlan) -> int:
     changed_ids = {change.public_id for change in plan.changes}
     changed_documents = [
@@ -236,6 +331,31 @@ def apply_repairs(instance_dir: Path, plan: RepairPlan) -> int:
             raise RuntimeError(
                 f"{document.relative_path}: mapping changed during repair; rerun"
             )
+    audit_dir = instance_dir / "catalog_audits"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    source = sqlite3.connect(catalog.database_path(instance_dir))
+    backup = sqlite3.connect(audit_dir / f"batch_catalog_{stamp}.sqlite3")
+    try:
+        source.backup(backup)
+    finally:
+        backup.close()
+        source.close()
+    with (audit_dir / f"slide_repairs_{stamp}.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=("batch", "row", "disposition", "old_name", "new_name"),
+        )
+        writer.writeheader()
+        writer.writerows({
+            "batch": change.relative_path,
+            "row": change.row_index + 1,
+            "disposition": change.disposition,
+            "old_name": change.old_name,
+            "new_name": change.new_name,
+        } for change in plan.changes)
     for document in changed_documents:
         catalog.replace_document(
             instance_dir,
@@ -249,6 +369,12 @@ def apply_repairs(instance_dir: Path, plan: RepairPlan) -> int:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument(
+        "--inventory-root",
+        type=Path,
+        default=Path(os.environ.get("SCANNER_INVENTORIES", r"D:\scanner_inventories")),
+        help="scanner inventory directory",
+    )
     result.add_argument(
         "--instance-dir",
         type=Path,
@@ -268,18 +394,19 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     args = parser().parse_args(argv)
     try:
-        plan = plan_repairs(args.instance_dir)
+        plan = plan_inventory_repairs(args.instance_dir, args.inventory_root)
         for change in plan.changes:
             print(
-                f"{change.relative_path} row {change.row_index + 1}: "
+                f"{change.relative_path} row {change.row_index + 1} "
+                f"[{change.disposition or 'renamed'}]: "
                 f"{change.old_name} -> {change.new_name}"
             )
         if not plan.changes:
-            print("No duplicate output filenames found.")
+            print("Catalog matches scanner inventories; no repairs are needed.")
             return 0
         print(
-            f"Found {plan.conflict_count} conflicting filename(s); "
-            f"{len(plan.changes)} row(s) need new names."
+            f"Found {plan.conflict_count} inventory issue(s); "
+            f"{len(plan.changes)} row(s) need catalog updates."
         )
         if not args.apply:
             print("Dry run complete. Re-run with --apply to update the catalog.")

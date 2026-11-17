@@ -2127,7 +2127,7 @@ def reconcile_batch_catalog() -> List[str]:
                             warnings.append(f"{display_name}: {message}; database copy was kept.")
                 renaming_status = (
                     "approved"
-                    if mapping_rows and all(renaming.parse_bool(row["Approved"]) for row in mapping_rows)
+                    if renaming.mapping_ready(mapping_rows)
                     else "ready"
                 )
             history_status = str(renaming.read_history_job(root).get("status", "not_needed"))
@@ -2236,6 +2236,27 @@ def _renaming_report_rows(
             }
         )
     return reports
+
+
+def _renaming_prior_rows(exclude_batch_id: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for batch in batch_catalog.list_batches(Config.INSTANCE_DIR):
+        public_id = str(batch["public_id"])
+        if public_id == exclude_batch_id or batch["validity"] != "ready":
+            continue
+        try:
+            _, mapping, _ = batch_catalog.load_document(
+                Config.INSTANCE_DIR, public_id, "name_mapping"
+            )
+        except KeyError:
+            continue
+        for row in mapping:
+            rows.append({
+                **row,
+                "_BatchID": public_id,
+                "_BatchPath": str(batch["relative_path"]),
+            })
+    return rows
 
 
 def _catalog_reconciler() -> None:
@@ -2420,7 +2441,7 @@ def _start_longitudinal_job(context: BatchContext, *, force: bool = False) -> bo
             )
             if state is not None:
                 _, rows, _ = _load_batch_document(context.id, "name_mapping")
-                if rows and all(renaming.parse_bool(row["Approved"]) for row in rows):
+                if renaming.mapping_ready(rows):
                     _wait_for_document_export(context.id, "name_mapping")
                     with _renaming_clone_lock:
                         renaming.finalize_batch(context.root, Path(Config.COPATH_CLONE))
@@ -2481,6 +2502,23 @@ def _start_renaming_job(
                     context.document_version = _adopt_batch_document(
                         context.id, context.root, "enriched"
                     )
+                    mapping_fields, mapping_rows = renaming.read_csv(
+                        context.root / "name_mapping.csv"
+                    )
+                    renaming.assign_catalog_names(
+                        mapping_rows,
+                        _renaming_prior_rows(context.id),
+                        context.id,
+                        preserve_sections=True,
+                    )
+                    errors = renaming.validate_mapping_rows(mapping_rows)
+                    if errors:
+                        raise renaming.RenamingError("; ".join(errors))
+                    renaming.atomic_write(
+                        context.root / "name_mapping.csv",
+                        list(dict.fromkeys([*mapping_fields, *renaming.MAPPING_FIELDS])),
+                        mapping_rows,
+                    )
                     _adopt_batch_document(context.id, context.root, "name_mapping")
                     _replace_sdl_accession(old_accession, new_accession)
                     fields, rows, state = _load_batch_document(
@@ -2494,6 +2532,12 @@ def _start_renaming_job(
                         context.root,
                         Path(Config.COPATH_CLONE),
                         Path(Config.INSLIDE_BATCHES),
+                        inventory_path=(
+                            Path(Config.SCANNER_INVENTORIES)
+                            / f"{context.root.parent.name}_inventory.csv"
+                        ),
+                        prior_rows=_renaming_prior_rows(context.id),
+                        batch_id=context.id,
                     )
                     _adopt_batch_document(context.id, context.root, "name_mapping")
             state = {"status": "ready", "error": ""}
@@ -3201,6 +3245,7 @@ def _post_qc_sdl_rows(
 ) -> List[Dict[str, Any]]:
     """Build new SDL rows for scan groups absent from the workbook."""
     _, mapping = renaming.read_csv(batch_root / "name_mapping.csv")
+    mapping = renaming.active_mapping_rows(mapping)
     existing_groups = {
         sdl_type_key(
             row["values"]["Accession ID"],
@@ -4204,6 +4249,7 @@ def _tq_rebuild_catalog(
                 )
             sources.append(source)
             continue
+        source["mapping_version"] = int(state["desired_version"])
         try:
             fields, rows, _ = _load_batch_document(context.id, "name_mapping")
             missing = required.difference(fields)
@@ -4213,14 +4259,21 @@ def _tq_rebuild_catalog(
                 )
             batch_slides: List[Dict[str, Any]] = []
             for source_row, row in enumerate(rows):
+                disposition = renaming.mapping_disposition(row)
                 raw_original_path = row["OriginalPath"].strip()
                 original_path = str(runtime_path(raw_original_path))
                 accession = renaming.row_accession(row)
                 accession_key = renaming.accession_key(accession)
                 organ = row["Organ"].strip().upper()
                 pid = row["PID"].strip().upper()
-                destination_name = row["NewName"].strip()
-                if not all((original_path, accession, organ, pid, destination_name)):
+                destination_name = (
+                    row.get("NewName", "").strip()
+                    if disposition == "active"
+                    else row.get("ConflictName", "").strip()
+                )
+                if not all((original_path, accession, organ, pid)) or (
+                    disposition == "active" and not destination_name
+                ):
                     raise renaming.RenamingError(
                         "contains a row missing OriginalPath, AccessionID, "
                         "Organ, PID, or NewName"
@@ -4253,6 +4306,14 @@ def _tq_rebuild_catalog(
                         "block_number": row["BlockNumber"].strip(),
                         "section_count": row["SectionCount"].strip(),
                         "destination_name": destination_name,
+                        "source_size": (
+                            int(row["SourceSize"]) if row.get("SourceSize", "").isdigit()
+                            else None
+                        ),
+                        "disposition": disposition,
+                        "duplicate_of_batch": row.get("DuplicateOfBatch", ""),
+                        "duplicate_of_path": row.get("DuplicateOfPath", ""),
+                        "conflict_name": row.get("ConflictName", ""),
                         "sdl_types": [slide_type],
                         "digitization_date": digitization_date,
                     }
@@ -6687,7 +6748,7 @@ def tq_page():
                 "selected_ids": set(),
                 "destination_dir": "",
                 "include_copath": False,
-                "deidentify": False,
+                "deidentify": True,
                 "batch_size": 10,
                 "phase": "select",
             },
@@ -6696,7 +6757,7 @@ def tq_page():
             "selected_ids": set(draft["selected_ids"]),
             "destination_dir": str(draft.get("destination_dir", "")),
             "include_copath": bool(draft.get("include_copath", False)),
-            "deidentify": bool(draft.get("deidentify", False)),
+            "deidentify": bool(draft.get("deidentify", True)),
             "batch_size": int(draft.get("batch_size", 10)),
             "phase": draft["phase"],
         }
@@ -7011,7 +7072,7 @@ def tq_review():
                 "selected_ids": set(),
                 "destination_dir": "",
                 "include_copath": False,
-                "deidentify": False,
+                "deidentify": True,
                 "batch_size": 10,
                 "phase": "select",
             },
@@ -7040,7 +7101,7 @@ def tq_save_draft():
                 "selected_ids": set(),
                 "destination_dir": "",
                 "include_copath": False,
-                "deidentify": False,
+                "deidentify": True,
                 "batch_size": 10,
                 "phase": "select",
             },
@@ -7628,6 +7689,25 @@ def renaming_prepare(batch_id: str):
     return redirect(url_for("renaming_page", batch=batch_id))
 
 
+@app.route("/renaming/finish-duplicates/<batch_id>", methods=["POST"])
+@login_required
+def renaming_finish_duplicates(batch_id: str):
+    context = _renaming_context(batch_id)
+    if context is None:
+        flash("The batch is no longer available for renaming.", "warning")
+        return redirect(url_for("renaming_page"))
+    _, rows, _ = _load_batch_document(context.id, "name_mapping")
+    if not rows or any(
+        renaming.mapping_disposition(row) != "duplicate" for row in rows
+    ):
+        flash("Only a duplicate-only batch can be finished this way.", "error")
+        return redirect(url_for("renaming_page", batch=batch_id))
+    context.mark_renamed_complete()
+    _tq_prepare_catalog()
+    flash("Duplicate-only batch finished; no slides were made transferable.", "success")
+    return redirect(url_for("renaming_page"))
+
+
 @app.route("/renaming/retry/<batch_id>", methods=["POST"])
 @login_required
 def renaming_retry(batch_id: str):
@@ -7796,8 +7876,17 @@ def renaming_approve(batch_id: str):
                 values["PID"] = current_pid
             updated, merged = renaming.update_group_rows(
                 current_rows, old_accession, values, slide_values,
-                current_signature,
+                current_signature, validate=False,
             )
+            renaming.assign_catalog_names(
+                updated,
+                _renaming_prior_rows(context.id),
+                context.id,
+                preserve_sections=True,
+            )
+            errors = renaming.validate_mapping_rows(updated)
+            if errors:
+                raise renaming.RenamingError("; ".join(errors))
             _replace_batch_document(
                 context.id, "name_mapping", renaming.MAPPING_FIELDS, updated
             )
@@ -7819,7 +7908,7 @@ def renaming_approve(batch_id: str):
         else:
             message = f"Approved names for {values['AccessionID']}."
             category = "success"
-        if updated and all(renaming.parse_bool(row["Approved"]) for row in updated):
+        if updated and renaming.mapping_ready(updated):
             if not _start_renaming_finalization(context):
                 raise renaming.RenamingError(
                     "Batch finalization is already running"

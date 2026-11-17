@@ -5,25 +5,25 @@
     <input type="hidden" name="slide_count" value="{{ group.slides|length }}">
     <div class="cell"><button class="slide-toggle secondary" type="button" aria-expanded="false" aria-controls="slides-{{ group_key }}" title="Show slides">▶</button></div>
     <div class="cell accession-cell">
-        <input name="accession_id" value="{{ group.shared.AccessionID }}" aria-describedby="requery-suggestion-{{ group_key }}" required>
+        <input name="accession_id" value="{{ group.shared.AccessionID }}" aria-describedby="requery-suggestion-{{ group_key }}" required {% if not group.has_active %}disabled{% endif %}>
         <small class="requery-suggestion" id="requery-suggestion-{{ group_key }}" hidden>Accession changed. Consider requerying CoPath.</small>
     </div>
-    <div class="cell"><select name="organ">{% for value in ['BRAIN','BREAST','TESTIS','OTHER','UNKNOWN'] %}<option {% if group.shared.Organ==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div class="cell"><select name="organ" {% if not group.has_active %}disabled{% endif %}>{% for value in ['BRAIN','BREAST','TESTIS','OTHER','UNKNOWN'] %}<option {% if group.shared.Organ==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
     <div class="cell"><input name="pid" value="{{ group.shared.PID }}" maxlength="6" required readonly></div>
-    <div class="cell"><input name="accession_date" value="{{ group.shared.AccessionDate }}" maxlength="8" required></div>
-    <div class="cell"><input name="timepoint" value="{{ group.shared.Timepoint }}" maxlength="4" required></div>
-    <div class="cell"><select name="image_type">{% for value in ['WSI','FNA','XXX'] %}<option {% if group.shared.ImageType==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
-    <div class="cell"><select name="samp_acq_type">{% for value in ['RE','BP','XX'] %}<option {% if group.shared.SampAcqType==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div class="cell"><input name="accession_date" value="{{ group.shared.AccessionDate }}" maxlength="8" required {% if not group.has_active %}disabled{% endif %}></div>
+    <div class="cell"><input name="timepoint" value="{{ group.shared.Timepoint }}" maxlength="4" required {% if not group.has_active %}disabled{% endif %}></div>
+    <div class="cell"><select name="image_type" {% if not group.has_active %}disabled{% endif %}>{% for value in ['WSI','FNA','XXX'] %}<option {% if group.shared.ImageType==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div class="cell"><select name="samp_acq_type" {% if not group.has_active %}disabled{% endif %}>{% for value in ['RE','BP','XX'] %}<option {% if group.shared.SampAcqType==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
     <div class="cell">{% if group.report %}<button class="report-toggle secondary" type="button" aria-expanded="false" aria-controls="reports-{{ group_key }}">View</button>{% else %}<button class="secondary" type="button" disabled>No report</button>{% endif %}</div>
-    <div class="cell approval-state">{% if group.approved %}<strong>Approved</strong>{% else %}<span>Pending</span>{% endif %}</div>
+    <div class="cell approval-state">{% if not group.has_active %}<strong>Duplicate</strong>{% elif group.approved %}<strong>Approved</strong>{% else %}<span>Pending</span>{% endif %}</div>
     <div class="cell actions">
-        <button class="success approve-button" type="submit" {% if job_state.status in ('preparing','retrying','finalizing') %}disabled{% endif %}>Approve</button>
-        <button class="secondary retry-button" type="submit" formaction="{{ url_for('renaming_retry', batch_id=context.id) }}" {% if job_state.status in ('preparing','retrying','finalizing') %}disabled{% endif %}>Requery CoPath</button>
+        <button class="success approve-button" type="submit" {% if not group.has_active or job_state.status in ('preparing','retrying','finalizing') %}disabled{% endif %}>Approve</button>
+        <button class="secondary retry-button" type="submit" formaction="{{ url_for('renaming_retry', batch_id=context.id) }}" {% if not group.has_active or job_state.status in ('preparing','retrying','finalizing') %}disabled{% endif %}>Requery CoPath</button>
     </div>
     <div class="expanded" id="slides-{{ group_key }}" hidden>
         <div class="slide"><strong>Original path</strong><strong>Stain</strong><strong>Block</strong><strong>Section</strong><strong>New name</strong></div>
         {% for slide in group.slides %}
-        <div class="slide">
+        <div class="slide {% if slide.Disposition == 'duplicate' %}duplicate-slide{% endif %}">
             <div>
                 <span class="path">{{ slide.OriginalPath }}</span>
                 {% if slide.LabelImageURL or slide.MacroImageURL %}
@@ -34,10 +34,17 @@
                 {% endif %}
             </div>
             <input type="hidden" name="original_path_{{ loop.index0 }}" value="{{ slide.OriginalPath }}">
+            {% if slide.Disposition == 'duplicate' %}
+            <span>{{ slide.Stain }}</span>
+            <span>{{ slide.BlockNumber }}</span>
+            <span class="duplicate-section">---</span>
+            <span class="new-name">Duplicate: {{ slide.ConflictName }}<br><small>{{ slide.SourceSize }} bytes; matches {{ slide.DuplicateOfPath }}</small></span>
+            {% else %}
             <input name="stain_{{ loop.index0 }}" value="{{ slide.Stain }}" required>
             <input name="block_number_{{ loop.index0 }}" value="{{ slide.BlockNumber }}" required>
             <input name="section_count_{{ loop.index0 }}" value="{{ slide.SectionCount }}" maxlength="3" required>
             <span class="new-name">{{ slide.NewName }}</span>
+            {% endif %}
         </div>
         {% endfor %}
     </div>

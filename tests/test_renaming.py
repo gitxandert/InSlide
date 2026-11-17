@@ -73,6 +73,112 @@ class RenamingDataTests(unittest.TestCase):
         self.assertEqual("BRAIN_AAAAAZ_20250304_XXXX_HE_WSI_REB4000.svs", rows[0]["NewName"])
         self.assertTrue(all(row["Approved"] == "False" for row in rows))
 
+    def test_prepare_uses_inventory_to_flag_duplicate_and_continue_sections(self):
+        inventory = self.root / "SS100_inventory.csv"
+        write_csv(
+            inventory,
+            ["full_path", "size_in_bytes"],
+            [
+                {"full_path": "one.svs", "size_in_bytes": "100"},
+                {"full_path": "two.svs", "size_in_bytes": "200"},
+            ],
+        )
+        prior = {
+            "AccessionID": "NP25-100", "Organ": "BRAIN", "PID": "AAAAAZ",
+            "AccessionDate": "20250304", "Timepoint": "XXXX", "Stain": "HE",
+            "ImageType": "WSI", "SampAcqType": "RE", "BlockNumber": "B4",
+            "SectionCount": "004", "OriginalPath": "old.svs", "Approved": "True",
+            "SourceSize": "100", "Disposition": "active", "_BatchID": "old-batch",
+        }
+        prior["NewName"] = renaming.build_new_name(prior)
+
+        renaming.prepare_batch(
+            self.batch,
+            self.clone,
+            self.batch_base,
+            self.query,
+            inventory_path=inventory,
+            prior_rows=[prior],
+            batch_id="new-batch",
+        )
+
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        duplicate, active = rows
+        self.assertEqual("duplicate", duplicate["Disposition"])
+        self.assertEqual("", duplicate["SectionCount"])
+        self.assertEqual("", duplicate["NewName"])
+        self.assertEqual("old-batch", duplicate["DuplicateOfBatch"])
+        self.assertEqual("old.svs", duplicate["DuplicateOfPath"])
+        self.assertEqual(prior["NewName"], duplicate["ConflictName"])
+        self.assertEqual(("active", "005"), (
+            active["Disposition"], active["SectionCount"],
+        ))
+
+    def test_prepare_fails_when_post_qc_slide_is_absent_from_inventory(self):
+        inventory = self.root / "SS100_inventory.csv"
+        write_csv(
+            inventory,
+            ["full_path", "size_in_bytes"],
+            [{"full_path": "one.svs", "size_in_bytes": "100"}],
+        )
+
+        with self.assertRaisesRegex(
+            renaming.RenamingError, "missing post-QC slide.*two.svs"
+        ):
+            renaming.prepare_batch(
+                self.batch,
+                self.clone,
+                self.batch_base,
+                self.query,
+                inventory_path=inventory,
+            )
+
+    def test_inventory_paths_follow_windows_and_unix_case_rules(self):
+        inventory = self.root / "inventory.csv"
+        write_csv(
+            inventory,
+            ["full_path", "size_in_bytes"],
+            [
+                {"full_path": "scan/A.svs", "size_in_bytes": "100"},
+                {"full_path": "scan/a.svs", "size_in_bytes": "200"},
+                {"full_path": r"D:\Scan\One.SVS", "size_in_bytes": "300"},
+            ],
+        )
+
+        sizes = renaming.inventory_sizes(
+            inventory,
+            ["scan/A.svs", "scan/a.svs", r"d:/scan/one.svs"],
+        )
+
+        self.assertEqual(100, sizes[renaming.normalized_slide_path("scan/A.svs")])
+        self.assertEqual(200, sizes[renaming.normalized_slide_path("scan/a.svs")])
+        self.assertEqual(
+            300, sizes[renaming.normalized_slide_path(r"d:/scan/one.svs")]
+        )
+
+    def test_reallocation_does_not_steal_another_current_section(self):
+        def mapping_row(path, section):
+            row = {
+                "AccessionID": "NP25-100", "Organ": "BRAIN", "PID": "AAAAAA",
+                "AccessionDate": "20250101", "Timepoint": "XXXX", "Stain": "HE",
+                "ImageType": "WSI", "SampAcqType": "RE", "BlockNumber": "A1",
+                "SectionCount": section, "OriginalPath": path, "Approved": "False",
+                "SourceSize": "", "Disposition": "active",
+            }
+            row["NewName"] = renaming.build_new_name(row)
+            return row
+
+        prior = mapping_row("old.svs", "000")
+        rows = [mapping_row("collision.svs", "000"), mapping_row("keep.svs", "001")]
+
+        renaming.assign_catalog_names(
+            rows, [{**prior, "_BatchID": "old-batch"}], "new-batch",
+            preserve_sections=True,
+        )
+
+        self.assertEqual("002", rows[0]["SectionCount"])
+        self.assertEqual("001", rows[1]["SectionCount"])
+
     def test_prepare_preserves_arbitrary_accession_and_matches_copath_case_insensitively(self):
         write_csv(
             self.batch / "enriched.csv",
@@ -749,6 +855,52 @@ class RenamingPageTests(unittest.TestCase):
         self.assertIn(b'class="success approve-button"', detail.data)
         self.assertIn(b'Accession changed. Consider requerying CoPath.', detail.data)
         self.assertIn(b'>Requery CoPath</button>', detail.data)
+
+    def test_duplicate_only_batch_is_read_only_and_can_be_finished(self):
+        _, rows, _ = app_module._load_batch_document(
+            self.batch_id, "name_mapping"
+        )
+        conflict_name = rows[0]["NewName"]
+        rows[0].update({
+            "SectionCount": "", "NewName": "", "Approved": "False",
+            "SourceSize": "123", "Disposition": "duplicate",
+            "DuplicateOfBatch": "older-batch", "DuplicateOfPath": "old.svs",
+            "ConflictName": conflict_name,
+        })
+        app_module._replace_batch_document(
+            self.batch_id, "name_mapping", renaming.MAPPING_FIELDS, rows
+        )
+
+        detail = self.client.get(f"/renaming?batch={self.batch_id}")
+
+        self.assertEqual(200, detail.status_code)
+        self.assertIn(b'class="slide duplicate-slide"', detail.data)
+        self.assertIn(b'class="duplicate-section">---</span>', detail.data)
+        self.assertIn(b"Duplicate: BRAIN_AAAAAA_", detail.data)
+        self.assertIn(b'<div class="cell approval-state"><strong>Duplicate</strong>', detail.data)
+        self.assertNotIn(b'name="stain_0"', detail.data)
+        self.assertIn(b"Finish duplicate-only batch", detail.data)
+
+        finished = self.client.post(
+            f"/renaming/finish-duplicates/{self.batch_id}", data={}
+        )
+
+        self.assertEqual(302, finished.status_code)
+        batch = app_module.batch_catalog.get_batch(
+            app_module.Config.INSTANCE_DIR, self.batch_id
+        )
+        self.assertTrue(batch["renamed_complete"])
+        self.assertEqual(
+            [],
+            app_module.batch_catalog.list_transfer_slides(
+                app_module.Config.INSTANCE_DIR
+            ),
+        )
+        history = app_module.batch_catalog.accession_history(
+            app_module.Config.INSTANCE_DIR,
+            renaming.accession_key("NP25-100"),
+        )
+        self.assertEqual("duplicate", history["slides"][0]["disposition"])
 
     def test_approval_allows_accession_change_without_copath_requery(self):
         rows = self.add_second_accession()
