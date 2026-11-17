@@ -11,6 +11,7 @@ SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 from batch_catalog import BatchCatalog
+import compare_inventory_paths
 import renaming
 import resolve_output_filename_conflicts as resolver
 
@@ -198,6 +199,24 @@ class ResolveOutputFilenameConflictsTests(unittest.TestCase):
         audit_dir = self.instance / "catalog_audits"
         self.assertEqual(1, len(list(audit_dir.glob("batch_catalog_*.sqlite3"))))
         self.assertEqual(1, len(list(audit_dir.glob("slide_repairs_*.csv"))))
+
+    def test_compare_inventory_paths_shows_matching_basenames(self):
+        self.add_batch("SS100/2026-01-01", [
+            self.row("2026-01-01", 0), self.row("2026-01-01", 1)
+        ])
+        inventory_root = Path(self.temporary.name) / "inventories"
+        renaming.atomic_write(
+            inventory_root / "SS100_inventory.csv",
+            ["full_path", "size_in_bytes"],
+            [{"full_path": "/other/slide-0.svs", "size_in_bytes": "100"}],
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            compare_inventory_paths.compare(self.instance, inventory_root)
+        self.assertIn("SS100: 2 missing paths", output.getvalue())
+        self.assertIn("1 same basename", output.getvalue())
+        self.assertIn("1 no basename match", output.getvalue())
+        self.assertIn("inventory: /other/slide-0.svs", output.getvalue())
 
     def test_exhausted_section_numbers_fail_before_writes(self):
         old_id = self.add_batch(
