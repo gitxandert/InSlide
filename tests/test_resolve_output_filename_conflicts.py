@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import io
 import os
 import sys
@@ -15,6 +16,7 @@ from batch_catalog import BatchCatalog
 import compare_inventory_paths
 import renaming
 import resolve_output_filename_conflicts as resolver
+import report_output_filename_conflicts as report
 
 
 class ResolveOutputFilenameConflictsTests(unittest.TestCase):
@@ -235,6 +237,50 @@ class ResolveOutputFilenameConflictsTests(unittest.TestCase):
         self.assertEqual(0, plan.conflict_count)
         self.assertEqual("100", plan.documents[0].rows[0]["SourceSize"])
         self.assertEqual("active", plan.documents[0].rows[0]["Disposition"])
+
+    def test_rename_report_identifies_oldest_conflicting_row(self):
+        old = self.row("2026-01-01", 0)
+        new = self.row("2026-02-01", 0)
+        self.add_batch("SS100/2026-01-01", [old])
+        self.add_batch("SS100/2026-02-01", [new])
+        inventory_root = Path(self.temporary.name) / "inventories"
+        renaming.atomic_write(
+            inventory_root / "SS100_inventory.csv",
+            ["full_path", "size_in_bytes"],
+            [
+                {"full_path": old["OriginalPath"], "size_in_bytes": "100"},
+                {"full_path": new["OriginalPath"], "size_in_bytes": "200"},
+            ],
+        )
+        output = io.StringIO()
+        report.write_report(self.instance, inventory_root, output)
+        rows = list(csv.DictReader(io.StringIO(output.getvalue())))
+        self.assertEqual(1, len(rows))
+        self.assertEqual("SS100/2026-02-01", rows[0]["changed_batch"])
+        self.assertEqual("1", rows[0]["changed_row"])
+        self.assertEqual(old["NewName"], rows[0]["current_name"])
+        self.assertEqual("SS100/2026-01-01", rows[0]["conflicting_batch"])
+        self.assertEqual("1", rows[0]["conflicting_row"])
+        self.assertEqual(old["NewName"], rows[0]["conflicting_name"])
+        self.assertEqual(old["NewName"].replace("A1000", "A1001"), rows[0]["proposed_new_name"])
+
+    def test_rename_report_leaves_nonconflict_columns_blank(self):
+        row = self.row("2026-01-01", 0)
+        row["NewName"] = row["NewName"].replace("A1000", "A1005")
+        self.add_batch("SS100/2026-01-01", [row])
+        inventory_root = Path(self.temporary.name) / "inventories"
+        renaming.atomic_write(
+            inventory_root / "SS100_inventory.csv",
+            ["full_path", "size_in_bytes"],
+            [{"full_path": row["OriginalPath"], "size_in_bytes": "100"}],
+        )
+        output = io.StringIO()
+        report.write_report(self.instance, inventory_root, output)
+        rows = list(csv.DictReader(io.StringIO(output.getvalue())))
+        self.assertEqual(1, len(rows))
+        self.assertEqual("", rows[0]["conflicting_batch"])
+        self.assertEqual("", rows[0]["conflicting_row"])
+        self.assertEqual("", rows[0]["conflicting_name"])
 
     def test_exhausted_section_numbers_fail_before_writes(self):
         old_id = self.add_batch(
