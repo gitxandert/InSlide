@@ -1,3 +1,5 @@
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -157,6 +159,13 @@ class ResolveOutputFilenameConflictsTests(unittest.TestCase):
         )
 
         plan = resolver.plan_inventory_repairs(self.instance, inventory_root)
+        output = io.StringIO()
+        with mock.patch.object(resolver, "plan_inventory_repairs", return_value=plan):
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(0, resolver.main([]))
+        self.assertIn("2 inventory issue(s):\n  1 duplicates\n  1 missing sources", output.getvalue())
+        self.assertIn("3 row(s) need catalog updates:\n  1 duplicates\n  1 missing sources\n  0 renamed slides\n  1 metadata only", output.getvalue())
+        self.assertNotIn("SS100/", output.getvalue())
 
         planned_old = next(
             document for document in plan.documents if document.public_id == old_id

@@ -9,7 +9,7 @@ import os
 import sqlite3
 import sys
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Optional
 
@@ -41,6 +41,8 @@ class RepairPlan:
     documents: list[MappingDocument]
     changes: list[FilenameChange]
     conflict_count: int
+    issues: Counter[str] = field(default_factory=Counter)
+    updates: Counter[str] = field(default_factory=Counter)
 
 
 def _inventory_rows(path: Path) -> dict[str, int]:
@@ -265,7 +267,8 @@ def plan_inventory_repairs(instance_dir: Path, inventory_root: Path) -> RepairPl
     }
     prior_rows: list[dict[str, str]] = []
     changes: list[FilenameChange] = []
-    issue_count = 0
+    issues: Counter[str] = Counter()
+    updates: Counter[str] = Counter()
     for document in documents:
         scanner = PurePosixPath(document.relative_path).parts[0]
         inventory = inventories.get(scanner)
@@ -281,7 +284,7 @@ def plan_inventory_repairs(instance_dir: Path, inventory_root: Path) -> RepairPl
                     "DuplicateOfBatch": "", "DuplicateOfPath": "",
                     "ConflictName": "",
                 })
-                issue_count += 1
+                issues["missing sources"] += 1
             else:
                 row["SourceSize"] = str(size)
                 if not row.get("Disposition", "").strip():
@@ -295,16 +298,24 @@ def plan_inventory_repairs(instance_dir: Path, inventory_root: Path) -> RepairPl
         )
         for row_index, (before, after) in enumerate(zip(original, document.rows)):
             if before != after:
+                disposition = renaming.mapping_disposition(after)
+                if disposition == "duplicate":
+                    issues["duplicates"] += 1
+                    updates["duplicates"] += 1
+                elif disposition == "missing_source":
+                    updates["missing sources"] += 1
+                elif before.get("NewName", "") != after.get("NewName", ""):
+                    updates["renamed slides"] += 1
+                else:
+                    updates["metadata only"] += 1
                 changes.append(FilenameChange(
                     document.public_id,
                     document.relative_path,
                     row_index,
                     before.get("NewName", ""),
                     after.get("NewName") or after.get("ConflictName", ""),
-                    renaming.mapping_disposition(after),
+                    disposition,
                 ))
-                if renaming.mapping_disposition(after) == "duplicate":
-                    issue_count += 1
         document.fields = list(dict.fromkeys([*document.fields, *renaming.MAPPING_FIELDS]))
         errors = renaming.validate_mapping_rows([dict(row) for row in document.rows])
         if errors:
@@ -313,7 +324,7 @@ def plan_inventory_repairs(instance_dir: Path, inventory_root: Path) -> RepairPl
             {**row, "_BatchID": document.public_id, "_BatchPath": document.relative_path}
             for row in document.rows
         )
-    return RepairPlan(documents, changes, issue_count)
+    return RepairPlan(documents, changes, sum(issues.values()), issues, updates)
 
 
 def apply_repairs(instance_dir: Path, plan: RepairPlan) -> int:
@@ -395,19 +406,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser().parse_args(argv)
     try:
         plan = plan_inventory_repairs(args.instance_dir, args.inventory_root)
-        for change in plan.changes:
-            print(
-                f"{change.relative_path} row {change.row_index + 1} "
-                f"[{change.disposition or 'renamed'}]: "
-                f"{change.old_name} -> {change.new_name}"
-            )
+        print(f"{plan.conflict_count} inventory issue(s):")
+        for label in ("duplicates", "missing sources"):
+            print(f"  {plan.issues[label]} {label}")
+        print(f"{len(plan.changes)} row(s) need catalog updates:")
+        for label in ("duplicates", "missing sources", "renamed slides", "metadata only"):
+            print(f"  {plan.updates[label]} {label}")
         if not plan.changes:
-            print("Catalog matches scanner inventories; no repairs are needed.")
+            print("No catalog updates needed.")
             return 0
-        print(
-            f"Found {plan.conflict_count} inventory issue(s); "
-            f"{len(plan.changes)} row(s) need catalog updates."
-        )
         if not args.apply:
             print("Dry run complete. Re-run with --apply to update the catalog.")
             return 0
