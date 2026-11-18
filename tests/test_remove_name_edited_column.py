@@ -21,105 +21,87 @@ class RemoveNameEditedColumnTests(unittest.TestCase):
         self.instance = self.root / "instance"
         self.catalog = BatchCatalog()
         self.mapping.parent.mkdir(parents=True)
-        renaming.atomic_write(self.mapping, ["OriginalPath", "NameEdited"], [
-            {"OriginalPath": "one.svs", "NameEdited": "True"}
-        ])
-
-    def test_removes_csv_column_and_preserves_database_flag(self):
-        batch_id = self.catalog.upsert_batch(self.instance, "SS100/batch-1")
-        fields, rows = renaming.read_csv(self.mapping)
+        fields = ["OriginalPath", "PID", "NameEdited"]
+        rows = [{"OriginalPath": "one.svs", "PID": "AAAAAA", "NameEdited": "True"}]
+        renaming.atomic_write(self.mapping, fields, rows)
+        self.batch_id = self.catalog.upsert_batch(self.instance, "SS100/batch-1")
         self.catalog.import_document(
-            self.instance, batch_id, "name_mapping", fields, rows,
+            self.instance, self.batch_id, "name_mapping", fields, rows,
             hashlib.sha256(self.mapping.read_bytes()).hexdigest(),
         )
+
+    def test_catalog_pid_wins_and_original_csv_is_backed_up(self):
+        fields, rows = renaming.read_csv(self.mapping)
+        renaming.atomic_write(self.mapping, fields, [dict(rows[0], PID="AAAAAB")])
         changes = cleanup.plan(self.batches, self.instance)
         self.assertEqual(1, len(changes))
         backup = cleanup.apply(changes, self.instance)
-        csv_fields, _ = renaming.read_csv(self.mapping)
+        csv_fields, csv_rows = renaming.read_csv(self.mapping)
         db_fields, db_rows, state = self.catalog.load_document(
-            self.instance, batch_id, "name_mapping"
+            self.instance, self.batch_id, "name_mapping"
         )
-        self.assertEqual(["OriginalPath"], csv_fields)
+        self.assertNotIn("NameEdited", csv_fields)
+        self.assertEqual("AAAAAA", csv_rows[0]["PID"])
+        self.assertEqual("AAAAAB", renaming.read_csv(
+            backup / "SS100" / "batch-1" / "name_mapping.csv"
+        )[1][0]["PID"])
         self.assertEqual(csv_fields, db_fields)
         self.assertEqual("True", db_rows[0]["NameEdited"])
         self.assertEqual("current", state["status"])
         self.assertEqual([], cleanup.plan(self.batches, self.instance))
-        self.assertEqual(fields, renaming.read_csv(
-            backup / "SS100" / "batch-1" / "name_mapping.csv"
-        )[0])
 
-    def test_refuses_to_drop_true_flag_without_catalog(self):
-        with self.assertRaisesRegex(ValueError, "need a catalog"):
-            cleanup.plan(self.batches, self.instance)
-
-    def test_cleans_legacy_csv_without_catalog_when_flags_are_false(self):
-        renaming.atomic_write(self.mapping, ["OriginalPath", "NameEdited"], [
-            {"OriginalPath": "one.svs", "NameEdited": "False"}
-        ])
+    def test_recreates_missing_export_from_catalog(self):
+        self.mapping.unlink()
         changes = cleanup.plan(self.batches, self.instance)
+        self.assertEqual(1, len(changes))
         cleanup.apply(changes, self.instance)
-        fields, _ = renaming.read_csv(self.mapping)
-        self.assertEqual(["OriginalPath"], fields)
-
-    def test_accepts_hash_mismatch_when_rows_match(self):
-        batch_id = self.catalog.upsert_batch(self.instance, "SS100/batch-1")
         fields, rows = renaming.read_csv(self.mapping)
-        self.catalog.import_document(
-            self.instance, batch_id, "name_mapping", fields, rows, "wrong-hash"
+        self.assertNotIn("NameEdited", fields)
+        self.assertEqual("AAAAAA", rows[0]["PID"])
+
+    def test_refuses_catalog_version_change_after_plan(self):
+        changes = cleanup.plan(self.batches, self.instance)
+        fields, rows, _ = self.catalog.load_document(
+            self.instance, self.batch_id, "name_mapping"
         )
-        self.catalog.mark_document_conflict(
-            self.instance, batch_id, "name_mapping", "changed outside InSlide"
+        self.catalog.replace_document(
+            self.instance, self.batch_id, "name_mapping", fields, rows
+        )
+        with self.assertRaisesRegex(RuntimeError, "catalog changed"):
+            cleanup.apply(changes, self.instance)
+
+    def test_removes_column_even_when_stored_hash_matches(self):
+        fields, rows, _ = self.catalog.load_document(
+            self.instance, self.batch_id, "name_mapping"
+        )
+        self.catalog.adopt_document(
+            self.instance, self.batch_id, "name_mapping",
+            [field for field in fields if field != "NameEdited"], rows,
+            hashlib.sha256(self.mapping.read_bytes()).hexdigest(),
         )
         changes = cleanup.plan(self.batches, self.instance)
         self.assertEqual(1, len(changes))
         cleanup.apply(changes, self.instance)
-        _, stored_rows, state = self.catalog.load_document(
-            self.instance, batch_id, "name_mapping"
+        self.assertNotIn("NameEdited", renaming.read_csv(self.mapping)[0])
+
+    def test_reconciles_conflicted_export_from_catalog(self):
+        self.catalog.mark_document_conflict(
+            self.instance, self.batch_id, "name_mapping", "changed outside InSlide"
         )
-        self.assertEqual("True", stored_rows[0]["NameEdited"])
+        changes = cleanup.plan(self.batches, self.instance)
+        cleanup.apply(changes, self.instance)
+        state = self.catalog.document_state(self.instance, self.batch_id, "name_mapping")
         self.assertEqual("current", state["status"])
 
-    def test_refuses_meaningful_row_difference(self):
-        batch_id = self.catalog.upsert_batch(self.instance, "SS100/batch-1")
-        fields, rows = renaming.read_csv(self.mapping)
-        self.catalog.import_document(
-            self.instance, batch_id, "name_mapping", fields, rows,
-            hashlib.sha256(self.mapping.read_bytes()).hexdigest(),
-        )
-        renaming.atomic_write(self.mapping, fields, [
-            {"OriginalPath": "different.svs", "NameEdited": "True"}
-        ])
-        with self.assertRaisesRegex(ValueError, "row 1 differs in OriginalPath"):
+    def test_refuses_orphan_csv(self):
+        orphan = self.batches / "SS200" / "batch-2" / "name_mapping.csv"
+        renaming.atomic_write(orphan, ["PID"], [{"PID": "AAAAAB"}])
+        with self.assertRaisesRegex(ValueError, "no matching catalog document"):
             cleanup.plan(self.batches, self.instance)
 
-    def test_removes_stale_catalog_column_when_csv_already_lacks_it(self):
-        batch_id = self.catalog.upsert_batch(self.instance, "SS100/batch-1")
-        fields, rows = renaming.read_csv(self.mapping)
-        self.catalog.import_document(
-            self.instance, batch_id, "name_mapping", fields, rows,
-            hashlib.sha256(self.mapping.read_bytes()).hexdigest(),
-        )
-        renaming.atomic_write(self.mapping, ["OriginalPath"], rows)
-        changes = cleanup.plan(self.batches, self.instance)
-        self.assertEqual(1, len(changes))
-        cleanup.apply(changes, self.instance)
-        db_fields, db_rows, _ = self.catalog.load_document(
-            self.instance, batch_id, "name_mapping"
-        )
-        self.assertEqual(["OriginalPath"], db_fields)
-        self.assertEqual("True", db_rows[0]["NameEdited"])
-
-    def test_pid_mismatch_reports_both_values_without_changing_data(self):
-        batch_id = self.catalog.upsert_batch(self.instance, "SS100/batch-1")
-        fields = ["OriginalPath", "PID", "NameEdited"]
-        rows = [{"OriginalPath": "one.svs", "PID": "AAAAAA", "NameEdited": "False"}]
-        renaming.atomic_write(self.mapping, fields, rows)
-        self.catalog.import_document(
-            self.instance, batch_id, "name_mapping", fields, rows,
-            hashlib.sha256(self.mapping.read_bytes()).hexdigest(),
-        )
-        renaming.atomic_write(self.mapping, fields, [dict(rows[0], PID="AAAAAB")])
-        with self.assertRaisesRegex(ValueError, "CSV=AAAAAB, catalog=AAAAAA"):
+    def test_requires_catalog(self):
+        self.catalog.database_path(self.instance).unlink()
+        with self.assertRaisesRegex(ValueError, "catalog not found"):
             cleanup.plan(self.batches, self.instance)
 
 
