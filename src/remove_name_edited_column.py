@@ -1,6 +1,6 @@
-"""Remove NameEdited from existing name_mapping.csv files.
+"""Queue catalog-backed name_mapping.csv exports without NameEdited.
 
-Stop InSlide before --apply. Without --apply, list files that need cleanup.
+Stop InSlide before --apply. Restart it afterward to write queued exports.
 """
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ import argparse
 import csv
 import datetime as dt
 import hashlib
-import os
 import shutil
 import sqlite3
 import sys
@@ -17,7 +16,6 @@ from contextlib import closing
 from pathlib import Path
 
 from batch_catalog import catalog, normalize_relative_path
-import renaming
 
 
 def file_hash(path: Path) -> str:
@@ -88,16 +86,9 @@ def apply(changes: list[tuple[Path, str, list[str], list[dict], int]],
         shutil.copy2(path, backup_path)
     for path, batch_id, fields, rows, _ in changes:
         updated_fields = [field for field in fields if field != "NameEdited"]
-        version = catalog.replace_document(
+        catalog.replace_document(
             instance_dir, batch_id, "name_mapping", updated_fields, rows
         )
-        renaming.atomic_write(path, updated_fields, rows)
-        if os.name != "nt":
-            path.chmod(0o444)
-        if not catalog.finish_export(
-            instance_dir, batch_id, "name_mapping", version, file_hash(path)
-        ):
-            raise RuntimeError(f"{path}: catalog changed during export; rerun")
     return backup_dir
 
 
@@ -113,8 +104,9 @@ def main(argv: list[str] | None = None) -> int:
         for path, _, _, _, _ in changes:
             print(path)
         if args.apply and changes:
-            print(f"Exported {len(changes)} catalog mapping(s); backup: {apply(changes, args.instance_dir)}")
-    except (OSError, sqlite3.Error, renaming.RenamingError, RuntimeError, ValueError) as exc:
+            print(f"Queued {len(changes)} catalog export(s); backup: {apply(changes, args.instance_dir)}")
+            print("Restart InSlide to write the CSV files.")
+    except (OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     return 0

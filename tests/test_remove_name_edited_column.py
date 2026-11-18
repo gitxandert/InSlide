@@ -30,7 +30,7 @@ class RemoveNameEditedColumnTests(unittest.TestCase):
             hashlib.sha256(self.mapping.read_bytes()).hexdigest(),
         )
 
-    def test_catalog_pid_wins_and_original_csv_is_backed_up(self):
+    def test_catalog_pid_wins_and_export_is_queued(self):
         fields, rows = renaming.read_csv(self.mapping)
         renaming.atomic_write(self.mapping, fields, [dict(rows[0], PID="AAAAAB")])
         changes = cleanup.plan(self.batches, self.instance)
@@ -40,24 +40,29 @@ class RemoveNameEditedColumnTests(unittest.TestCase):
         db_fields, db_rows, state = self.catalog.load_document(
             self.instance, self.batch_id, "name_mapping"
         )
-        self.assertNotIn("NameEdited", csv_fields)
-        self.assertEqual("AAAAAA", csv_rows[0]["PID"])
+        self.assertIn("NameEdited", csv_fields)
+        self.assertEqual("AAAAAB", csv_rows[0]["PID"])
         self.assertEqual("AAAAAB", renaming.read_csv(
             backup / "SS100" / "batch-1" / "name_mapping.csv"
         )[1][0]["PID"])
-        self.assertEqual(csv_fields, db_fields)
+        self.assertNotIn("NameEdited", db_fields)
+        self.assertEqual("AAAAAA", db_rows[0]["PID"])
         self.assertEqual("True", db_rows[0]["NameEdited"])
-        self.assertEqual("current", state["status"])
-        self.assertEqual([], cleanup.plan(self.batches, self.instance))
+        self.assertEqual("pending", state["status"])
+        snapshot = self.catalog.export_snapshot(
+            self.instance, self.batch_id, "name_mapping", state["desired_version"]
+        )
+        self.assertEqual("AAAAAA", snapshot[1][0]["PID"])
+        self.assertNotIn("NameEdited", snapshot[0])
 
-    def test_recreates_missing_export_from_catalog(self):
+    def test_queues_missing_export_from_catalog(self):
         self.mapping.unlink()
         changes = cleanup.plan(self.batches, self.instance)
         self.assertEqual(1, len(changes))
         cleanup.apply(changes, self.instance)
-        fields, rows = renaming.read_csv(self.mapping)
-        self.assertNotIn("NameEdited", fields)
-        self.assertEqual("AAAAAA", rows[0]["PID"])
+        self.assertFalse(self.mapping.exists())
+        state = self.catalog.document_state(self.instance, self.batch_id, "name_mapping")
+        self.assertEqual("pending", state["status"])
 
     def test_refuses_catalog_version_change_after_plan(self):
         changes = cleanup.plan(self.batches, self.instance)
@@ -82,7 +87,10 @@ class RemoveNameEditedColumnTests(unittest.TestCase):
         changes = cleanup.plan(self.batches, self.instance)
         self.assertEqual(1, len(changes))
         cleanup.apply(changes, self.instance)
-        self.assertNotIn("NameEdited", renaming.read_csv(self.mapping)[0])
+        self.assertNotIn(
+            "NameEdited",
+            self.catalog.load_document(self.instance, self.batch_id, "name_mapping")[0],
+        )
 
     def test_reconciles_conflicted_export_from_catalog(self):
         self.catalog.mark_document_conflict(
@@ -91,7 +99,21 @@ class RemoveNameEditedColumnTests(unittest.TestCase):
         changes = cleanup.plan(self.batches, self.instance)
         cleanup.apply(changes, self.instance)
         state = self.catalog.document_state(self.instance, self.batch_id, "name_mapping")
-        self.assertEqual("current", state["status"])
+        self.assertEqual("pending", state["status"])
+
+    def test_recovers_pending_export_after_failed_direct_write(self):
+        fields, rows, _ = self.catalog.load_document(
+            self.instance, self.batch_id, "name_mapping"
+        )
+        self.catalog.replace_document(
+            self.instance, self.batch_id, "name_mapping",
+            [field for field in fields if field != "NameEdited"], rows,
+        )
+        changes = cleanup.plan(self.batches, self.instance)
+        self.assertEqual(1, len(changes))
+        cleanup.apply(changes, self.instance)
+        state = self.catalog.document_state(self.instance, self.batch_id, "name_mapping")
+        self.assertEqual("pending", state["status"])
 
     def test_refuses_orphan_csv(self):
         orphan = self.batches / "SS200" / "batch-2" / "name_mapping.csv"
