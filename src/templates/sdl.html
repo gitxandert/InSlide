@@ -188,6 +188,7 @@
         }
         .delete-link:hover { background: none; color: #a71d2a; text-decoration: underline; }
         .empty { padding: 30px; text-align: center; color: var(--muted); }
+        .table-navigation { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 14px; }
 
         @media (max-width: 1100px) {
             form { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
@@ -384,7 +385,7 @@
                         </p>
                     </div>
                     <p data-table-count>
-                        {% if rows|length != total_rows %}{{ rows|length }} of {% endif %}
+                        {% if matching_rows != total_rows %}{{ matching_rows }} matching · {% endif %}
                         {{ total_rows }} {{ 'entry' if total_rows == 1 else 'entries' }}
                     </p>
                 </div>
@@ -490,6 +491,11 @@
                             </tbody>
                         </table>
                     </div>
+                    <nav class="table-navigation" data-table-navigation aria-label="Workbook pages">
+                        {% if current_page > 1 %}<a href="{{ url_for('sdl', **dict(query_params, page=current_page - 1)) }}">Previous</a>{% endif %}
+                        <span>Page {{ current_page }} of {{ total_pages }}</span>
+                        {% if current_page < total_pages %}<a href="{{ url_for('sdl', **dict(query_params, page=current_page + 1)) }}">Next</a>{% endif %}
+                    </nav>
                 {% else %}
                     <div class="empty">No log entries have been added yet.</div>
                 {% endif %}
@@ -589,13 +595,15 @@
                 const nextBody = nextPage.querySelector('[data-table-body]');
                 const nextCount = nextPage.querySelector('[data-table-count]');
                 const nextStatistics = nextPage.querySelector('[data-table-statistics]');
-                if (!nextBody || !nextCount || !nextStatistics) {
+                const nextNavigation = nextPage.querySelector('[data-table-navigation]');
+                if (!nextBody || !nextCount || !nextStatistics || !nextNavigation) {
                     window.location.assign(response.url);
                     return;
                 }
                 document.querySelector('[data-table-body]').innerHTML = nextBody.innerHTML;
                 document.querySelector('[data-table-count]').innerHTML = nextCount.innerHTML;
                 document.querySelector('[data-table-statistics]').innerHTML = nextStatistics.innerHTML;
+                document.querySelector('[data-table-navigation]').innerHTML = nextNavigation.innerHTML;
                 const nextSortLinks = nextPage.querySelectorAll('.sort-link');
                 document.querySelectorAll('.sort-link').forEach((link, index) => {
                     if (nextSortLinks[index]) {
@@ -636,6 +644,12 @@
                 event.preventDefault();
                 updateTable(link.href);
             });
+        });
+        document.querySelector('[data-table-navigation]')?.addEventListener('click', (event) => {
+            const link = event.target.closest('a');
+            if (!link) return;
+            event.preventDefault();
+            updateTable(link.href);
         });
 
         function attachEditableRows() {

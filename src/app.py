@@ -3612,6 +3612,15 @@ def _render_sdl_page(
         for row in rows
         if (value := row["values"]["Slides Count"].strip()).isdigit()
     )
+    matching_rows = len(rows)
+    rows_per_page = 100
+    total_pages = max(1, (matching_rows + rows_per_page - 1) // rows_per_page)
+    try:
+        current_page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        current_page = 1
+    current_page = min(current_page, total_pages)
+    rows = rows[(current_page - 1) * rows_per_page:current_page * rows_per_page]
     query_params = _table_query_params(
         global_query, column_filters, sort_column, sort_direction
     )
@@ -3658,6 +3667,9 @@ def _render_sdl_page(
         workbook_available=True,
         rows=rows,
         total_rows=total_rows,
+        matching_rows=matching_rows,
+        current_page=current_page,
+        total_pages=total_pages,
         accession_count=accession_count,
         slide_count=slide_count,
         headers=SDL_HEADERS,

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 import sys
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
@@ -187,6 +187,28 @@ class TableSearchRouteTests(unittest.TestCase):
         self.assertIn(b"Row", response.data)
         self.assertIn("▲".encode(), response.data)
         self.assertIn("↕".encode(), response.data)
+
+    def test_sdl_pages_limit_rendered_rows_without_losing_search_or_totals(self):
+        workbook = load_workbook(self.workbook_path)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        for number in range(4, 125):
+            worksheet.append([f"NP25-{number}", "BRAIN", "", 1])
+        workbook.save(self.workbook_path)
+        workbook.close()
+
+        first = self.client.get("/sdl")
+        second = self.client.get("/sdl?page=2")
+        filtered = self.client.get("/sdl?q=NP25-10")
+
+        self.assertIn(b"Page 1 of 2", first.data)
+        self.assertIn(b"Page 2 of 2", second.data)
+        self.assertEqual(100, first.data.count(b'class="editable-row"'))
+        self.assertEqual(24, second.data.count(b'class="editable-row"'))
+        self.assertIn(b"124 entries", first.data)
+        self.assertIn(b"130 slides", first.data)
+        self.assertIn(b"/sdl?page=2", first.data)
+        self.assertIn(b"matching", filtered.data)
+        self.assertIn(b"NP25-10", filtered.data)
 
     def test_inventory_route_renders_naturally_sorted_results(self):
         response = self.client.get(
