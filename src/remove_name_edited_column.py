@@ -44,15 +44,32 @@ def plan(batches_root: Path, instance_dir: Path) -> list[tuple[Path, str | None,
                 )
             except KeyError as exc:
                 raise ValueError(f"{path}: no matching catalog document") from exc
-            if (state["status"] != "current"
-                    or file_hash(path) != state["source_hash"]
-                    or fields != stored_fields
-                    or rows != [{field: row.get(field, "") for field in fields}
-                                for row in stored_rows]):
-                raise ValueError(f"{path}: catalog and CSV differ; resolve conflict first")
+            if state["status"] not in {"current", "conflict"}:
+                raise ValueError(f"{path}: catalog export is {state['status']}; finish it first")
+            public_fields = [field for field in fields if field != "NameEdited"]
+            stored_public_fields = [field for field in stored_fields if field != "NameEdited"]
+            if public_fields != stored_public_fields:
+                raise ValueError(f"{path}: CSV and catalog columns differ beyond NameEdited")
+            if len(rows) != len(stored_rows):
+                raise ValueError(
+                    f"{path}: CSV has {len(rows)} rows; catalog has {len(stored_rows)}"
+                )
+            for index, (row, stored) in enumerate(zip(rows, stored_rows), 1):
+                for field in public_fields:
+                    if row.get(field, "") != stored.get(field, ""):
+                        raise ValueError(f"{path}: row {index} differs in {field}")
+            rows = [
+                dict(row, NameEdited=(
+                    "True" if renaming.parse_bool(row.get("NameEdited", ""))
+                    or renaming.parse_bool(stored.get("NameEdited", "")) else "False"
+                ))
+                for row, stored in zip(rows, stored_rows)
+            ]
         elif any(renaming.parse_bool(row.get("NameEdited", "")) for row in rows):
             raise ValueError(f"{path}: edited flags need a catalog before removal")
-        if "NameEdited" in fields:
+        if ("NameEdited" in fields or has_catalog and (
+                "NameEdited" in stored_fields or state["status"] == "conflict"
+                or file_hash(path) != state["source_hash"])):
             changes.append((path, batch_id, fields, rows))
     return changes
 

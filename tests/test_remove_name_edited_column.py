@@ -61,14 +61,53 @@ class RemoveNameEditedColumnTests(unittest.TestCase):
         fields, _ = renaming.read_csv(self.mapping)
         self.assertEqual(["OriginalPath"], fields)
 
-    def test_refuses_catalog_csv_mismatch(self):
+    def test_accepts_hash_mismatch_when_rows_match(self):
         batch_id = self.catalog.upsert_batch(self.instance, "SS100/batch-1")
         fields, rows = renaming.read_csv(self.mapping)
         self.catalog.import_document(
             self.instance, batch_id, "name_mapping", fields, rows, "wrong-hash"
         )
-        with self.assertRaisesRegex(ValueError, "catalog and CSV differ"):
+        self.catalog.mark_document_conflict(
+            self.instance, batch_id, "name_mapping", "changed outside InSlide"
+        )
+        changes = cleanup.plan(self.batches, self.instance)
+        self.assertEqual(1, len(changes))
+        cleanup.apply(changes, self.instance)
+        _, stored_rows, state = self.catalog.load_document(
+            self.instance, batch_id, "name_mapping"
+        )
+        self.assertEqual("True", stored_rows[0]["NameEdited"])
+        self.assertEqual("current", state["status"])
+
+    def test_refuses_meaningful_row_difference(self):
+        batch_id = self.catalog.upsert_batch(self.instance, "SS100/batch-1")
+        fields, rows = renaming.read_csv(self.mapping)
+        self.catalog.import_document(
+            self.instance, batch_id, "name_mapping", fields, rows,
+            hashlib.sha256(self.mapping.read_bytes()).hexdigest(),
+        )
+        renaming.atomic_write(self.mapping, fields, [
+            {"OriginalPath": "different.svs", "NameEdited": "True"}
+        ])
+        with self.assertRaisesRegex(ValueError, "row 1 differs in OriginalPath"):
             cleanup.plan(self.batches, self.instance)
+
+    def test_removes_stale_catalog_column_when_csv_already_lacks_it(self):
+        batch_id = self.catalog.upsert_batch(self.instance, "SS100/batch-1")
+        fields, rows = renaming.read_csv(self.mapping)
+        self.catalog.import_document(
+            self.instance, batch_id, "name_mapping", fields, rows,
+            hashlib.sha256(self.mapping.read_bytes()).hexdigest(),
+        )
+        renaming.atomic_write(self.mapping, ["OriginalPath"], rows)
+        changes = cleanup.plan(self.batches, self.instance)
+        self.assertEqual(1, len(changes))
+        cleanup.apply(changes, self.instance)
+        db_fields, db_rows, _ = self.catalog.load_document(
+            self.instance, batch_id, "name_mapping"
+        )
+        self.assertEqual(["OriginalPath"], db_fields)
+        self.assertEqual("True", db_rows[0]["NameEdited"])
 
 
 if __name__ == "__main__":
