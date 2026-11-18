@@ -57,6 +57,11 @@ def plan(batches_root: Path, instance_dir: Path) -> list[tuple[Path, str | None,
             for index, (row, stored) in enumerate(zip(rows, stored_rows), 1):
                 for field in public_fields:
                     if row.get(field, "") != stored.get(field, ""):
+                        if field == "PID":
+                            raise ValueError(
+                                f"{path}: row {index} PID differs "
+                                f"(CSV={row.get(field, '')}, catalog={stored.get(field, '')})"
+                            )
                         raise ValueError(f"{path}: row {index} differs in {field}")
             rows = [
                 dict(row, NameEdited=(

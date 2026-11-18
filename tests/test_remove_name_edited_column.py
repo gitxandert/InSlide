@@ -109,6 +109,19 @@ class RemoveNameEditedColumnTests(unittest.TestCase):
         self.assertEqual(["OriginalPath"], db_fields)
         self.assertEqual("True", db_rows[0]["NameEdited"])
 
+    def test_pid_mismatch_reports_both_values_without_changing_data(self):
+        batch_id = self.catalog.upsert_batch(self.instance, "SS100/batch-1")
+        fields = ["OriginalPath", "PID", "NameEdited"]
+        rows = [{"OriginalPath": "one.svs", "PID": "AAAAAA", "NameEdited": "False"}]
+        renaming.atomic_write(self.mapping, fields, rows)
+        self.catalog.import_document(
+            self.instance, batch_id, "name_mapping", fields, rows,
+            hashlib.sha256(self.mapping.read_bytes()).hexdigest(),
+        )
+        renaming.atomic_write(self.mapping, fields, [dict(rows[0], PID="AAAAAB")])
+        with self.assertRaisesRegex(ValueError, "CSV=AAAAAB, catalog=AAAAAA"):
+            cleanup.plan(self.batches, self.instance)
+
 
 if __name__ == "__main__":
     unittest.main()
