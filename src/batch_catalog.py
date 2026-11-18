@@ -499,13 +499,14 @@ class BatchCatalog:
 
     @staticmethod
     def _document_values(
-        fields: Sequence[str], rows: Iterable[Mapping[str, object]]
+        fields: Sequence[str], rows: Iterable[Mapping[str, object]],
+        internal_fields: Sequence[str] = (),
     ) -> tuple[list[str], list[dict[str, str]]]:
         headers = list(dict.fromkeys(str(field) for field in fields))
         if not headers:
             raise ValueError("batch document must have at least one field")
         values = [
-            {field: str(row.get(field) or "") for field in headers}
+            {field: str(row.get(field) or "") for field in [*headers, *internal_fields]}
             for row in rows
         ]
         return headers, values
@@ -521,7 +522,9 @@ class BatchCatalog:
     ) -> bool:
         """Import one existing file once; never replace central edits."""
         kind = self._document_kind(kind)
-        headers, values = self._document_values(fields, rows)
+        headers, values = self._document_values(
+            fields, rows, ("NameEdited",) if kind == "name_mapping" else ()
+        )
         with self.connection(instance_dir) as connection:
             batch = self._batch_row(connection, public_id)
             existing = connection.execute(
@@ -595,7 +598,9 @@ class BatchCatalog:
     ) -> int:
         """Replace central rows and durably request one latest-version export."""
         kind = self._document_kind(kind)
-        headers, values = self._document_values(fields, rows)
+        headers, values = self._document_values(
+            fields, rows, ("NameEdited",) if kind == "name_mapping" else ()
+        )
         with self.connection(instance_dir) as connection:
             batch = self._batch_row(connection, public_id)
             state = connection.execute(
@@ -711,7 +716,9 @@ class BatchCatalog:
     ) -> int:
         """Adopt a file written by an internal pipeline job as current central data."""
         kind = self._document_kind(kind)
-        headers, values = self._document_values(fields, rows)
+        headers, values = self._document_values(
+            fields, rows, ("NameEdited",) if kind == "name_mapping" else ()
+        )
         with self.connection(instance_dir) as connection:
             batch = self._batch_row(connection, public_id)
             state = connection.execute(

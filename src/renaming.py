@@ -29,7 +29,7 @@ MAPPING_FIELDS = (
     "AccessionID", "Organ", "PID", "AccessionDate", "Timepoint", "Stain",
     "ImageType", "SampAcqType", "BlockNumber", "SectionCount", "OriginalPath",
     "NewName", "Approved", "SourceSize", "Disposition", "DuplicateOfBatch",
-    "DuplicateOfPath", "ConflictName", "NameEdited",
+    "DuplicateOfPath", "ConflictName",
 )
 DISPOSITIONS = {"active", "duplicate", "missing_source"}
 DERIVED_COPATH_FIELDS = ("organ", "PID", "_accdate", "timepoint", "image_type", "_sampacqtype")
@@ -834,7 +834,10 @@ def repair_staged_pid_assignments(
             transform_mapping(rows, original)
         if rows != original:
             targets.append((
-                path, list(dict.fromkeys([*headers, *MAPPING_FIELDS])), rows,
+                path, list(dict.fromkeys([
+                    *[field for field in headers if field != "NameEdited"],
+                    *MAPPING_FIELDS,
+                ])), rows,
                 headers, original,
             ))
 

@@ -316,7 +316,10 @@ def plan_inventory_repairs(instance_dir: Path, inventory_root: Path) -> RepairPl
                     after.get("NewName") or after.get("ConflictName", ""),
                     disposition,
                 ))
-        document.fields = list(dict.fromkeys([*document.fields, *renaming.MAPPING_FIELDS]))
+        document.fields = list(dict.fromkeys([
+            *[field for field in document.fields if field != "NameEdited"],
+            *renaming.MAPPING_FIELDS,
+        ]))
         errors = renaming.validate_mapping_rows([dict(row) for row in document.rows])
         if errors:
             raise ValueError(f"{document.relative_path}: {'; '.join(errors)}")

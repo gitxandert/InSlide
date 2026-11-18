@@ -275,6 +275,18 @@ class TQTransferTests(unittest.TestCase):
         with self.assertRaises(app_module.TQError):
             app_module._tq_destination_dir("../outside", slides[0])
 
+    def test_catalog_accepts_legacy_mapping_without_name_edited(self):
+        batches, _ = app_module.discover_batches()
+        batch_id = batches[0].id
+        fields, rows, _ = app_module._load_batch_document(batch_id, "name_mapping")
+        self.assertNotIn("NameEdited", fields)
+        app_module._replace_batch_document(batch_id, "name_mapping", fields, rows)
+
+        slides, warnings = app_module._tq_catalog()
+
+        self.assertEqual([], warnings)
+        self.assertEqual(2, len(slides))
+
     def test_search_returns_image_links_without_loading_copath_data(self):
         self.catalog()
 

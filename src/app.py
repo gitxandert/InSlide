@@ -1776,6 +1776,21 @@ def _adopt_batch_document(public_id: str, root: Path, kind: str) -> int:
     path = _batch_document_path(root, kind)
     fields, rows = renaming.read_csv(path)
     with _document_export_lock:
+        if kind == "name_mapping":
+            try:
+                _, stored_rows, _ = batch_catalog.load_document(
+                    Config.INSTANCE_DIR, public_id, kind
+                )
+            except KeyError:
+                stored_rows = []
+            edited = {
+                row.get("OriginalPath", ""): row.get("NameEdited", "")
+                for row in stored_rows
+            }
+            for row in rows:
+                row["NameEdited"] = row.get(
+                    "NameEdited", edited.get(row.get("OriginalPath", ""), "")
+                )
         version = batch_catalog.adopt_document(
             Config.INSTANCE_DIR,
             public_id,
@@ -2516,7 +2531,10 @@ def _start_renaming_job(
                         raise renaming.RenamingError("; ".join(errors))
                     renaming.atomic_write(
                         context.root / "name_mapping.csv",
-                        list(dict.fromkeys([*mapping_fields, *renaming.MAPPING_FIELDS])),
+                        list(dict.fromkeys([
+                            *[field for field in mapping_fields if field != "NameEdited"],
+                            *renaming.MAPPING_FIELDS,
+                        ])),
                         mapping_rows,
                     )
                     _adopt_batch_document(context.id, context.root, "name_mapping")
@@ -2564,11 +2582,16 @@ def _start_renaming_finalization(context: BatchContext) -> bool:
     def worker() -> None:
         try:
             _wait_for_document_export(context.id, "name_mapping")
+            _, stored_rows, _ = _load_batch_document(context.id, "name_mapping")
+            edited_paths = {
+                row.get("OriginalPath", "") for row in stored_rows
+                if renaming.parse_bool(row.get("NameEdited", ""))
+            }
             with _renaming_clone_lock:
                 def check_final_names(rows, original):
                     selected = [
                         index for index, row in enumerate(rows)
-                        if renaming.parse_bool(row.get("NameEdited", ""))
+                        if row.get("OriginalPath", "") in edited_paths
                         or row.get("PID") != original[index].get("PID")
                     ]
                     if selected:
@@ -4205,7 +4228,7 @@ def _tq_catalog_signature(batches: Sequence[BatchContext]) -> str:
     values: List[Dict[str, Any]] = [
         {
             "kind": "configuration",
-            "catalog_version": 2,
+            "catalog_version": 3,
             "batches_root": str(Config.INSLIDE_BATCHES),
             "image_host_prefix": os.environ.get("GT450_IMAGES_HOST_PREFIX", ""),
             "image_container_root": os.environ.get("GT450_IMAGES_CONTAINER_ROOT", ""),

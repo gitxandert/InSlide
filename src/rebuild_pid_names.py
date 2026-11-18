@@ -56,7 +56,10 @@ def restore_missing_rows(
             row for path, row in stored_target.items() if path not in corrected_paths
         ]
         if missing:
-            renaming.atomic_write(mapping_path, fields, [*corrected_rows, *missing])
+            renaming.atomic_write(
+                mapping_path, [field for field in fields if field != "NameEdited"],
+                [*corrected_rows, *missing],
+            )
             restored.append((str(mapping_path), len(missing)))
     return restored
 
@@ -134,7 +137,8 @@ def rebuild_pid_names(
     if apply:
         for public_id, fields, rows, _ in plans:
             catalog.replace_document(
-                instance_dir, public_id, "name_mapping", fields, rows
+                instance_dir, public_id, "name_mapping",
+                [field for field in fields if field != "NameEdited"], rows
             )
     return [(public_id, count) for public_id, _, _, count in plans]
 
