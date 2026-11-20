@@ -7376,11 +7376,16 @@ def accessions_export(kind: str):
     if {renaming.accession_key(slide["accession"]) for slide in slides} != set(keys):
         return jsonify({"error": "Selected accessions are unavailable. Search again."}), 409
     if kind == "metadata":
-        fields = ("accession", "batch_name", "organ", "pid", "accession_date",
+        fields = ("accession", "accession_slide_count", "batch_name", "organ", "pid", "accession_date",
                   "stain", "image_type", "samp_acq_type", "block_number",
                   "section_count", "disposition", "sdl_types", "original_filename",
                   "original_path", "destination_name")
+        slide_counts = Counter(
+            renaming.accession_key(slide["accession"]) for slide in slides
+        )
         rows = [{field: ", ".join(slide[field]) if field == "sdl_types"
+                 else slide_counts[renaming.accession_key(slide["accession"])]
+                 if field == "accession_slide_count"
                  else slide.get(field, "") for field in fields} for slide in slides]
     else:
         reports = batch_catalog.copath_reports(Config.INSTANCE_DIR, keys)

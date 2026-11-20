@@ -298,6 +298,7 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(200, metadata.status_code)
         rows = list(csv.DictReader(io.StringIO(metadata.get_data(as_text=True))))
         self.assertEqual(2, len(rows))
+        self.assertTrue(all(row["accession_slide_count"] == "2" for row in rows))
         self.assertTrue(all(row["organ"] == "BREAST" and row["pid"] == "AAAAAB"
                             and row["sdl_types"] == "RETRO" for row in rows))
         self.assertIn("one.svs", rows[0]["original_path"])
