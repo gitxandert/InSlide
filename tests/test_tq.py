@@ -212,7 +212,9 @@ class TQTransferTests(unittest.TestCase):
 
     def test_accession_editor_updates_catalog_and_exports_current_files(self):
         self.catalog()
-        self.assertIn(b"Find accessions", self.client.get("/accessions").data)
+        page = self.client.get("/accessions").data
+        self.assertIn(b"Find accessions", page)
+        self.assertIn(b"Set one field for all loaded accessions", page)
         batch_id = app_module.batch_catalog.list_batches(app_module.Config.INSTANCE_DIR)[0]["public_id"]
         app_module.batch_catalog.update_stages(app_module.Config.INSTANCE_DIR,
                                                 batch_id, renamed_complete=False)
@@ -285,6 +287,55 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(1, imported.get_json()["found"])
         self.assertEqual(400, self.client.post("/accessions/file", json={
             "name": "bad.csv", "text": 'ID\n"unterminated', "column": 0,
+        }).status_code)
+
+    def test_accession_editor_bulk_organ_update_over_thousand_accessions(self):
+        self.catalog()
+        batch_id = app_module.batch_catalog.list_batches(app_module.Config.INSTANCE_DIR)[0]["public_id"]
+        fields, rows, _ = app_module._load_batch_document(batch_id, "name_mapping")
+        accessions = []
+        for number in range(1, 1002):
+            accession = f"NP25-{number:04d}"
+            accessions.append(accession)
+            pid = "".join(chr(65 + number // 26 ** power % 26) for power in range(5, -1, -1))
+            row = mapping_row(fr"D:\scanner\misc\bulk-{number}.svs", pid, "001")
+            row["AccessionID"] = accession
+            row["NewName"] = renaming.build_new_name(row)
+            rows.append(row)
+        app_module._replace_batch_document(batch_id, "name_mapping", fields, rows)
+        app_module._tq_prepare_catalog()
+
+        first_page = self.client.get("/accessions/search?offset=0").get_json()
+        second_page = self.client.get("/accessions/search?offset=200").get_json()
+        self.assertEqual(200, len(first_page["accessions"]))
+        self.assertTrue(first_page["has_more"])
+        self.assertEqual(200, len(second_page["accessions"]))
+
+        imported = self.client.post("/accessions/file", json={
+            "name": "bulk.txt", "text": "\n".join(accessions),
+        })
+        self.assertEqual(1001, imported.get_json()["found"])
+        keys = [row["accession_key"] for row in imported.get_json()["accessions"]]
+        status = self.client.post("/accessions/sync", json={
+            "accession_keys": keys, "include_slides": False,
+        }).get_json()
+        self.assertTrue(status["ready"])
+        self.assertNotIn("slides", status)
+        updated = self.client.post("/accessions/update", json={
+            "accession_keys": keys,
+            "versions": status["versions"],
+            "changes": {"Organ": "BREAST"},
+        })
+        self.assertEqual(200, updated.status_code, updated.get_json())
+        exported = self.client.post("/accessions/export/metadata", json={
+            "accession_keys": keys,
+        })
+        self.assertEqual(200, exported.status_code)
+        metadata = list(csv.DictReader(io.StringIO(exported.get_data(as_text=True))))
+        self.assertEqual(1001, len([row for row in metadata if row["accession"] in accessions]))
+        self.assertTrue(all(row["organ"] == "BREAST" for row in metadata))
+        self.assertEqual(200, self.client.post("/accessions/export/copath", json={
+            "accession_keys": keys,
         }).status_code)
 
     def search(self, filters=None, selected_ids=None, accessions=None):

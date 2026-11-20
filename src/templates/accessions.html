@@ -39,14 +39,28 @@
                 <select id="accession-column"><option value="">Choose a column</option></select>
             </label>
             <div class="actions"><button id="add-file" disabled>Add file accessions</button></div>
-            <p class="muted">Select one or more accessions. First 200 matches shown.</p>
+            <p class="muted">Search and browse results, or load accessions from a file.</p>
             <div id="list" class="list" aria-label="Accessions"></div>
+            <div class="actions"><button id="load-more" hidden>Show more accessions</button></div>
         </section>
         <div>
             <section>
                 <h2>Selected slides</h2>
                 <p id="selection" class="muted">Select accessions from list.</p>
                 <div id="details"></div>
+            </section>
+            <section>
+                <h2>Set one field for all loaded accessions</h2>
+                <p id="loaded-count" class="muted">Load a TXT or CSV file to use this action.</p>
+                <div class="fields">
+                    <label for="bulk-field">Field
+                        <select id="bulk-field">{% for field in fields %}<option value="{{ field }}">{{ field }}</option>{% endfor %}</select>
+                    </label>
+                    <label for="bulk-value">Value
+                        <input id="bulk-value" maxlength="200" placeholder="e.g. BREAST">
+                    </label>
+                </div>
+                <div class="actions"><button id="bulk-apply" disabled>Set field for all loaded</button></div>
             </section>
             <section>
                 <h2>Change values</h2>
@@ -73,10 +87,15 @@
 const csrf={{ csrf_token()|tojson }};
 const urls={search:{{ url_for('accessions_search')|tojson }},file:{{ url_for('accessions_file')|tojson }},update:{{ url_for('accessions_update')|tojson }},sync:{{ url_for('accessions_sync')|tojson }},metadata:{{ url_for('accessions_export',kind='metadata')|tojson }},copath:{{ url_for('accessions_export',kind='copath')|tojson }}};
 const selected=new Set();
+const loaded=new Set();
 const opened=new Set();
 let catalog={accessions:[],slides:[],versions:{}};
 let ready=false;
+let bulkBusy=false;
 let timer;
+let searchOffset=0;
+let searchSequence=0;
+let syncSequence=0;
 let fileData;
 const list=document.getElementById('list'), details=document.getElementById('details'), status=document.getElementById('sync'), message=document.getElementById('message');
 function request(url,body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});}
@@ -85,12 +104,14 @@ function render(){
   list.replaceChildren();details.replaceChildren();
   for(const accession of catalog.accessions){
     const label=document.createElement('label'),check=document.createElement('input'),name=document.createElement('span');
-    check.type='checkbox';check.checked=selected.has(accession.accession_key);check.addEventListener('change',()=>{if(check.checked&&selected.size>=200){message.textContent='Select up to 200 accessions at once.';check.checked=false;return;}check.checked?selected.add(accession.accession_key):selected.delete(accession.accession_key);render();checkSync();});
+    check.type='checkbox';check.checked=selected.has(accession.accession_key);check.addEventListener('change',()=>{check.checked?selected.add(accession.accession_key):selected.delete(accession.accession_key);setReady(false);render();checkSync();});
     name.textContent=`${accession.accession} (${accession.slide_count})`;label.append(check,name);list.append(label);
   }
   if(!catalog.accessions.length)list.textContent='No accessions found. Catalog may still be updating.';
   const slides=catalog.slides.filter(slide=>selected.has(slide.accession.trim().toLocaleLowerCase()));
   document.getElementById('selection').textContent=`${selected.size} accession(s), ${slides.length} slide(s) selected`;
+  document.getElementById('loaded-count').textContent=loaded.size?`${loaded.size} file accession(s) loaded. This changes all of them, including any unchecked in the list.`:'Load a TXT or CSV file to use this action.';
+  document.getElementById('bulk-apply').disabled=!loaded.size||bulkBusy;
   document.getElementById('save').disabled=!selected.size||!ready;
   for(const accession of catalog.accessions.filter(item=>selected.has(item.accession_key))){
     const group=document.createElement('details'),summary=document.createElement('summary'),wrap=document.createElement('div'),table=document.createElement('table');
@@ -109,28 +130,34 @@ function render(){
     wrap.className='slides';wrap.append(table);group.append(summary,wrap);details.append(group);
   }
 }
-async function search(){
-  try{const response=await fetch(`${urls.search}?q=${encodeURIComponent(document.getElementById('search').value)}`);const data=await response.json();if(!response.ok)throw Error(data.error);
-    const pinned=catalog.accessions.filter(item=>selected.has(item.accession_key)&&!data.accessions.some(match=>match.accession_key===item.accession_key));
+async function search(append=false){
+  const sequence=++searchSequence;
+  try{const response=await fetch(`${urls.search}?q=${encodeURIComponent(document.getElementById('search').value)}&offset=${append?searchOffset:0}`);const data=await response.json();if(sequence!==searchSequence)return;if(!response.ok)throw Error(data.error);
+    const newKeys=new Set(data.accessions.map(item=>item.accession_key)),newSlides=new Set(data.slides.map(slide=>slide.id));
+    const pinned=catalog.accessions.filter(item=>(append||selected.has(item.accession_key)||loaded.has(item.accession_key))&&!newKeys.has(item.accession_key));
+    const pinnedKeys=new Set(pinned.map(item=>item.accession_key));
     data.accessions=[...pinned,...data.accessions];
-    data.slides=[...catalog.slides.filter(slide=>selected.has(slide.accession.trim().toLocaleLowerCase())&&!data.slides.some(match=>match.id===slide.id)),...data.slides];
+    data.slides=[...catalog.slides.filter(slide=>pinnedKeys.has(slide.accession.trim().toLocaleLowerCase())&&!newSlides.has(slide.id)),...data.slides];
     data.versions={...catalog.versions,...data.versions};
+    searchOffset=data.next_offset;document.getElementById('load-more').hidden=!data.has_more;
     catalog=data;render();checkSync();}
-  catch(error){message.textContent=error.message;message.className='error';}
+  catch(error){if(sequence===searchSequence){message.textContent=error.message;message.className='error';}}
 }
 async function checkSync(){
+  const sequence=++syncSequence;
   if(!selected.size){setReady(false);status.textContent='Select accessions to check catalog sync.';return;}
-  try{const response=await request(urls.sync,{accession_keys:[...selected]});const data=await response.json();const wasReady=ready;const changed=JSON.stringify(catalog.slides)!==JSON.stringify(data.slides);setReady(response.ok&&data.ready);if(ready){catalog.slides=data.slides;catalog.versions={...catalog.versions,...data.versions};if(!wasReady||changed)render();}}
-  catch(error){setReady(false);status.textContent=error.message;}
+  try{const includeSlides=!ready;const response=await request(urls.sync,{accession_keys:[...selected],include_slides:includeSlides});const data=await response.json();if(sequence!==syncSequence)return;const wasReady=ready;const changed=includeSlides&&JSON.stringify(catalog.slides)!==JSON.stringify(data.slides);setReady(response.ok&&data.ready);if(ready){if(includeSlides)catalog.slides=data.slides;catalog.versions={...catalog.versions,...data.versions};if(!wasReady||changed)render();}}
+  catch(error){if(sequence===syncSequence){setReady(false);status.textContent=error.message;}}
 }
 document.getElementById('search').addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(search,250);});
+document.getElementById('load-more').addEventListener('click',()=>search(true));
 document.getElementById('accession-file').addEventListener('change',async event=>{
   fileData=undefined;document.getElementById('add-file').disabled=true;
   const field=document.getElementById('column-field'),column=document.getElementById('accession-column');
   field.hidden=true;column.replaceChildren(new Option('Choose a column',''));
   const file=event.target.files[0];if(!file)return;
   try{
-    if(file.size>2011000)throw Error('Accession file is too large.');
+    if(file.size>2021000)throw Error('Accession file must be smaller than 2 MB.');
     fileData={name:file.name,text:new TextDecoder('utf-8',{fatal:true}).decode(await file.arrayBuffer())};
     if(file.name.toLowerCase().endsWith('.csv')){
       const response=await request(urls.file,fileData),data=await response.json();if(!response.ok)throw Error(data.error);
@@ -148,11 +175,10 @@ document.getElementById('add-file').addEventListener('click',async()=>{
   const payload={...fileData};if(!document.getElementById('column-field').hidden)payload.column=Number(column.value);
   try{
     const response=await request(urls.file,payload),data=await response.json();if(!response.ok)throw Error(data.error);
-    const added=data.accessions.filter(item=>!selected.has(item.accession_key));
-    if(selected.size+added.length>200)throw Error('Selection would exceed 200 accessions. Clear some selections first.');
-    for(const item of added)selected.add(item.accession_key);
-    catalog.accessions=[...catalog.accessions.filter(item=>!data.accessions.some(match=>match.accession_key===item.accession_key)),...data.accessions];
-    catalog.slides=[...catalog.slides.filter(slide=>!data.slides.some(match=>match.id===slide.id)),...data.slides];
+    for(const item of data.accessions){selected.add(item.accession_key);loaded.add(item.accession_key);}
+    const newKeys=new Set(data.accessions.map(item=>item.accession_key)),newSlides=new Set(data.slides.map(slide=>slide.id));
+    catalog.accessions=[...catalog.accessions.filter(item=>!newKeys.has(item.accession_key)),...data.accessions];
+    catalog.slides=[...catalog.slides.filter(slide=>!newSlides.has(slide.id)),...data.slides];
     catalog.versions={...catalog.versions,...data.versions};
     render();checkSync();
     message.textContent=`Found ${data.found}/${data.requested} accessions in ${fileData.name}.${data.missing.length?` Missing: ${data.missing.slice(0,5).join(', ')}${data.missing.length>5?'…':''}`:''}`;message.className='';
@@ -164,6 +190,22 @@ document.getElementById('save').addEventListener('click',async()=>{
   setReady(false);message.textContent='Saving changes…';
   try{const response=await request(urls.update,{accession_keys:[...selected],changes,versions:catalog.versions});const data=await response.json();if(!response.ok)throw Error(data.error);message.textContent=data.message;document.querySelectorAll('[data-field]').forEach(input=>input.value='');await search();}
   catch(error){message.textContent=error.message;message.className='error';}
+});
+document.getElementById('bulk-apply').addEventListener('click',async()=>{
+  const field=document.getElementById('bulk-field').value,value=document.getElementById('bulk-value').value.trim();
+  if(!loaded.size||!value){message.textContent='Choose a field and enter a value.';return;}
+  const button=document.getElementById('bulk-apply');bulkBusy=true;button.disabled=true;setReady(false);message.textContent=`Checking ${loaded.size} loaded accessions…`;message.className='';
+  try{
+    const keys=[...loaded],syncResponse=await request(urls.sync,{accession_keys:keys,include_slides:false}),state=await syncResponse.json();
+    if(!syncResponse.ok)throw Error(state.error);
+    if(!state.ready)throw Error('Catalog sync is required before changing loaded accessions.');
+    message.textContent=`Updating ${keys.length} accessions…`;
+    const response=await request(urls.update,{accession_keys:keys,changes:{[field]:value},versions:state.versions});
+    const data=await response.json();if(!response.ok)throw Error(data.error);
+    setReady(false);message.textContent=`Updated ${keys.length} loaded accessions. Waiting for catalog sync.`;
+    document.getElementById('bulk-value').value='';await search();
+  }catch(error){message.textContent=error.message;message.className='error';}
+  finally{bulkBusy=false;button.disabled=!loaded.size;checkSync();}
 });
 async function saveFile(kind){
   if(!ready)return;
@@ -179,7 +221,7 @@ async function saveFile(kind){
 }
 document.getElementById('metadata').addEventListener('click',()=>saveFile('metadata'));
 document.getElementById('copath').addEventListener('click',()=>saveFile('copath'));
-setInterval(()=>{if(document.visibilityState==='visible'){if(selected.size)checkSync();else search();}},5000);
+setInterval(()=>{if(document.visibilityState==='visible'){if(selected.size)checkSync();else if(!catalog.accessions.length)search();}},5000);
 search();
 </script>
 </body>

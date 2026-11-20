@@ -6827,8 +6827,16 @@ def accessions_search():
     term = request.args.get("q", "").strip()
     if len(term) > 200:
         return jsonify({"error": "Search is too long."}), 400
-    matches = batch_catalog.search_accessions(Config.INSTANCE_DIR, term)
-    response = jsonify(_accession_search_result(matches))
+    try:
+        offset = int(request.args.get("offset", "0"))
+    except ValueError:
+        return jsonify({"error": "Invalid page."}), 400
+    if offset < 0:
+        return jsonify({"error": "Invalid page."}), 400
+    matches = batch_catalog.search_accessions(Config.INSTANCE_DIR, term, limit=201, offset=offset)
+    result = _accession_search_result(matches[:200])
+    result.update({"has_more": len(matches) > 200, "next_offset": offset + min(len(matches), 200)})
+    response = jsonify(result)
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -6844,7 +6852,7 @@ def accessions_file():
             or Path(name).suffix.casefold() not in {".txt", ".csv"}
             or not isinstance(content, str)
             or len(content) > _TQ_MAX_ACCESSION_TEXT_LENGTH):
-        return jsonify({"error": "Use a .txt or .csv file within the accession size limit."}), 400
+        return jsonify({"error": "Use a .txt or .csv file smaller than 2 MB."}), 400
     try:
         if Path(name).suffix.casefold() == ".csv":
             reader = csv.reader(io.StringIO(content.removeprefix("\ufeff"), newline=""), strict=True)
@@ -6859,13 +6867,9 @@ def accessions_file():
             values = [row[column].strip() for row in reader if len(row) > column and row[column].strip()]
         else:
             values = _tq_accession_lines(content)
-        if len(values) > _TQ_MAX_ACCESSION_ENTRIES:
-            raise ValueError("Accession file may contain at most 10,000 entries.")
         if any(len(value) > _TQ_MAX_ACCESSION_LENGTH for value in values):
             raise ValueError("Accession IDs must not exceed 200 characters.")
         keys = list(dict.fromkeys(renaming.accession_key(value) for value in values))
-        if len(keys) > 200:
-            raise ValueError("Select at most 200 unique accessions per file.")
         if not keys:
             raise ValueError("No accession IDs found in file.")
         matches = batch_catalog.accessions_by_keys(Config.INSTANCE_DIR, keys)
@@ -6890,7 +6894,7 @@ def accessions_update():
     keys = payload.get("accession_keys")
     changes = payload.get("changes")
     versions = payload.get("versions")
-    if (not isinstance(keys, list) or not keys or len(keys) > 200
+    if (not isinstance(keys, list) or not keys
             or not all(isinstance(key, str) and 0 < len(key) <= 200 for key in keys)
             or len(set(keys)) != len(keys)
             or not isinstance(changes, dict) or not changes
@@ -6906,7 +6910,10 @@ def accessions_update():
     ):
         return jsonify({"error": "Value is too long."}), 400
     selected = set(keys)
-    slides = _accession_editor_slides(list(selected))
+    sync = accessions_sync().get_json()
+    if not sync["ready"]:
+        return jsonify({"error": "Catalog sync is required before editing."}), 409
+    slides = sync.get("slides") or _accession_editor_slides(keys)
     if {renaming.accession_key(slide["accession"]) for slide in slides} != selected:
         return jsonify({"error": "Some accessions are unavailable. Search again."}), 409
     batch_ids = {slide["batch_id"] for slide in slides}
@@ -6942,22 +6949,30 @@ def accessions_update():
                     workbook, worksheet, _ = _load_sdl_workbook()
                     try:
                         headers = _sdl_header_columns(worksheet)
-                        matching = [row["worksheet_row"] for row in _read_sdl_rows(worksheet)
-                                    if renaming.accession_key(row["values"]["Accession ID"]) in selected]
-                        if slide_type is not None and not matching:
-                            raise renaming.RenamingError("No Slide Digitization Log rows found for Type edit.")
+                        sdl_rows = _read_sdl_rows(worksheet)
+                        matched_keys = {renaming.accession_key(row["values"]["Accession ID"])
+                                        for row in sdl_rows
+                                        if renaming.accession_key(row["values"]["Accession ID"]) in selected}
+                        matching = {row["worksheet_row"] for row in sdl_rows
+                                    if renaming.accession_key(row["values"]["Accession ID"]) in selected}
+                        if slide_type is not None and matched_keys != selected:
+                            raise renaming.RenamingError(
+                                f"{len(selected - matched_keys)} accession(s) lack Slide Digitization Log rows for Type edit.")
                         for number in matching:
                             if slide_type is not None:
                                 worksheet.cell(row=number, column=headers["Type"]).value = slide_type
                             if "Organ" in changes:
                                 worksheet.cell(row=number, column=headers["Organ"]).value = changes["Organ"]
                         if matching:
-                            for row in _read_sdl_rows(worksheet):
-                                if row["worksheet_row"] in matching:
-                                    _validate_sdl_type_consistency(
-                                        worksheet, row["values"],
-                                        excluded_row=row["worksheet_row"],
-                                    )
+                            if slide_type is not None:
+                                records = [sdl_type_record(row["values"], row["worksheet_row"])
+                                           for row in _read_sdl_rows(worksheet)]
+                                _, conflicts = resolve_sdl_types(record for record in records if record)
+                                affected = next((conflict for conflict in conflicts
+                                                 if any(record.row_number in matching
+                                                        for record in conflict.records)), None)
+                                if affected:
+                                    raise SDLValidationError(format_sdl_type_conflict(affected))
                             _save_sdl_workbook(workbook)
                             sdl_saved = True
                     finally:
@@ -6983,29 +6998,25 @@ def accessions_sync():
     if not isinstance(payload, dict):
         return jsonify({"error": "Invalid request."}), 400
     keys = payload.get("accession_keys")
-    if (not isinstance(keys, list) or not keys or len(keys) > 200
+    if (not isinstance(keys, list) or not keys
             or not all(isinstance(key, str) and 0 < len(key) <= 200 for key in keys)
             or len(set(keys)) != len(keys)):
         return jsonify({"error": "Select accessions first."}), 400
-    slides = _accession_editor_slides(keys)
-    found = {renaming.accession_key(slide["accession"]) for slide in slides}
-    counts = Counter(renaming.accession_key(slide["accession"]) for slide in slides)
     indexed_counts = batch_catalog.accession_slide_counts(Config.INSTANCE_DIR, keys)
-    ready = found == set(keys) and all(
-        counts[key] == indexed_counts.get(key) for key in keys
+    synced_counts, versions = batch_catalog.accession_sync_state(Config.INSTANCE_DIR, keys)
+    ready = all(
+        indexed_counts.get(key, 0) > 0
+        and indexed_counts[key] == synced_counts.get(key)
+        for key in keys
     ) and bool(batch_catalog.get_metadata(
         Config.INSTANCE_DIR, "transfer_signature"))
-    for batch_id in {slide["batch_id"] for slide in slides}:
-        state = batch_catalog.document_state(Config.INSTANCE_DIR, batch_id, "name_mapping")
-        ready = ready and bool(state) and state["status"] == "current" and (
-            state["desired_version"] == state["exported_version"])
-    versions = {}
-    if ready:
-        for batch_id in {slide["batch_id"] for slide in slides}:
-            state = batch_catalog.document_state(Config.INSTANCE_DIR, batch_id, "name_mapping")
-            versions[batch_id] = state["desired_version"]
-    return jsonify({"ready": bool(ready), "slides": slides if ready else [],
-                    "versions": versions})
+    include_slides = payload.get("include_slides", True)
+    if not isinstance(include_slides, bool):
+        return jsonify({"error": "Invalid sync request."}), 400
+    result = {"ready": bool(ready), "versions": versions if ready else {}}
+    if ready and include_slides:
+        result["slides"] = _accession_editor_slides(keys)
+    return jsonify(result)
 
 
 @app.route("/accessions/export/<kind>", methods=["POST"])
@@ -7017,14 +7028,14 @@ def accessions_export(kind: str):
     if not isinstance(payload, dict):
         return jsonify({"error": "Invalid request."}), 400
     keys = payload.get("accession_keys")
-    if (not isinstance(keys, list) or not keys or len(keys) > 200
+    if (not isinstance(keys, list) or not keys
             or not all(isinstance(key, str) and 0 < len(key) <= 200 for key in keys)
             or len(set(keys)) != len(keys)):
         return jsonify({"error": "Select accessions first."}), 400
     sync = accessions_sync().get_json()
     if not sync["ready"]:
         return jsonify({"error": "Catalog sync is required before export."}), 409
-    slides = sync["slides"]
+    slides = sync.get("slides") or _accession_editor_slides(keys)
     if kind == "metadata":
         fields = ("accession", "batch_name", "organ", "pid", "accession_date",
                   "stain", "image_type", "samp_acq_type", "block_number",

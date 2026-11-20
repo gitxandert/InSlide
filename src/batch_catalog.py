@@ -938,14 +938,21 @@ class BatchCatalog:
         keys = list(dict.fromkeys(str(key) for key in accession_keys if key))
         if not keys:
             return {}
-        placeholders = ",".join("?" for _ in keys)
         with self.connection(instance_dir) as connection:
+            self._requested_accessions(connection, keys)
             rows = connection.execute(
-                f"SELECT accession_key,data_json FROM copath_report_rows "
-                f"WHERE accession_key IN ({placeholders})",
-                keys,
+                "SELECT c.accession_key,c.data_json FROM copath_report_rows c "
+                "JOIN requested_accessions r ON r.accession_key=c.accession_key"
             ).fetchall()
             return {str(row["accession_key"]): dict(json.loads(row["data_json"])) for row in rows}
+
+    @staticmethod
+    def _requested_accessions(connection: sqlite3.Connection, keys: Sequence[str]) -> None:
+        connection.execute("CREATE TEMP TABLE requested_accessions(accession_key TEXT PRIMARY KEY)")
+        connection.executemany(
+            "INSERT OR IGNORE INTO requested_accessions(accession_key) VALUES(?)",
+            ((key,) for key in keys),
+        )
 
     def upsert_batch(
         self,
@@ -1583,7 +1590,8 @@ class BatchCatalog:
         return result
 
     def search_accessions(
-        self, instance_dir: str | Path, term: str = "", limit: int = 200
+        self, instance_dir: str | Path, term: str = "", limit: int = 200,
+        offset: int = 0,
     ) -> list[dict]:
         with self.connection(instance_dir) as connection:
             rows = connection.execute(
@@ -1591,8 +1599,8 @@ class BatchCatalog:
                           COUNT(*) AS slide_count
                    FROM transfer_slides s JOIN batches b ON b.id=s.batch_id
                    WHERE b.validity='ready' AND instr(lower(s.accession),lower(?))>0
-                   GROUP BY s.accession_key ORDER BY accession LIMIT ?""",
-                (term, limit),
+                   GROUP BY s.accession_key ORDER BY accession LIMIT ? OFFSET ?""",
+                (term, limit, offset),
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -1602,14 +1610,46 @@ class BatchCatalog:
         if not accession_keys:
             return {}
         with self.connection(instance_dir) as connection:
+            self._requested_accessions(connection, accession_keys)
             rows = connection.execute(
                 "SELECT s.accession_key,COUNT(*) AS slide_count FROM transfer_slides s "
                 "JOIN batches b ON b.id=s.batch_id "
-                f"WHERE b.validity='ready' AND s.accession_key IN ({','.join('?' for _ in accession_keys)}) "
+                "JOIN requested_accessions r ON r.accession_key=s.accession_key "
+                "WHERE b.validity='ready' "
                 "GROUP BY s.accession_key",
-                accession_keys,
             ).fetchall()
             return {row["accession_key"]: row["slide_count"] for row in rows}
+
+    def accession_sync_state(
+        self, instance_dir: str | Path, accession_keys: Sequence[str]
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        if not accession_keys:
+            return {}, {}
+        with self.connection(instance_dir) as connection:
+            self._requested_accessions(connection, accession_keys)
+            rows = connection.execute(
+                """SELECT s.accession_key,b.public_id AS batch_id,
+                          mapping.desired_version,COUNT(*) AS slide_count
+                   FROM transfer_slides s
+                   JOIN batches b ON b.id=s.batch_id
+                   JOIN requested_accessions r ON r.accession_key=s.accession_key
+                   JOIN transfer_sources source
+                     ON source.batch_id=b.id AND source.source_kind='mapping'
+                   JOIN batch_documents mapping
+                     ON mapping.batch_id=b.id AND mapping.kind='name_mapping'
+                   WHERE b.validity='ready' AND source.status='ready'
+                     AND source.mapping_version=mapping.desired_version
+                     AND mapping.status='current'
+                     AND mapping.desired_version=mapping.exported_version
+                   GROUP BY s.accession_key,b.public_id,mapping.desired_version"""
+            ).fetchall()
+            counts: dict[str, int] = {}
+            versions: dict[str, int] = {}
+            for row in rows:
+                key = str(row["accession_key"])
+                counts[key] = counts.get(key, 0) + int(row["slide_count"])
+                versions[str(row["batch_id"])] = int(row["desired_version"])
+            return counts, versions
 
     def accessions_by_keys(
         self, instance_dir: str | Path, accession_keys: Sequence[str]
@@ -1617,14 +1657,14 @@ class BatchCatalog:
         if not accession_keys:
             return []
         with self.connection(instance_dir) as connection:
+            self._requested_accessions(connection, accession_keys)
             rows = connection.execute(
                 """SELECT s.accession_key, MIN(s.accession) AS accession,
                           COUNT(*) AS slide_count
                    FROM transfer_slides s JOIN batches b ON b.id=s.batch_id
-                   WHERE b.validity='ready' AND s.accession_key IN """
-                f"({','.join('?' for _ in accession_keys)}) "
-                "GROUP BY s.accession_key ORDER BY accession",
-                accession_keys,
+                   JOIN requested_accessions r ON r.accession_key=s.accession_key
+                   WHERE b.validity='ready'
+                   GROUP BY s.accession_key ORDER BY accession""",
             ).fetchall()
             return [dict(row) for row in rows]
 
