@@ -12,6 +12,7 @@
         <a href="{{ url_for('sdl') }}" class="{% if request.endpoint == 'sdl' %}active{% endif %}" title="Slide Digitization Log"><span class="nav-icon">S</span><span class="nav-label">Slide Digitization Log</span></a>
         <a href="{{ url_for('inventories') }}" class="{% if request.endpoint == 'inventories' %}active{% endif %}" title="Scanner Inventories"><span class="nav-icon">I</span><span class="nav-label">Scanner Inventories</span></a>
         <a href="{{ url_for('tq_page') }}" class="{% if request.endpoint and request.endpoint.startswith('tq') %}active{% endif %}" title="Transfers"><span class="nav-icon">T</span><span class="nav-label">Transfers</span></a>
+        <a href="{{ url_for('accessions_page') }}" class="{% if request.endpoint and request.endpoint.startswith('accessions_') %}active{% endif %}" title="Accessions"><span class="nav-icon">A</span><span class="nav-label">Accessions</span></a>
         {% if current_user.is_admin %}
             <a href="{{ url_for('users_management') }}" class="{% if request.endpoint in ('users_management', 'add_user') %}active{% endif %}" title="User Management"><span class="nav-icon">U</span><span class="nav-label">User Management</span></a>
         {% endif %}

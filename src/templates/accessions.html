@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Accessions - InSlide</title>
+    <style nonce="{{ csp_nonce() }}">
+        body{margin:0;background:#f7f9fb;color:#27313d;font:15px Arial,sans-serif}
+        header{padding:16px 30px;background:#0056b3;color:white} h1{margin:0;font-size:1.5rem}
+        main{max-width:1400px;margin:24px auto;padding:0 18px} section{background:white;border:1px solid #dce2e8;border-radius:9px;padding:20px;margin-bottom:18px}
+        h2{margin-top:0} .layout{display:grid;grid-template-columns:minmax(240px,350px) minmax(0,1fr);gap:18px}
+        input,select,button{font:inherit} input,select{padding:8px;border:1px solid #aeb8c3;border-radius:5px;max-width:100%}
+        button{padding:9px 13px;border:0;border-radius:5px;background:#007bff;color:white;cursor:pointer} button:disabled{opacity:.5;cursor:default}
+        .fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px} label{display:block;font-weight:bold}
+        .fields label input,.fields label select{display:block;width:100%;box-sizing:border-box;margin-top:5px}
+        .actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:16px;align-items:center}
+        .list{max-height:55vh;overflow:auto;border:1px solid #dce2e8;border-radius:5px;margin-top:12px}
+        .list label{display:flex;gap:9px;padding:9px;border-bottom:1px solid #e8edf2;font-weight:normal;cursor:pointer}
+        .list label:hover,details:hover{background:#f7faff} .muted{color:#687482} .error{color:#b42318}
+        details{border:1px solid #dce2e8;border-radius:6px;margin:9px 0;padding:10px} summary{cursor:pointer;font-weight:bold}
+        .slides{overflow:auto} table{border-collapse:collapse;width:100%;font-size:13px} th,td{padding:8px;border-bottom:1px solid #e8edf2;text-align:left;white-space:nowrap}
+        .sync{padding:10px;border-radius:5px;background:#fff3cd;margin-top:14px} .sync.ready{background:#d1e7dd}
+        [hidden]{display:none!important} @media(max-width:750px){.layout{grid-template-columns:1fr}}
+    </style>
+</head>
+<body>
+{% include '_app_sidebar.html' %}
+<header><h1>Accessions</h1></header>
+<main>
+    <div class="layout">
+        <section>
+            <h2>Find accessions</h2>
+            <label for="search">Accession ID</label>
+            <input id="search" type="search" autocomplete="off" placeholder="Type ID, or browse list" maxlength="200">
+            <p class="muted">Select one or more accessions. First 200 matches shown.</p>
+            <div id="list" class="list" aria-label="Accessions"></div>
+        </section>
+        <div>
+            <section>
+                <h2>Selected slides</h2>
+                <p id="selection" class="muted">Select accessions from list.</p>
+                <div id="details"></div>
+            </section>
+            <section>
+                <h2>Change values</h2>
+                <p class="muted">Fill only fields to change. Changes apply to selected accessions and their slides. Type updates matching Slide Digitization Log rows.</p>
+                <div class="fields">
+                    {% for field in fields %}
+                    <label>{{ field }}
+                        {% if field == 'Organ' %}<select data-field="{{ field }}"><option value="">Keep current</option>{% for value in organs %}<option>{{ value }}</option>{% endfor %}</select>
+                        {% elif field == 'ImageType' %}<select data-field="{{ field }}"><option value="">Keep current</option>{% for value in image_types %}<option>{{ value }}</option>{% endfor %}</select>
+                        {% elif field == 'SampAcqType' %}<select data-field="{{ field }}"><option value="">Keep current</option>{% for value in sample_types %}<option>{{ value }}</option>{% endfor %}</select>
+                        {% else %}<input data-field="{{ field }}" maxlength="200" placeholder="Keep current">{% endif %}
+                    </label>
+                    {% endfor %}
+                </div>
+                <div class="actions"><button id="save" disabled>Save changes</button><span id="message" role="status"></span></div>
+                <div id="sync" class="sync" role="status">Select accessions to check catalog sync.</div>
+                <div class="actions"><button id="metadata" disabled>Save metadata CSV</button><button id="copath" disabled>Save CoPath CSV</button></div>
+                <p class="muted">Metadata includes catalog values, original paths, and new filenames. CoPath data saves separately when available.</p>
+            </section>
+        </div>
+    </div>
+</main>
+<script nonce="{{ csp_nonce() }}">
+const csrf={{ csrf_token()|tojson }};
+const urls={search:{{ url_for('accessions_search')|tojson }},update:{{ url_for('accessions_update')|tojson }},sync:{{ url_for('accessions_sync')|tojson }},metadata:{{ url_for('accessions_export',kind='metadata')|tojson }},copath:{{ url_for('accessions_export',kind='copath')|tojson }}};
+const selected=new Set();
+const opened=new Set();
+let catalog={accessions:[],slides:[],versions:{}};
+let ready=false;
+let timer;
+const list=document.getElementById('list'), details=document.getElementById('details'), status=document.getElementById('sync'), message=document.getElementById('message');
+function request(url,body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});}
+function setReady(value){ready=value;document.getElementById('save').disabled=!value||!selected.size;document.getElementById('metadata').disabled=!value;document.getElementById('copath').disabled=!value;status.classList.toggle('ready',value);status.textContent=value?'Catalog synced. Files ready to save.':'Catalog sync needed before saving files.';}
+function render(){
+  list.replaceChildren();details.replaceChildren();
+  for(const accession of catalog.accessions){
+    const label=document.createElement('label'),check=document.createElement('input'),name=document.createElement('span');
+    check.type='checkbox';check.checked=selected.has(accession.accession_key);check.addEventListener('change',()=>{if(check.checked&&selected.size>=200){message.textContent='Select up to 200 accessions at once.';check.checked=false;return;}check.checked?selected.add(accession.accession_key):selected.delete(accession.accession_key);render();checkSync();});
+    name.textContent=`${accession.accession} (${accession.slide_count})`;label.append(check,name);list.append(label);
+  }
+  if(!catalog.accessions.length)list.textContent='No accessions found. Catalog may still be updating.';
+  const slides=catalog.slides.filter(slide=>selected.has(slide.accession.trim().toLocaleLowerCase()));
+  document.getElementById('selection').textContent=`${selected.size} accession(s), ${slides.length} slide(s) selected`;
+  document.getElementById('save').disabled=!selected.size||!ready;
+  for(const accession of catalog.accessions.filter(item=>selected.has(item.accession_key))){
+    const group=document.createElement('details'),summary=document.createElement('summary'),wrap=document.createElement('div'),table=document.createElement('table');
+    summary.textContent=`${accession.accession} — ${accession.slide_count} slide(s)`;
+    group.open=opened.has(accession.accession_key);
+    const fill=()=>{
+      if(table.rows.length)return;
+      const columns=['batch_name','organ','pid','sdl_types','image_type','samp_acq_type','stain','disposition','original_filename','destination_name','original_path'];
+      const head=document.createElement('tr');for(const column of columns){const cell=document.createElement('th');cell.textContent=column.replaceAll('_',' ');head.append(cell);}table.append(head);
+      for(const slide of slides.filter(item=>item.accession.trim().toLocaleLowerCase()===accession.accession_key)){
+        const row=document.createElement('tr');for(const column of columns){const cell=document.createElement('td');cell.textContent=Array.isArray(slide[column])?slide[column].join(', '):(slide[column]??'');row.append(cell);}table.append(row);
+      }
+    };
+    if(group.open)fill();
+    group.addEventListener('toggle',()=>{if(group.open){opened.add(accession.accession_key);fill();}else opened.delete(accession.accession_key);});
+    wrap.className='slides';wrap.append(table);group.append(summary,wrap);details.append(group);
+  }
+}
+async function search(){
+  try{const response=await fetch(`${urls.search}?q=${encodeURIComponent(document.getElementById('search').value)}`);const data=await response.json();if(!response.ok)throw Error(data.error);
+    const pinned=catalog.accessions.filter(item=>selected.has(item.accession_key)&&!data.accessions.some(match=>match.accession_key===item.accession_key));
+    data.accessions=[...pinned,...data.accessions];
+    data.slides=[...catalog.slides.filter(slide=>selected.has(slide.accession.trim().toLocaleLowerCase())&&!data.slides.some(match=>match.id===slide.id)),...data.slides];
+    data.versions={...catalog.versions,...data.versions};
+    catalog=data;render();checkSync();}
+  catch(error){message.textContent=error.message;message.className='error';}
+}
+async function checkSync(){
+  if(!selected.size){setReady(false);status.textContent='Select accessions to check catalog sync.';return;}
+  try{const response=await request(urls.sync,{accession_keys:[...selected]});const data=await response.json();const wasReady=ready;const changed=JSON.stringify(catalog.slides)!==JSON.stringify(data.slides);setReady(response.ok&&data.ready);if(ready){catalog.slides=data.slides;catalog.versions={...catalog.versions,...data.versions};if(!wasReady||changed)render();}}
+  catch(error){setReady(false);status.textContent=error.message;}
+}
+document.getElementById('search').addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(search,250);});
+document.getElementById('save').addEventListener('click',async()=>{
+  const changes=Object.fromEntries([...document.querySelectorAll('[data-field]')].map(input=>[input.dataset.field,input.value.trim()]).filter(([,value])=>value));
+  if(!Object.keys(changes).length){message.textContent='Fill at least one field.';return;}
+  setReady(false);message.textContent='Saving changes…';
+  try{const response=await request(urls.update,{accession_keys:[...selected],changes,versions:catalog.versions});const data=await response.json();if(!response.ok)throw Error(data.error);message.textContent=data.message;document.querySelectorAll('[data-field]').forEach(input=>input.value='');await search();}
+  catch(error){message.textContent=error.message;message.className='error';}
+});
+async function saveFile(kind){
+  if(!ready)return;
+  try{
+    let handle;
+    if(window.showSaveFilePicker)handle=await window.showSaveFilePicker({suggestedName:`accessions-${kind}.csv`,types:[{description:'CSV',accept:{'text/csv':['.csv']}}]});
+    const response=await request(urls[kind],{accession_keys:[...selected]});
+    if(!response.ok){const data=await response.json();throw Error(data.error);}
+    const blob=await response.blob();
+    if(handle){const file=await handle.createWritable();await file.write(blob);await file.close();}
+    else{const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=`accessions-${kind}.csv`;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),60000);}
+  }catch(error){if(error.name!=='AbortError'){message.textContent=error.message;message.className='error';checkSync();}}
+}
+document.getElementById('metadata').addEventListener('click',()=>saveFile('metadata'));
+document.getElementById('copath').addEventListener('click',()=>saveFile('copath'));
+setInterval(()=>{if(document.visibilityState==='visible'){if(selected.size)checkSync();else search();}},5000);
+search();
+</script>
+</body>
+</html>

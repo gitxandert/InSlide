@@ -210,6 +210,58 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(2, len(slides))
         return slides
 
+    def test_accession_editor_updates_catalog_and_exports_current_files(self):
+        self.catalog()
+        self.assertIn(b"Find accessions", self.client.get("/accessions").data)
+        batch_id = app_module.batch_catalog.list_batches(app_module.Config.INSTANCE_DIR)[0]["public_id"]
+        app_module.batch_catalog.update_stages(app_module.Config.INSTANCE_DIR,
+                                                batch_id, renamed_complete=False)
+        self.assertEqual(2, len(self.client.get(
+            "/accessions/search?q=NP25-100").get_json()["slides"]))
+        app_module.batch_catalog.update_stages(app_module.Config.INSTANCE_DIR,
+                                                batch_id, renamed_complete=True)
+        search = self.client.get("/accessions/search?q=NP25-100").get_json()
+        self.assertEqual(2, len(search["slides"]))
+        key = search["accessions"][0]["accession_key"]
+        selection = {"accession_keys": [key]}
+        app_module.batch_catalog.set_metadata(app_module.Config.INSTANCE_DIR,
+                                              "transfer_signature", "")
+        self.assertEqual(409, self.client.post(
+            "/accessions/export/metadata", json=selection).status_code)
+        app_module._tq_prepare_catalog()
+        invalid = self.client.post("/accessions/update", json={
+            **selection, "versions": search["versions"],
+            "changes": {"PID": "BAD"},
+        })
+        self.assertEqual(409, invalid.status_code)
+        response = self.client.post("/accessions/update", json={
+            **selection,
+            "versions": search["versions"],
+            "changes": {"Organ": "BREAST", "PID": "BBBBBB", "Type": "RETRO"},
+        })
+        self.assertEqual(200, response.status_code, response.get_json())
+        self.assertTrue(self.client.post("/accessions/sync", json=selection).get_json()["ready"])
+        metadata = self.client.post("/accessions/export/metadata", json=selection)
+        self.assertEqual(200, metadata.status_code)
+        rows = list(csv.DictReader(io.StringIO(metadata.get_data(as_text=True))))
+        self.assertEqual(2, len(rows))
+        self.assertTrue(all(row["organ"] == "BREAST" and row["pid"] == "BBBBBB"
+                            and row["sdl_types"] == "RETRO" for row in rows))
+        self.assertIn("one.svs", rows[0]["original_path"])
+        self.assertEqual("one.svs", rows[0]["original_filename"])
+        self.assertIn("BBBBBB", rows[0]["destination_name"])
+        copath = self.client.post("/accessions/export/copath", json=selection)
+        self.assertEqual(200, copath.status_code)
+        self.assertEqual([], list(csv.DictReader(io.StringIO(copath.get_data(as_text=True)))))
+        write_csv(self.batch / "pending_CoPath_data.csv", renaming.COPATH_FIELDS,
+                  [{"accession_id": "NP25-100", "report": "Pending report"}])
+        copath = self.client.post("/accessions/export/copath", json=selection)
+        self.assertEqual("Pending report", list(csv.DictReader(
+            io.StringIO(copath.get_data(as_text=True))))[0]["report"])
+        workbook = load_workbook(self.sdl_path)
+        self.assertEqual("RETRO", workbook.active.cell(2, app_module.SDL_HEADERS.index("Type") + 1).value)
+        workbook.close()
+
     def search(self, filters=None, selected_ids=None, accessions=None):
         payload = (
             {"selected_ids": selected_ids}

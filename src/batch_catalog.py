@@ -1414,8 +1414,10 @@ class BatchCatalog:
         instance_dir: str | Path,
         filters: Optional[Mapping[str, object]] = None,
         slide_ids: Optional[Iterable[str]] = None,
+        *,
+        include_unfinished: bool = False,
     ) -> list[dict]:
-        """Return matching transfer rows from healthy, finalized batches."""
+        """Return matching indexed slides; transfer callers require finalized batches."""
         exact_columns = {
             "batch_name": "b.scanner_name || '/' || b.batch_name",
             "organ": "s.organ",
@@ -1432,12 +1434,12 @@ class BatchCatalog:
             "destination_name": "s.destination_name",
         }
         conditions = [
-            "b.renamed_complete=1",
             "b.validity='ready'",
             "source.status='ready'",
-            "s.disposition='active'",
             "source.mapping_version=mapping.desired_version",
         ]
+        if not include_unfinished:
+            conditions.extend(("b.renamed_complete=1", "s.disposition='active'"))
         parameters: list[object] = []
         selected_ids = None if slide_ids is None else list(slide_ids)
         if selected_ids is not None:
@@ -1579,6 +1581,35 @@ class BatchCatalog:
             row.pop("raw_original_path", None)
             result.append(row)
         return result
+
+    def search_accessions(
+        self, instance_dir: str | Path, term: str = "", limit: int = 200
+    ) -> list[dict]:
+        with self.connection(instance_dir) as connection:
+            rows = connection.execute(
+                """SELECT s.accession_key, MIN(s.accession) AS accession,
+                          COUNT(*) AS slide_count
+                   FROM transfer_slides s JOIN batches b ON b.id=s.batch_id
+                   WHERE b.validity='ready' AND instr(lower(s.accession),lower(?))>0
+                   GROUP BY s.accession_key ORDER BY accession LIMIT ?""",
+                (term, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def accession_slide_counts(
+        self, instance_dir: str | Path, accession_keys: Sequence[str]
+    ) -> dict[str, int]:
+        if not accession_keys:
+            return {}
+        with self.connection(instance_dir) as connection:
+            rows = connection.execute(
+                "SELECT s.accession_key,COUNT(*) AS slide_count FROM transfer_slides s "
+                "JOIN batches b ON b.id=s.batch_id "
+                f"WHERE b.validity='ready' AND s.accession_key IN ({','.join('?' for _ in accession_keys)}) "
+                "GROUP BY s.accession_key",
+                accession_keys,
+            ).fetchall()
+            return {row["accession_key"]: row["slide_count"] for row in rows}
 
     def accession_history(self, instance_dir: str | Path, accession_key: str) -> dict:
         """Return slide, extracted image, CoPath source, and stage data from catalog."""

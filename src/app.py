@@ -27,6 +27,7 @@ import datetime
 import functools
 import hmac
 import hashlib
+import io
 import json
 import logging
 import os
@@ -71,6 +72,7 @@ from flask import (
     get_flashed_messages,
     g,
     jsonify,
+    make_response,
     redirect,
     render_template,
     request,
@@ -6782,6 +6784,241 @@ def admin_download_lifetime_statistics():
         as_attachment=True,
         download_name="lifetime_stats.csv",
     )
+
+
+ACCESSION_EDIT_FIELDS = (
+    "Organ", "PID", "AccessionDate", "Timepoint", "Stain", "ImageType",
+    "SampAcqType", "BlockNumber", "SectionCount", "Type",
+)
+
+
+def _accession_editor_slides(keys: Sequence[str]) -> List[Dict[str, Any]]:
+    slides = batch_catalog.list_transfer_slides(
+        Config.INSTANCE_DIR, filters={"accession_keys": keys},
+        include_unfinished=True,
+    )
+    for slide in slides:
+        slide["original_filename"] = _tq_original_filename(slide["original_path"])
+    return slides
+
+
+@app.route("/accessions")
+@login_required
+def accessions_page():
+    _start_catalog_reconciler()
+    return render_template("accessions.html", fields=ACCESSION_EDIT_FIELDS,
+                           organs=renaming.ORGANS, image_types=renaming.IMAGE_TYPES,
+                           sample_types=renaming.SAMPLE_TYPES)
+
+
+@app.route("/accessions/search")
+@login_required
+def accessions_search():
+    term = request.args.get("q", "").strip()
+    if len(term) > 200:
+        return jsonify({"error": "Search is too long."}), 400
+    matches = batch_catalog.search_accessions(Config.INSTANCE_DIR, term)
+    keys = [row["accession_key"] for row in matches]
+    slides = _accession_editor_slides(keys)
+    versions = {}
+    for batch_id in {slide["batch_id"] for slide in slides}:
+        state = batch_catalog.document_state(Config.INSTANCE_DIR, batch_id, "name_mapping")
+        if state:
+            versions[batch_id] = state["desired_version"]
+    response = jsonify({"accessions": matches, "slides": slides,
+                        "versions": versions})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/accessions/update", methods=["POST"])
+@login_required
+def accessions_update():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Invalid request."}), 400
+    keys = payload.get("accession_keys")
+    changes = payload.get("changes")
+    versions = payload.get("versions")
+    if (not isinstance(keys, list) or not keys or len(keys) > 200
+            or not all(isinstance(key, str) and 0 < len(key) <= 200 for key in keys)
+            or len(set(keys)) != len(keys)
+            or not isinstance(changes, dict) or not changes
+            or not isinstance(versions, dict)):
+        return jsonify({"error": "Select accessions and changes first."}), 400
+    if any(field not in ACCESSION_EDIT_FIELDS or not isinstance(value, str)
+           for field, value in changes.items()):
+        return jsonify({"error": "Invalid field or value."}), 400
+    changes = {field: value.strip().upper() for field, value in changes.items()}
+    slide_type = changes.pop("Type", None)
+    if any(len(value) > 200 for value in changes.values()) or (
+        slide_type is not None and (not slide_type or len(slide_type) > 100)
+    ):
+        return jsonify({"error": "Value is too long."}), 400
+    selected = set(keys)
+    slides = _accession_editor_slides(list(selected))
+    if {renaming.accession_key(slide["accession"]) for slide in slides} != selected:
+        return jsonify({"error": "Some accessions are unavailable. Search again."}), 409
+    batch_ids = {slide["batch_id"] for slide in slides}
+    saved_batches = []
+    sdl_saved = False
+    try:
+        with _renaming_clone_lock:
+            prepared = {}
+            for batch_id in sorted(batch_ids):
+                fields, rows, state = _load_batch_document(batch_id, "name_mapping")
+                if str(state["desired_version"]) != str(versions.get(batch_id, "")):
+                    raise renaming.RenamingError("Mapping changed. Search again before saving.")
+                if changes:
+                    for row in rows:
+                        if renaming.row_accession_key(row) in selected:
+                            row.update(changes)
+                            row["NameEdited"] = "True"
+                    prior = [row for row in _renaming_prior_rows(batch_id)
+                             if row["_BatchID"] not in prepared]
+                    for prior_batch_id, (_, prior_rows) in prepared.items():
+                        prior.extend({**row, "_BatchID": prior_batch_id}
+                                     for row in prior_rows)
+                    renaming.assign_catalog_names(rows, prior, batch_id,
+                                                  preserve_sections=True)
+                    errors = renaming.validate_mapping_rows(rows)
+                    if errors:
+                        raise renaming.RenamingError("; ".join(errors))
+                    prepared[batch_id] = (fields, rows)
+            if slide_type is not None or (
+                "Organ" in changes and Path(Config.SDL_FILE_PATH).is_file()
+            ):
+                with _sdl_workbook_lock:
+                    workbook, worksheet, _ = _load_sdl_workbook()
+                    try:
+                        headers = _sdl_header_columns(worksheet)
+                        matching = [row["worksheet_row"] for row in _read_sdl_rows(worksheet)
+                                    if renaming.accession_key(row["values"]["Accession ID"]) in selected]
+                        if slide_type is not None and not matching:
+                            raise renaming.RenamingError("No Slide Digitization Log rows found for Type edit.")
+                        for number in matching:
+                            if slide_type is not None:
+                                worksheet.cell(row=number, column=headers["Type"]).value = slide_type
+                            if "Organ" in changes:
+                                worksheet.cell(row=number, column=headers["Organ"]).value = changes["Organ"]
+                        if matching:
+                            for row in _read_sdl_rows(worksheet):
+                                if row["worksheet_row"] in matching:
+                                    _validate_sdl_type_consistency(
+                                        worksheet, row["values"],
+                                        excluded_row=row["worksheet_row"],
+                                    )
+                            _save_sdl_workbook(workbook)
+                            sdl_saved = True
+                    finally:
+                        workbook.close()
+            # shortcut: SDL and batch writes can partly succeed; use one store for atomic multi-batch edits.
+            for batch_id, (fields, rows) in prepared.items():
+                _replace_batch_document(batch_id, "name_mapping", fields, rows)
+                saved_batches.append(batch_id)
+            batch_catalog.set_metadata(Config.INSTANCE_DIR, "transfer_signature", "")
+        if app.config.get("TESTING"):
+            _tq_prepare_catalog()
+        return jsonify({"success": True, "message": "Saved. Catalog sync required before export."})
+    except (renaming.RenamingError, DataLoadError, DataSaveError,
+            SDLWorkbookError, SDLValidationError) as exc:
+        suffix = " Some changes were saved; search again." if saved_batches or sdl_saved else ""
+        return jsonify({"error": str(exc) + suffix}), 409
+
+
+@app.route("/accessions/sync", methods=["POST"])
+@login_required
+def accessions_sync():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Invalid request."}), 400
+    keys = payload.get("accession_keys")
+    if (not isinstance(keys, list) or not keys or len(keys) > 200
+            or not all(isinstance(key, str) and 0 < len(key) <= 200 for key in keys)
+            or len(set(keys)) != len(keys)):
+        return jsonify({"error": "Select accessions first."}), 400
+    slides = _accession_editor_slides(keys)
+    found = {renaming.accession_key(slide["accession"]) for slide in slides}
+    counts = Counter(renaming.accession_key(slide["accession"]) for slide in slides)
+    indexed_counts = batch_catalog.accession_slide_counts(Config.INSTANCE_DIR, keys)
+    ready = found == set(keys) and all(
+        counts[key] == indexed_counts.get(key) for key in keys
+    ) and bool(batch_catalog.get_metadata(
+        Config.INSTANCE_DIR, "transfer_signature"))
+    for batch_id in {slide["batch_id"] for slide in slides}:
+        state = batch_catalog.document_state(Config.INSTANCE_DIR, batch_id, "name_mapping")
+        ready = ready and bool(state) and state["status"] == "current" and (
+            state["desired_version"] == state["exported_version"])
+    versions = {}
+    if ready:
+        for batch_id in {slide["batch_id"] for slide in slides}:
+            state = batch_catalog.document_state(Config.INSTANCE_DIR, batch_id, "name_mapping")
+            versions[batch_id] = state["desired_version"]
+    return jsonify({"ready": bool(ready), "slides": slides if ready else [],
+                    "versions": versions})
+
+
+@app.route("/accessions/export/<kind>", methods=["POST"])
+@login_required
+def accessions_export(kind: str):
+    if kind not in {"metadata", "copath"}:
+        abort(404)
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Invalid request."}), 400
+    keys = payload.get("accession_keys")
+    if (not isinstance(keys, list) or not keys or len(keys) > 200
+            or not all(isinstance(key, str) and 0 < len(key) <= 200 for key in keys)
+            or len(set(keys)) != len(keys)):
+        return jsonify({"error": "Select accessions first."}), 400
+    sync = accessions_sync().get_json()
+    if not sync["ready"]:
+        return jsonify({"error": "Catalog sync is required before export."}), 409
+    slides = sync["slides"]
+    if kind == "metadata":
+        fields = ("accession", "batch_name", "organ", "pid", "accession_date",
+                  "stain", "image_type", "samp_acq_type", "block_number",
+                  "section_count", "disposition", "sdl_types", "original_filename",
+                  "original_path", "destination_name")
+        rows = [{field: ", ".join(slide[field]) if field == "sdl_types"
+                 else slide.get(field, "") for field in fields} for slide in slides]
+    else:
+        reports = batch_catalog.copath_reports(Config.INSTANCE_DIR, keys)
+        roots = {row["public_id"]: Path(Config.INSLIDE_BATCHES) / row["relative_path"]
+                 for row in batch_catalog.list_batches(Config.INSTANCE_DIR)}
+        pending_reports = {}
+        try:
+            for batch_id in {slide["batch_id"] for slide in slides}:
+                if batch_id not in roots:
+                    return jsonify({"error": "Batch changed. Sync catalog and try again."}), 409
+                pending = roots[batch_id] / "pending_CoPath_data.csv"
+                if not pending.is_file():
+                    continue
+                _, pending_rows = renaming.read_csv(pending)
+                for row in pending_rows:
+                    key = renaming.row_accession_key(row)
+                    if key not in keys:
+                        continue
+                    collapsed = renaming.collapse_report_fields(row)
+                    if key in pending_reports and pending_reports[key] != collapsed:
+                        raise renaming.RenamingError(
+                            f"Conflicting pending CoPath records for {key}.")
+                    pending_reports[key] = collapsed
+        except (OSError, renaming.RenamingError) as exc:
+            return jsonify({"error": f"CoPath data could not be read: {exc}"}), 409
+        reports.update(pending_reports)
+        fields = renaming.COPATH_FIELDS
+        rows = [{field: reports[key].get(field, "") for field in fields}
+                for key in keys if key in reports]
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+    response = make_response(output.getvalue())
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = f'attachment; filename="accessions-{kind}.csv"'
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/tq", methods=["GET"])
