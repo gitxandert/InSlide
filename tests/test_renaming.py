@@ -73,6 +73,52 @@ class RenamingDataTests(unittest.TestCase):
         self.assertEqual("BRAIN_AAAAAZ_20250304_XXXX_HE_WSI_REB4000.svs", rows[0]["NewName"])
         self.assertTrue(all(row["Approved"] == "False" for row in rows))
 
+    def test_reassign_organ_treats_blank_mrn_as_unique_and_moves_copath_row(self):
+        renaming.initialize_clone(self.clone)
+        write_csv(self.clone / "all_iuh_identifiers.csv", renaming.IDENTIFIER_FIELDS, [
+            {"AccessionID": "NP25-100", "Organ": "BRAIN", "MRN": "", "PID": "AAAAAA"},
+            {"AccessionID": "NP24-1", "Organ": "BREAST", "MRN": "MRN1", "PID": "AAAAAA"},
+        ])
+        write_csv(self.clone / "BRAIN" / "copath_data.csv", renaming.COPATH_FIELDS, [{
+            "accession_id": "NP25-100", "mrn": "", "organ": "BRAIN",
+            "PID": "AAAAAA", "report": "Example",
+        }])
+
+        pids = renaming.reassign_accession_organs(
+            self.clone, {"NP25-100": "BREAST"}, save=True
+        )
+
+        self.assertEqual({"np25-100": "AAAAAB"}, pids)
+        _, identifiers = renaming.read_csv(self.clone / "all_iuh_identifiers.csv")
+        selected = next(row for row in identifiers if row["AccessionID"] == "NP25-100")
+        self.assertEqual(
+            {"Organ": "BREAST", "MRN": "", "PID": "AAAAAB"},
+            {field: selected[field] for field in ("Organ", "MRN", "PID")},
+        )
+        _, brain = renaming.read_csv(self.clone / "BRAIN" / "copath_data.csv")
+        _, breast = renaming.read_csv(self.clone / "BREAST" / "copath_data.csv")
+        self.assertFalse(any(renaming.row_accession_key(row) == "np25-100" for row in brain))
+        moved = next(row for row in breast if renaming.row_accession_key(row) == "np25-100")
+        self.assertEqual("BREAST", moved["organ"])
+        self.assertEqual("AAAAAB", moved["PID"])
+
+    def test_reassign_organ_reuses_existing_mrn_organ_pid(self):
+        renaming.initialize_clone(self.clone)
+        write_csv(self.clone / "all_iuh_identifiers.csv", renaming.IDENTIFIER_FIELDS, [
+            {"AccessionID": "NP25-100", "Organ": "BRAIN", "MRN": "MRN2", "PID": "AAAAAA"},
+            {"AccessionID": "NP24-1", "Organ": "BREAST", "MRN": "MRN2", "PID": "BBBBBB"},
+        ])
+
+        pids = renaming.reassign_accession_organs(
+            self.clone, {"NP25-100": "BREAST"}, save=True
+        )
+
+        self.assertEqual({"np25-100": "BBBBBB"}, pids)
+        _, identifiers = renaming.read_csv(self.clone / "all_iuh_identifiers.csv")
+        selected = next(row for row in identifiers if row["AccessionID"] == "NP25-100")
+        self.assertEqual("BREAST", selected["Organ"])
+        self.assertEqual("BBBBBB", selected["PID"])
+
     def test_prepare_uses_inventory_to_flag_duplicate_and_continue_sections(self):
         inventory = self.root / "SS100_inventory.csv"
         write_csv(

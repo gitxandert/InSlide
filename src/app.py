@@ -6930,6 +6930,15 @@ def _accession_edit_plan(payload: Any) -> Dict[str, Any]:
     slides = sync.get("slides") or _accession_editor_slides(keys)
     if {renaming.accession_key(slide["accession"]) for slide in slides} != selected:
         raise renaming.RenamingError("Some accessions are unavailable. Search again.")
+    identifier_organs = {}
+    identity_pids = {}
+    if "Organ" in changes:
+        identifier_organs = {
+            slide["accession"]: changes["Organ"] for slide in slides
+        }
+        identity_pids = renaming.reassign_accession_organs(
+            Path(Config.COPATH_CLONE), identifier_organs
+        )
     slide_by_path = {(slide["batch_id"], slide["original_path"]): slide
                      for slide in slides}
     if set(slide_changes) - {slide["id"] for slide in slides}:
@@ -6945,7 +6954,13 @@ def _accession_edit_plan(payload: Any) -> Dict[str, Any]:
             for row in rows:
                 if renaming.row_accession_key(row) in selected:
                     slide = slide_by_path.get((batch_id, str(runtime_path(row["OriginalPath"]))))
-                    row_changes = {**changes, **slide_changes.get(slide["id"], {})} if slide else changes
+                    row_changes = {
+                        **changes,
+                        **(slide_changes.get(slide["id"], {}) if slide else {}),
+                    }
+                    pid = identity_pids.get(renaming.row_accession_key(row))
+                    if pid:
+                        row_changes["PID"] = pid
                     if row_changes:
                         row.update(row_changes)
                         row["NameEdited"] = "True"
@@ -6971,7 +6986,13 @@ def _accession_edit_plan(payload: Any) -> Dict[str, Any]:
             ):
                 continue
             slide = slide_by_path.get((batch_id, str(runtime_path(row["OriginalPath"]))))
-            row_changes = {**changes, **slide_changes.get(slide["id"], {})} if slide else changes
+            row_changes = {
+                **changes,
+                **(slide_changes.get(slide["id"], {}) if slide else {}),
+            }
+            pid = identity_pids.get(renaming.row_accession_key(row))
+            if pid:
+                row_changes["PID"] = pid
             old_values = {field: before.get(field, "") for field in row_changes}
             new_values = {field: row.get(field, "") for field in row_changes}
             if slide_type is not None and is_selected:
@@ -6989,7 +7010,8 @@ def _accession_edit_plan(payload: Any) -> Dict[str, Any]:
                          item["old_filename"] != item["new_filename"]
                          for item in preview)
     return {"selected": selected, "changes": changes, "slide_type": slide_type,
-            "prepared": prepared, "preview": preview, "changed_slides": changed_slides}
+            "prepared": prepared, "preview": preview, "changed_slides": changed_slides,
+            "identifier_organs": identifier_organs, "identity_pids": identity_pids}
 
 
 def _accession_edit_sdl(selected: set[str], changes: Dict[str, str],
@@ -7054,6 +7076,7 @@ def accessions_preview():
 def _commit_accession_edit(payload: Dict[str, Any]) -> Dict[str, Any]:
     saved_batches = []
     sdl_saved = False
+    clone_saved = False
     try:
         with _renaming_clone_lock:
             plan = _accession_edit_plan(payload)
@@ -7062,6 +7085,16 @@ def _commit_accession_edit(payload: Dict[str, Any]) -> Dict[str, Any]:
             batches, warnings = discover_batches()
             sdl_saved = _accession_edit_sdl(plan["selected"], plan["changes"],
                                            plan["slide_type"], save=True)
+            if plan["identifier_organs"]:
+                saved_pids = renaming.reassign_accession_organs(
+                    Path(Config.COPATH_CLONE), plan["identifier_organs"], save=True
+                )
+                if saved_pids != plan["identity_pids"]:
+                    raise renaming.RenamingError(
+                        "Identifier assignments changed. Preview again before saving."
+                    )
+                clone_saved = True
+                _refresh_copath_report_index()
             # shortcut: SDL and batch writes can partly succeed; use one store for atomic multi-batch edits.
             with _tq_catalog_lock, _document_export_lock:
                 batch_catalog.set_metadata(Config.INSTANCE_DIR, "transfer_signature", "")
@@ -7090,7 +7123,7 @@ def _commit_accession_edit(payload: Dict[str, Any]) -> Dict[str, Any]:
             ValueError) as exc:
         if saved_batches:
             _document_export_event.set()
-        suffix = " Some changes were saved; search again." if saved_batches or sdl_saved else ""
+        suffix = " Some changes were saved; search again." if saved_batches or sdl_saved or clone_saved else ""
         raise RuntimeError(str(exc) + suffix) from exc
 
 

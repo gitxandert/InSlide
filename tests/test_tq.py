@@ -252,10 +252,15 @@ class TQTransferTests(unittest.TestCase):
             "changes": {"PID": "BAD"},
         })
         self.assertEqual(409, invalid.status_code)
+        write_csv(
+            Path(app_module.Config.COPATH_CLONE) / "all_iuh_identifiers.csv",
+            renaming.IDENTIFIER_FIELDS,
+            [{"AccessionID": "NP25-100", "Organ": "BRAIN", "MRN": "", "PID": "AAAAAA"}],
+        )
         edit = {
             **selection,
             "versions": search["versions"],
-            "changes": {"Organ": "BREAST", "PID": "BBBBBB", "Type": "RETRO"},
+            "changes": {"Organ": "BREAST", "Type": "RETRO"},
         }
         before_state = app_module.batch_catalog.document_state(
             app_module.Config.INSTANCE_DIR, batch_id, "name_mapping")
@@ -287,11 +292,11 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(200, metadata.status_code)
         rows = list(csv.DictReader(io.StringIO(metadata.get_data(as_text=True))))
         self.assertEqual(2, len(rows))
-        self.assertTrue(all(row["organ"] == "BREAST" and row["pid"] == "BBBBBB"
+        self.assertTrue(all(row["organ"] == "BREAST" and row["pid"] == "AAAAAB"
                             and row["sdl_types"] == "RETRO" for row in rows))
         self.assertIn("one.svs", rows[0]["original_path"])
         self.assertEqual("one.svs", rows[0]["original_filename"])
-        self.assertIn("BBBBBB", rows[0]["destination_name"])
+        self.assertIn("AAAAAB", rows[0]["destination_name"])
         copath = self.client.post("/accessions/export/copath", json=selection)
         self.assertEqual(200, copath.status_code)
         self.assertEqual([], list(csv.DictReader(io.StringIO(copath.get_data(as_text=True)))))
@@ -307,6 +312,48 @@ class TQTransferTests(unittest.TestCase):
         workbook = load_workbook(self.sdl_path)
         self.assertEqual("RETRO", workbook.active.cell(2, app_module.SDL_HEADERS.index("Type") + 1).value)
         workbook.close()
+
+    def test_accession_editor_organ_change_reassigns_pid_without_copath_data(self):
+        write_csv(
+            Path(app_module.Config.COPATH_CLONE) / "all_iuh_identifiers.csv",
+            renaming.IDENTIFIER_FIELDS,
+            [
+                {"AccessionID": "NP25-100", "Organ": "BRAIN", "MRN": "", "PID": "AAAAAA"},
+                {"AccessionID": "NP24-1", "Organ": "BREAST", "MRN": "MRN1", "PID": "AAAAAA"},
+            ],
+        )
+        self.catalog()
+        search = self.client.get("/accessions/search?q=NP25-100").get_json()
+        key = search["accessions"][0]["accession_key"]
+        edit = {
+            "accession_keys": [key],
+            "versions": search["versions"],
+            "changes": {"Organ": "BREAST"},
+        }
+
+        preview = self.client.post("/accessions/preview", json=edit)
+        self.assertEqual(200, preview.status_code, preview.get_json())
+        self.assertTrue(all(
+            row["after"] == {"Organ": "BREAST", "PID": "AAAAAB"}
+            for row in preview.get_json()["slides"]
+        ))
+        self.assertEqual(202, self.client.post("/accessions/update", json=edit).status_code)
+        self.wait_for_accession_catalog()
+
+        _, identifiers = renaming.read_csv(
+            Path(app_module.Config.COPATH_CLONE) / "all_iuh_identifiers.csv"
+        )
+        selected = next(row for row in identifiers if row["AccessionID"] == "NP25-100")
+        self.assertEqual("BREAST", selected["Organ"])
+        self.assertEqual("", selected["MRN"])
+        self.assertEqual("AAAAAB", selected["PID"])
+        metadata = self.client.post(
+            "/accessions/export/metadata", json={"accession_keys": [key]}
+        )
+        rows = list(csv.DictReader(io.StringIO(metadata.get_data(as_text=True))))
+        self.assertTrue(all(
+            row["organ"] == "BREAST" and row["pid"] == "AAAAAB" for row in rows
+        ))
 
     def test_accession_editor_imports_txt_and_selected_csv_column(self):
         self.catalog()

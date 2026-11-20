@@ -905,6 +905,137 @@ def _pid_for_identifiers(
     return candidate
 
 
+def reassign_accession_organs(
+    clone_root: Path,
+    accession_organs: Mapping[str, str],
+    *,
+    save: bool = False,
+) -> Dict[str, str]:
+    """Return target PIDs and optionally persist accession organ moves."""
+    identifiers = _identifier_rows(clone_root)
+    identifier_by_accession = {
+        row_accession_key(row): row for row in identifiers if row_accession(row)
+    }
+    headers: Dict[str, List[str]] = {}
+    clone_rows: Dict[str, List[Dict[str, str]]] = {}
+    original_clone_rows: Dict[str, List[Dict[str, str]]] = {}
+    raw_by_accession: Dict[str, List[Tuple[str, Dict[str, str]]]] = defaultdict(list)
+    for organ in ORGANS:
+        organ_headers, organ_rows = read_csv(clone_root / organ / "copath_data.csv")
+        headers[organ] = collapse_report_headers(organ_headers)
+        clone_rows[organ] = [collapse_report_fields(row) for row in organ_rows]
+        original_clone_rows[organ] = [dict(row) for row in clone_rows[organ]]
+        for row in clone_rows[organ]:
+            if row_accession(row):
+                raw_by_accession[row_accession_key(row)].append((organ, row))
+
+    requested: Dict[str, Tuple[str, str]] = {}
+    for accession, raw_organ in accession_organs.items():
+        cleaned = clean_accession(accession)
+        organ = str(raw_organ).strip().upper()
+        if not cleaned:
+            raise RenamingError("Accession ID is required")
+        if organ not in ORGANS:
+            raise RenamingError(f"invalid organ: {organ or '(blank)'}")
+        key = accession_key(cleaned)
+        requested[key] = (cleaned, organ)
+        matches = raw_by_accession.get(key, [])
+        if len(matches) > 1:
+            raise RenamingError(f"{cleaned} appears in multiple CoPath organ files")
+        source = matches[0][1] if matches else {}
+        current = identifier_by_accession.get(key)
+        if current is None:
+            current = {
+                "AccessionID": cleaned,
+                "Organ": matches[0][0] if matches else organ,
+                "MRN": source.get("mrn", "").strip(),
+                "PID": source.get("PID", "").strip().upper(),
+            }
+            identifiers.append(current)
+            identifier_by_accession[key] = current
+        elif not current.get("MRN", "").strip() and source.get("mrn", "").strip():
+            current["MRN"] = source["mrn"].strip()
+
+    reserved = {
+        organ: {
+            row.get("PID", "").strip().upper()
+            for row in identifiers
+            if row.get("Organ", "").strip().upper() == organ
+            and PID_RE.fullmatch(row.get("PID", "").strip().upper())
+        }
+        for organ in ORGANS
+    }
+    pairs = {
+        (row.get("MRN", "").strip(), row.get("Organ", "").strip().upper()):
+            row.get("PID", "").strip().upper()
+        for row in identifiers
+        if row.get("MRN", "").strip()
+        and row.get("Organ", "").strip().upper() in ORGANS
+        and PID_RE.fullmatch(row.get("PID", "").strip().upper())
+    }
+    result: Dict[str, str] = {}
+    for key, (accession, organ) in requested.items():
+        current = identifier_by_accession[key]
+        old_organ = current.get("Organ", "").strip().upper()
+        old_pid = current.get("PID", "").strip().upper()
+        mrn = current.get("MRN", "").strip()
+        if old_organ == organ and PID_RE.fullmatch(old_pid):
+            pid = old_pid
+        else:
+            pid = pairs.get((mrn, organ), "") if mrn else ""
+            if not pid:
+                if PID_RE.fullmatch(old_pid):
+                    reserved[organ].add(old_pid)
+                pid = _pid_for_identifiers(
+                    {"mrn": mrn}, organ, identifiers, reserved[organ], pairs
+                )
+        current.update({"AccessionID": accession, "Organ": organ, "PID": pid})
+        result[key] = pid
+
+        matches = raw_by_accession.get(key, [])
+        if matches:
+            source = dict(matches[0][1])
+            for source_organ in ORGANS:
+                clone_rows[source_organ] = [
+                    row for row in clone_rows[source_organ]
+                    if row_accession_key(row) != key
+                ]
+            source.update({"organ": organ, "PID": pid})
+            clone_rows[organ].append(source)
+            headers[organ] = list(dict.fromkeys([*headers[organ], *source.keys()]))
+
+    index_rows = sorted(identifiers, key=lambda row: row["AccessionID"])
+    _validate_identifiers(index_rows)
+    if not save:
+        return result
+
+    index_path = clone_root / "all_iuh_identifiers.csv"
+    original_index_headers, original_index_rows = read_csv(index_path)
+    targets = [(index_path, list(IDENTIFIER_FIELDS), index_rows,
+                original_index_headers, original_index_rows)]
+    targets.extend(
+        (
+            clone_root / organ / "copath_data.csv",
+            headers[organ],
+            clone_rows[organ],
+            headers[organ],
+            original_clone_rows[organ],
+        )
+        for organ in ORGANS
+        if clone_rows[organ] != original_clone_rows[organ]
+    )
+    written = []
+    try:
+        for path, target_headers, rows, old_headers, old_rows in targets:
+            atomic_write(path, target_headers, rows)
+            written.append((path, old_headers, old_rows))
+    except Exception:
+        for path, old_headers, old_rows in reversed(written):
+            atomic_write(path, old_headers, old_rows)
+        raise
+    return result
+
+
 def direct_query(
     batch_root: Path, accessions: Sequence[str], output_path: Path,
     scope: str = "exact_accession",
