@@ -6811,6 +6811,16 @@ def accessions_page():
                            sample_types=renaming.SAMPLE_TYPES)
 
 
+def _accession_search_result(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
+    slides = _accession_editor_slides([row["accession_key"] for row in matches])
+    versions = {}
+    for batch_id in {slide["batch_id"] for slide in slides}:
+        state = batch_catalog.document_state(Config.INSTANCE_DIR, batch_id, "name_mapping")
+        if state:
+            versions[batch_id] = state["desired_version"]
+    return {"accessions": matches, "slides": slides, "versions": versions}
+
+
 @app.route("/accessions/search")
 @login_required
 def accessions_search():
@@ -6818,17 +6828,57 @@ def accessions_search():
     if len(term) > 200:
         return jsonify({"error": "Search is too long."}), 400
     matches = batch_catalog.search_accessions(Config.INSTANCE_DIR, term)
-    keys = [row["accession_key"] for row in matches]
-    slides = _accession_editor_slides(keys)
-    versions = {}
-    for batch_id in {slide["batch_id"] for slide in slides}:
-        state = batch_catalog.document_state(Config.INSTANCE_DIR, batch_id, "name_mapping")
-        if state:
-            versions[batch_id] = state["desired_version"]
-    response = jsonify({"accessions": matches, "slides": slides,
-                        "versions": versions})
+    response = jsonify(_accession_search_result(matches))
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.route("/accessions/file", methods=["POST"])
+@login_required
+def accessions_file():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or set(payload) - {"name", "text", "column"}:
+        return jsonify({"error": "Invalid accession file."}), 400
+    name, content = payload.get("name"), payload.get("text")
+    if (not isinstance(name, str) or len(name) > 255
+            or Path(name).suffix.casefold() not in {".txt", ".csv"}
+            or not isinstance(content, str)
+            or len(content) > _TQ_MAX_ACCESSION_TEXT_LENGTH):
+        return jsonify({"error": "Use a .txt or .csv file within the accession size limit."}), 400
+    try:
+        if Path(name).suffix.casefold() == ".csv":
+            reader = csv.reader(io.StringIO(content.removeprefix("\ufeff"), newline=""), strict=True)
+            headers = next(reader, [])
+            if not headers:
+                raise ValueError("CSV has no columns.")
+            if "column" not in payload:
+                return jsonify({"columns": headers})
+            column = payload["column"]
+            if not isinstance(column, int) or isinstance(column, bool) or column < 0 or column >= len(headers):
+                raise ValueError("Select a CSV column.")
+            values = [row[column].strip() for row in reader if len(row) > column and row[column].strip()]
+        else:
+            values = _tq_accession_lines(content)
+        if len(values) > _TQ_MAX_ACCESSION_ENTRIES:
+            raise ValueError("Accession file may contain at most 10,000 entries.")
+        if any(len(value) > _TQ_MAX_ACCESSION_LENGTH for value in values):
+            raise ValueError("Accession IDs must not exceed 200 characters.")
+        keys = list(dict.fromkeys(renaming.accession_key(value) for value in values))
+        if len(keys) > 200:
+            raise ValueError("Select at most 200 unique accessions per file.")
+        if not keys:
+            raise ValueError("No accession IDs found in file.")
+        matches = batch_catalog.accessions_by_keys(Config.INSTANCE_DIR, keys)
+        found_keys = {row["accession_key"] for row in matches}
+        result = _accession_search_result(matches)
+        result.update({"requested": len(keys), "found": len(matches),
+                       "missing": list(dict.fromkeys(value for value in values
+                                   if renaming.accession_key(value) not in found_keys))})
+        response = jsonify(result)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except (csv.Error, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/accessions/update", methods=["POST"])

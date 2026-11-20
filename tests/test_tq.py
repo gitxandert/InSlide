@@ -262,6 +262,31 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual("RETRO", workbook.active.cell(2, app_module.SDL_HEADERS.index("Type") + 1).value)
         workbook.close()
 
+    def test_accession_editor_imports_txt_and_selected_csv_column(self):
+        self.catalog()
+        txt = self.client.post("/accessions/file", json={
+            "name": "list.txt", "text": "NP25-100\r\nMISSING\r\nnp25-100\n",
+        })
+        self.assertEqual(200, txt.status_code)
+        self.assertEqual(2, txt.get_json()["requested"])
+        self.assertEqual(1, txt.get_json()["found"])
+        self.assertEqual(["MISSING"], txt.get_json()["missing"])
+        self.assertEqual(2, len(txt.get_json()["slides"]))
+
+        csv_text = 'Comment,Accession,Other\n"contains, comma",NP25-100,x\nno match,MISSING,y\n'
+        preview = self.client.post("/accessions/file", json={
+            "name": "list.csv", "text": csv_text,
+        })
+        self.assertEqual(["Comment", "Accession", "Other"], preview.get_json()["columns"])
+        imported = self.client.post("/accessions/file", json={
+            "name": "list.csv", "text": csv_text, "column": 1,
+        })
+        self.assertEqual(200, imported.status_code)
+        self.assertEqual(1, imported.get_json()["found"])
+        self.assertEqual(400, self.client.post("/accessions/file", json={
+            "name": "bad.csv", "text": 'ID\n"unterminated', "column": 0,
+        }).status_code)
+
     def search(self, filters=None, selected_ids=None, accessions=None):
         payload = (
             {"selected_ids": selected_ids}

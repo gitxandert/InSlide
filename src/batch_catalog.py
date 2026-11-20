@@ -1611,6 +1611,23 @@ class BatchCatalog:
             ).fetchall()
             return {row["accession_key"]: row["slide_count"] for row in rows}
 
+    def accessions_by_keys(
+        self, instance_dir: str | Path, accession_keys: Sequence[str]
+    ) -> list[dict]:
+        if not accession_keys:
+            return []
+        with self.connection(instance_dir) as connection:
+            rows = connection.execute(
+                """SELECT s.accession_key, MIN(s.accession) AS accession,
+                          COUNT(*) AS slide_count
+                   FROM transfer_slides s JOIN batches b ON b.id=s.batch_id
+                   WHERE b.validity='ready' AND s.accession_key IN """
+                f"({','.join('?' for _ in accession_keys)}) "
+                "GROUP BY s.accession_key ORDER BY accession",
+                accession_keys,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def accession_history(self, instance_dir: str | Path, accession_key: str) -> dict:
         """Return slide, extracted image, CoPath source, and stage data from catalog."""
         with self.connection(instance_dir) as connection:

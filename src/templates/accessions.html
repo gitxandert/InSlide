@@ -32,6 +32,13 @@
             <h2>Find accessions</h2>
             <label for="search">Accession ID</label>
             <input id="search" type="search" autocomplete="off" placeholder="Type ID, or browse list" maxlength="200">
+            <div class="actions"><label for="accession-file">Select from TXT or CSV
+                <input id="accession-file" type="file" accept=".txt,.csv,text/plain,text/csv">
+            </label></div>
+            <label id="column-field" for="accession-column" hidden>CSV accession column
+                <select id="accession-column"><option value="">Choose a column</option></select>
+            </label>
+            <div class="actions"><button id="add-file" disabled>Add file accessions</button></div>
             <p class="muted">Select one or more accessions. First 200 matches shown.</p>
             <div id="list" class="list" aria-label="Accessions"></div>
         </section>
@@ -64,12 +71,13 @@
 </main>
 <script nonce="{{ csp_nonce() }}">
 const csrf={{ csrf_token()|tojson }};
-const urls={search:{{ url_for('accessions_search')|tojson }},update:{{ url_for('accessions_update')|tojson }},sync:{{ url_for('accessions_sync')|tojson }},metadata:{{ url_for('accessions_export',kind='metadata')|tojson }},copath:{{ url_for('accessions_export',kind='copath')|tojson }}};
+const urls={search:{{ url_for('accessions_search')|tojson }},file:{{ url_for('accessions_file')|tojson }},update:{{ url_for('accessions_update')|tojson }},sync:{{ url_for('accessions_sync')|tojson }},metadata:{{ url_for('accessions_export',kind='metadata')|tojson }},copath:{{ url_for('accessions_export',kind='copath')|tojson }}};
 const selected=new Set();
 const opened=new Set();
 let catalog={accessions:[],slides:[],versions:{}};
 let ready=false;
 let timer;
+let fileData;
 const list=document.getElementById('list'), details=document.getElementById('details'), status=document.getElementById('sync'), message=document.getElementById('message');
 function request(url,body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});}
 function setReady(value){ready=value;document.getElementById('save').disabled=!value||!selected.size;document.getElementById('metadata').disabled=!value;document.getElementById('copath').disabled=!value;status.classList.toggle('ready',value);status.textContent=value?'Catalog synced. Files ready to save.':'Catalog sync needed before saving files.';}
@@ -116,6 +124,40 @@ async function checkSync(){
   catch(error){setReady(false);status.textContent=error.message;}
 }
 document.getElementById('search').addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(search,250);});
+document.getElementById('accession-file').addEventListener('change',async event=>{
+  fileData=undefined;document.getElementById('add-file').disabled=true;
+  const field=document.getElementById('column-field'),column=document.getElementById('accession-column');
+  field.hidden=true;column.replaceChildren(new Option('Choose a column',''));
+  const file=event.target.files[0];if(!file)return;
+  try{
+    if(file.size>2011000)throw Error('Accession file is too large.');
+    fileData={name:file.name,text:new TextDecoder('utf-8',{fatal:true}).decode(await file.arrayBuffer())};
+    if(file.name.toLowerCase().endsWith('.csv')){
+      const response=await request(urls.file,fileData),data=await response.json();if(!response.ok)throw Error(data.error);
+      data.columns.forEach((name,index)=>column.add(new Option(`${index+1}: ${name||'(unnamed)'}`,String(index))));
+      field.hidden=false;
+    }else if(!file.name.toLowerCase().endsWith('.txt'))throw Error('Choose a .txt or .csv file.');
+    document.getElementById('add-file').disabled=!field.hidden;
+    message.textContent=field.hidden?'TXT ready: one accession per line.':'Choose CSV column containing accession IDs.';message.className='';
+  }catch(error){fileData=undefined;message.textContent=error.message;message.className='error';}
+});
+document.getElementById('accession-column').addEventListener('change',event=>{document.getElementById('add-file').disabled=!event.target.value;});
+document.getElementById('add-file').addEventListener('click',async()=>{
+  if(!fileData)return;
+  const column=document.getElementById('accession-column');
+  const payload={...fileData};if(!document.getElementById('column-field').hidden)payload.column=Number(column.value);
+  try{
+    const response=await request(urls.file,payload),data=await response.json();if(!response.ok)throw Error(data.error);
+    const added=data.accessions.filter(item=>!selected.has(item.accession_key));
+    if(selected.size+added.length>200)throw Error('Selection would exceed 200 accessions. Clear some selections first.');
+    for(const item of added)selected.add(item.accession_key);
+    catalog.accessions=[...catalog.accessions.filter(item=>!data.accessions.some(match=>match.accession_key===item.accession_key)),...data.accessions];
+    catalog.slides=[...catalog.slides.filter(slide=>!data.slides.some(match=>match.id===slide.id)),...data.slides];
+    catalog.versions={...catalog.versions,...data.versions};
+    render();checkSync();
+    message.textContent=`Found ${data.found}/${data.requested} accessions in ${fileData.name}.${data.missing.length?` Missing: ${data.missing.slice(0,5).join(', ')}${data.missing.length>5?'…':''}`:''}`;message.className='';
+  }catch(error){message.textContent=error.message;message.className='error';}
+});
 document.getElementById('save').addEventListener('click',async()=>{
   const changes=Object.fromEntries([...document.querySelectorAll('[data-field]')].map(input=>[input.dataset.field,input.value.trim()]).filter(([,value])=>value));
   if(!Object.keys(changes).length){message.textContent='Fill at least one field.';return;}
