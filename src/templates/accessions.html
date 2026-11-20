@@ -43,7 +43,7 @@
             <p class="muted">Search and browse results, or load accessions from a file.</p>
             <h2>Returned accessions</h2>
             <div id="list" class="list" aria-label="Accessions"></div>
-            <div class="actions"><button id="load-more" hidden>Show more accessions</button></div>
+            <div class="actions"><button id="toggle-all" disabled>Select all returned</button><button id="load-more" hidden>Show more accessions</button></div>
     </section>
             <section>
                 <h2>Set one field for all loaded accessions</h2>
@@ -90,9 +90,8 @@
 <script nonce="{{ csp_nonce() }}">
 const csrf={{ csrf_token()|tojson }};
 const urls={search:{{ url_for('accessions_search')|tojson }},file:{{ url_for('accessions_file')|tojson }},preview:{{ url_for('accessions_preview')|tojson }},update:{{ url_for('accessions_update')|tojson }},job:{{ url_for('accessions_job')|tojson }},selection:{{ url_for('accessions_selection')|tojson }},sync:{{ url_for('accessions_sync')|tojson }},metadata:{{ url_for('accessions_export',kind='metadata')|tojson }},copath:{{ url_for('accessions_export',kind='copath')|tojson }}};
-function storedKeys(name){try{const values=JSON.parse(sessionStorage.getItem(name)||'[]');return new Set(Array.isArray(values)?values:[]);}catch{return new Set();}}
-const selected=storedKeys('accessions:selected');
-const loaded=storedKeys('accessions:loaded');
+const selected=new Set();
+const loaded=new Set();
 const opened=new Set();
 const slideDrafts=new Map();
 let catalog={accessions:[],slides:[],versions:{}};
@@ -111,7 +110,6 @@ let jobSequence=0;
 let fileData;
 const list=document.getElementById('list'), details=document.getElementById('details'), status=document.getElementById('sync'), message=document.getElementById('message'), jobBanner=document.getElementById('job-banner');
 function request(url,body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});}
-function rememberKeys(){sessionStorage.setItem('accessions:selected',JSON.stringify([...selected]));sessionStorage.setItem('accessions:loaded',JSON.stringify([...loaded]));}
 function setReady(value,pendingFiles=0,failedFiles=0){ready=value;const pending=selected.size&&[...selected].some(key=>pendingKeys.has(key));const disabled=!selected.size||saveBusy;document.getElementById('metadata').disabled=disabled;document.getElementById('copath').disabled=disabled;status.classList.toggle('ready',ready);status.textContent=pending?'Selected accessions have changes waiting for catalog sync. Export checks their current status when clicked.':ready?(failedFiles?`Catalog synced. ${failedFiles} batch file export(s) failed. Exports use catalog data.`:pendingFiles?`Catalog synced. ${pendingFiles} batch file(s) updating in background. Exports ready.`:'Catalog synced. Exports ready.'):'Catalog updating. Export checks current catalog state when clicked.';}
 async function refreshSelection(){
   if(!selected.size)return;
@@ -122,18 +120,12 @@ async function refreshSelection(){
   catalog.slides=[...catalog.slides.filter(slide=>!keys.has(slide.accession.trim().toLocaleLowerCase())&&!ids.has(slide.id)),...data.slides];
   catalog.versions={...catalog.versions,...data.versions};render();
 }
-async function pollJob(restore=false){
+async function pollJob(){
   const sequence=++jobSequence;
   try{
-    const response=await fetch(`${urls.job}${restore?'?include_selection=1':''}`,{cache:'no-store'}),job=await response.json();
+    const response=await fetch(urls.job,{cache:'no-store'}),job=await response.json();
     if(sequence!==jobSequence)return;
     if(!response.ok)throw Error(job.error);
-    if(restore&&job.accession_keys?.length){
-      job.accession_keys.forEach(key=>selected.add(key));
-      job.loaded_keys?.forEach(key=>loaded.add(key));
-      rememberKeys();
-      await refreshSelection();
-    }
     jobBusy=['queued','catalog_syncing'].includes(job.status);
     pendingKeys=new Set(job.pending_keys||[]);
     jobBanner.hidden=job.status==='idle';
@@ -155,11 +147,13 @@ function render(){
   list.replaceChildren();details.replaceChildren();
   for(const accession of catalog.accessions){
     const label=document.createElement('label'),check=document.createElement('input'),name=document.createElement('span');
-    check.type='checkbox';check.checked=selected.has(accession.accession_key);check.addEventListener('change',()=>{check.checked?selected.add(accession.accession_key):selected.delete(accession.accession_key);rememberKeys();invalidatePreview();setReady(false);render();checkSync();});
+    check.type='checkbox';check.checked=selected.has(accession.accession_key);check.addEventListener('change',()=>{check.checked?selected.add(accession.accession_key):selected.delete(accession.accession_key);invalidatePreview();setReady(false);render();checkSync();});
     name.textContent=`${accession.accession} (${accession.slide_count})`;label.append(check,name);list.append(label);
   }
   if(!catalog.accessions.length)list.textContent='No accessions found. Catalog may still be updating.';
   list.scrollTop=listTop;
+  const returnedKeys=catalog.accessions.map(item=>item.accession_key),allReturnedSelected=returnedKeys.length&&returnedKeys.every(key=>selected.has(key)),toggleAll=document.getElementById('toggle-all');
+  toggleAll.disabled=!returnedKeys.length;toggleAll.textContent=allReturnedSelected?'Unselect all returned':'Select all returned';
   const slides=catalog.slides.filter(slide=>selected.has(slide.accession.trim().toLocaleLowerCase()));
   document.getElementById('selection').textContent=`${selected.size} accession(s), ${slides.length} slide(s) selected`;
   document.getElementById('loaded-count').textContent=loaded.size?`${loaded.size} file accession(s) loaded. This changes all of them, including any unchecked in the list.`:'Load a TXT or CSV file to use this action.';
@@ -220,6 +214,7 @@ async function checkSync(){
   catch(error){if(sequence===syncSequence){setReady(false);status.textContent=error.message;}}
 }
 document.getElementById('search').addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(search,250);});
+document.getElementById('toggle-all').addEventListener('click',()=>{const keys=catalog.accessions.map(item=>item.accession_key),unselect=keys.length&&keys.every(key=>selected.has(key));for(const key of keys){if(unselect)selected.delete(key);else selected.add(key);}invalidatePreview();setReady(false);render();checkSync();});
 document.getElementById('load-more').addEventListener('click',()=>search(true));
 document.getElementById('accession-file').addEventListener('change',async event=>{
   invalidatePreview();
@@ -247,7 +242,6 @@ document.getElementById('add-file').addEventListener('click',async()=>{
     const response=await request(urls.file,payload),data=await response.json();if(!response.ok)throw Error(data.error);
     selected.clear();loaded.clear();opened.clear();slideDrafts.clear();
     for(const item of data.accessions){selected.add(item.accession_key);loaded.add(item.accession_key);}
-    rememberKeys();
     invalidatePreview();
     catalog={accessions:data.accessions,slides:data.slides,versions:data.versions};
     searchOffset=0;document.getElementById('load-more').hidden=true;
@@ -325,7 +319,7 @@ async function saveFile(kind){
 document.getElementById('metadata').addEventListener('click',()=>saveFile('metadata'));
 document.getElementById('copath').addEventListener('click',()=>saveFile('copath'));
 setInterval(()=>{if(document.visibilityState==='visible'){pollJob();if(!jobBusy&&selected.size)checkSync();else if(!catalog.accessions.length)search();}},5000);
-(async()=>{await pollJob(true);if(selected.size)await refreshSelection();if(loaded.size){render();checkSync();}else await search();})();
+(async()=>{await pollJob();await search();})();
 </script>
 </body>
 </html>
