@@ -10,7 +10,7 @@ SCRIPT_PATH = (
     / "src" / "copath_utilities" / "query_copath_db.py"
 )
 sys.path.insert(0, str(SCRIPT_PATH.parent))
-sys.modules.setdefault("pyodbc", mock.Mock())
+sys.modules.setdefault("pyodbc", mock.Mock(Error=Exception))
 sys.modules.setdefault("striprtf", mock.Mock())
 sys.modules.setdefault("striprtf.striprtf", mock.Mock(rtf_to_text=lambda value: value))
 SPEC = importlib.util.spec_from_file_location("query_copath_db", SCRIPT_PATH)
