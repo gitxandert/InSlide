@@ -89,7 +89,7 @@
 </main>
 <script nonce="{{ csp_nonce() }}">
 const csrf={{ csrf_token()|tojson }};
-const urls={search:{{ url_for('accessions_search')|tojson }},file:{{ url_for('accessions_file')|tojson }},update:{{ url_for('accessions_update')|tojson }},job:{{ url_for('accessions_job')|tojson }},selection:{{ url_for('accessions_selection')|tojson }},sync:{{ url_for('accessions_sync')|tojson }},metadata:{{ url_for('accessions_export',kind='metadata')|tojson }},copath:{{ url_for('accessions_export',kind='copath')|tojson }}};
+const urls={search:{{ url_for('accessions_search')|tojson }},file:{{ url_for('accessions_file')|tojson }},preview:{{ url_for('accessions_preview')|tojson }},update:{{ url_for('accessions_update')|tojson }},job:{{ url_for('accessions_job')|tojson }},selection:{{ url_for('accessions_selection')|tojson }},sync:{{ url_for('accessions_sync')|tojson }},metadata:{{ url_for('accessions_export',kind='metadata')|tojson }},copath:{{ url_for('accessions_export',kind='copath')|tojson }}};
 const selected=new Set();
 const loaded=new Set();
 const opened=new Set();
@@ -242,12 +242,11 @@ document.getElementById('add-file').addEventListener('click',async()=>{
   const payload={...fileData};if(!document.getElementById('column-field').hidden)payload.column=Number(column.value);
   try{
     const response=await request(urls.file,payload),data=await response.json();if(!response.ok)throw Error(data.error);
+    selected.clear();loaded.clear();opened.clear();slideDrafts.clear();
     for(const item of data.accessions){selected.add(item.accession_key);loaded.add(item.accession_key);}
     invalidatePreview();
-    const newKeys=new Set(data.accessions.map(item=>item.accession_key)),newSlides=new Set(data.slides.map(slide=>slide.id));
-    catalog.accessions=[...catalog.accessions.filter(item=>!newKeys.has(item.accession_key)),...data.accessions];
-    catalog.slides=[...catalog.slides.filter(slide=>!newSlides.has(slide.id)),...data.slides];
-    catalog.versions={...catalog.versions,...data.versions};
+    catalog={accessions:data.accessions,slides:data.slides,versions:data.versions};
+    searchOffset=0;document.getElementById('load-more').hidden=true;
     render();checkSync();
     message.textContent=`Found ${data.found}/${data.requested} accessions in ${fileData.name}.${data.missing.length?` Missing: ${data.missing.slice(0,5).join(', ')}${data.missing.length>5?'…':''}`:''}`;message.className='';
   }catch(error){message.textContent=error.message;message.className='error';}
@@ -267,23 +266,15 @@ function showPreview(data){
   document.getElementById('preview-results').hidden=false;
   document.getElementById('preview-results').scrollIntoView({block:'start'});
 }
-function previewChanges(keys,changes,versions,includeDrafts=true){
+async function previewChanges(keys,changes,versions,includeDrafts=true){
   invalidatePreview();message.className='';
   const slide_changes=Object.fromEntries(catalog.slides.filter(slide=>keys.includes(slide.accession.trim().toLocaleLowerCase())&&slideDrafts.has(slide.id)).map(slide=>[slide.id,slideDrafts.get(slide.id)]));
   const payload={accession_keys:keys,changes,versions,slide_changes:includeDrafts?slide_changes:{}};
-  const fieldNames={Organ:'organ',PID:'pid',AccessionDate:'accession_date',Timepoint:'timepoint',Stain:'stain',ImageType:'image_type',SampAcqType:'samp_acq_type',BlockNumber:'block_number',SectionCount:'section_count',Type:'sdl_types'};
-  const slides=catalog.slides.filter(slide=>keys.includes(slide.accession.trim().toLocaleLowerCase())).map(slide=>{
-    const before={},after={};
-    for(const [field,value] of Object.entries({...changes,...payload.slide_changes[slide.id]})){
-      before[field]=field==='Type'?(slide.sdl_types||[]).join(', '):(slide[fieldNames[field]]??'');
-      after[field]=value.trim().toUpperCase();
-    }
-    return {accession:slide.accession,batch:slide.batch_name,original_filename:slide.original_filename,before,after};
-  });
-  const changed=slides.filter(slide=>Object.keys(slide.before).some(field=>slide.before[field]!==slide.after[field]));
-  showPreview({accessions:keys.length,changed_slides:changed.length,slides:changed});
-  if(changed.length){pendingEdit=payload;document.getElementById('save').disabled=false;}
-  message.textContent=changed.length?'Preview ready. Save will validate filenames and SDL values.':'No values would change.';
+  const response=await request(urls.preview,payload),data=await response.json();
+  if(!response.ok)throw Error(data.error);
+  showPreview(data);
+  if(data.changed_slides){pendingEdit=payload;document.getElementById('save').disabled=false;}
+  message.textContent=data.changed_slides?'Preview ready. Save will apply these validated changes.':'No values would change.';
 }
 document.querySelectorAll('[data-field],#bulk-field,#bulk-value').forEach(input=>input.addEventListener('input',invalidatePreview));
 document.getElementById('preview').addEventListener('click',async()=>{

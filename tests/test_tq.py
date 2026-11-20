@@ -229,6 +229,9 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b"Find accessions", page)
         self.assertIn(b"Set one field for all loaded accessions", page)
         self.assertIn(b"Preview changes", page)
+        self.assertIn(b"request(urls.preview,payload)", page)
+        self.assertIn(b"selected.clear();loaded.clear();opened.clear();slideDrafts.clear()", page)
+        self.assertIn(b"catalog={accessions:data.accessions,slides:data.slides,versions:data.versions}", page)
         self.assertLess(page.index(b"Find accessions"), page.index(b"Returned accessions"))
         self.assertLess(page.index(b"Returned accessions"), page.index(b"Selected slides"))
         batch_id = app_module.batch_catalog.list_batches(app_module.Config.INSTANCE_DIR)[0]["public_id"]
@@ -314,6 +317,14 @@ class TQTransferTests(unittest.TestCase):
         workbook.close()
 
     def test_accession_editor_organ_change_reassigns_pid_without_copath_data(self):
+        batch_id = app_module.batch_catalog.list_batches(
+            app_module.Config.INSTANCE_DIR
+        )[0]["public_id"]
+        fields, mapping, _ = app_module._load_batch_document(batch_id, "name_mapping")
+        for row in mapping:
+            row["Organ"] = "BREAST"
+            row["NewName"] = renaming.build_new_name(row)
+        app_module._replace_batch_document(batch_id, "name_mapping", fields, mapping)
         write_csv(
             Path(app_module.Config.COPATH_CLONE) / "all_iuh_identifiers.csv",
             renaming.IDENTIFIER_FIELDS,
