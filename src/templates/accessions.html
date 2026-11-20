@@ -98,6 +98,7 @@ let catalog={accessions:[],slides:[],versions:{}};
 let ready=false;
 let bulkBusy=false;
 let saveBusy=false;
+let exportBusy=false;
 let jobBusy=false;
 let pendingKeys=new Set();
 let lastSyncedJob='';
@@ -110,7 +111,7 @@ let jobSequence=0;
 let fileData;
 const list=document.getElementById('list'), details=document.getElementById('details'), status=document.getElementById('sync'), message=document.getElementById('message'), jobBanner=document.getElementById('job-banner');
 function request(url,body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});}
-function setReady(value,pendingFiles=0,failedFiles=0){ready=value;const pending=selected.size&&[...selected].some(key=>pendingKeys.has(key));const disabled=!selected.size||saveBusy;document.getElementById('metadata').disabled=disabled;document.getElementById('copath').disabled=disabled;status.classList.toggle('ready',ready);status.textContent=pending?'Selected accessions have changes waiting for catalog sync. Export checks their current status when clicked.':ready?(failedFiles?`Catalog synced. ${failedFiles} batch file export(s) failed. Exports use catalog data.`:pendingFiles?`Catalog synced. ${pendingFiles} batch file(s) updating in background. Exports ready.`:'Catalog synced. Exports ready.'):'Catalog updating. Export checks current catalog state when clicked.';}
+function setReady(value,pendingFiles=0,failedFiles=0){ready=value;const pending=selected.size&&[...selected].some(key=>pendingKeys.has(key));const disabled=!selected.size||saveBusy||exportBusy;document.getElementById('metadata').disabled=disabled;document.getElementById('copath').disabled=disabled;status.classList.toggle('ready',ready);status.textContent=pending?'Selected accessions have changes waiting for catalog sync. Export checks their current status when clicked.':ready?(failedFiles?`Catalog synced. ${failedFiles} batch file export(s) failed. Exports use catalog data.`:pendingFiles?`Catalog synced. ${pendingFiles} batch file(s) updating in background. Exports ready.`:'Catalog synced. Exports ready.'):'Catalog updating. Export checks current catalog state when clicked.';}
 async function refreshSelection(){
   if(!selected.size)return;
   const response=await request(urls.selection,{accession_keys:[...selected]}),data=await response.json();
@@ -246,7 +247,7 @@ document.getElementById('add-file').addEventListener('click',async()=>{
     catalog={accessions:data.accessions,slides:data.slides,versions:data.versions};
     searchOffset=0;document.getElementById('load-more').hidden=true;
     render();checkSync();
-    message.textContent=`Found ${data.found}/${data.requested} accessions in ${fileData.name}.${data.missing.length?` Missing: ${data.missing.slice(0,5).join(', ')}${data.missing.length>5?'…':''}`:''}`;message.className='';
+    message.textContent=`Found ${data.found}/${data.requested} accessions in ${fileData.name}. All matched accessions are selected.${data.missing.length?` Missing: ${data.missing.slice(0,5).join(', ')}${data.missing.length>5?'…':''}`:''}`;message.className='';
   }catch(error){message.textContent=error.message;message.className='error';}
 });
 function showPreview(data){
@@ -305,16 +306,21 @@ document.getElementById('bulk-apply').addEventListener('click',async()=>{
   finally{bulkBusy=false;render();}
 });
 async function saveFile(kind){
-  if(!selected.size)return;
+  if(!selected.size||saveBusy||exportBusy)return;
+  const button=document.getElementById(kind),label=kind==='metadata'?'metadata':'CoPath',original=button.textContent;
+  exportBusy=true;button.textContent=`Preparing ${label} CSV…`;setReady(ready);message.textContent=`Choose where to save, then ${label} CSV will be prepared…`;message.className='';
   try{
+    let handle;
+    if(window.showSaveFilePicker)handle=await window.showSaveFilePicker({suggestedName:`accessions-${kind}.csv`,types:[{description:'CSV',accept:{'text/csv':['.csv']}}]});
+    message.textContent=`Preparing ${label} CSV…`;
     const response=await request(urls[kind],{accession_keys:[...selected]});
     if(!response.ok){const data=await response.json();throw Error(data.error);}
     const blob=await response.blob();
-    let handle;
-    if(window.showSaveFilePicker)handle=await window.showSaveFilePicker({suggestedName:`accessions-${kind}.csv`,types:[{description:'CSV',accept:{'text/csv':['.csv']}}]});
     if(handle){const file=await handle.createWritable();await file.write(blob);await file.close();}
     else{const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=`accessions-${kind}.csv`;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),60000);}
-  }catch(error){if(error.name!=='AbortError'){message.textContent=error.message;message.className='error';checkSync();}}
+    message.textContent=`${label==='metadata'?'Metadata':label} CSV saved.`;
+  }catch(error){if(error.name==='AbortError')message.textContent='Save canceled.';else{message.textContent=error.message;message.className='error';checkSync();}}
+  finally{exportBusy=false;button.textContent=original;setReady(ready);}
 }
 document.getElementById('metadata').addEventListener('click',()=>saveFile('metadata'));
 document.getElementById('copath').addEventListener('click',()=>saveFile('copath'));
