@@ -232,6 +232,9 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b"request(urls.preview,payload)", page)
         self.assertIn(b"selected.clear();loaded.clear();opened.clear();slideDrafts.clear()", page)
         self.assertIn(b"catalog={accessions:data.accessions,slides:data.slides,versions:data.versions}", page)
+        self.assertIn(b"sessionStorage.setItem('accessions:selected'", page)
+        self.assertIn(b"if(!selected.size)return", page)
+        self.assertNotIn(b"if(!selected.size||[...selected].some", page)
         self.assertLess(page.index(b"Find accessions"), page.index(b"Returned accessions"))
         self.assertLess(page.index(b"Returned accessions"), page.index(b"Selected slides"))
         batch_id = app_module.batch_catalog.list_batches(app_module.Config.INSTANCE_DIR)[0]["public_id"]
