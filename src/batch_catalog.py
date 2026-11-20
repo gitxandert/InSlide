@@ -1622,14 +1622,15 @@ class BatchCatalog:
 
     def accession_sync_state(
         self, instance_dir: str | Path, accession_keys: Sequence[str]
-    ) -> tuple[dict[str, int], dict[str, int]]:
+    ) -> tuple[dict[str, int], dict[str, int], int, int]:
         if not accession_keys:
-            return {}, {}
+            return {}, {}, 0, 0
         with self.connection(instance_dir) as connection:
             self._requested_accessions(connection, accession_keys)
             rows = connection.execute(
                 """SELECT s.accession_key,b.public_id AS batch_id,
-                          mapping.desired_version,COUNT(*) AS slide_count
+                          mapping.desired_version,mapping.exported_version,mapping.status,
+                          COUNT(*) AS slide_count
                    FROM transfer_slides s
                    JOIN batches b ON b.id=s.batch_id
                    JOIN requested_accessions r ON r.accession_key=s.accession_key
@@ -1639,17 +1640,22 @@ class BatchCatalog:
                      ON mapping.batch_id=b.id AND mapping.kind='name_mapping'
                    WHERE b.validity='ready' AND source.status='ready'
                      AND source.mapping_version=mapping.desired_version
-                     AND mapping.status='current'
-                     AND mapping.desired_version=mapping.exported_version
                    GROUP BY s.accession_key,b.public_id,mapping.desired_version"""
             ).fetchall()
             counts: dict[str, int] = {}
             versions: dict[str, int] = {}
+            pending: set[str] = set()
+            failed: set[str] = set()
             for row in rows:
                 key = str(row["accession_key"])
                 counts[key] = counts.get(key, 0) + int(row["slide_count"])
-                versions[str(row["batch_id"])] = int(row["desired_version"])
-            return counts, versions
+                batch_id = str(row["batch_id"])
+                versions[batch_id] = int(row["desired_version"])
+                if row["desired_version"] != row["exported_version"]:
+                    pending.add(batch_id)
+                if row["status"] in {"failed", "conflict"}:
+                    failed.add(batch_id)
+            return counts, versions, len(pending - failed), len(failed)
 
     def accessions_by_keys(
         self, instance_dir: str | Path, accession_keys: Sequence[str]

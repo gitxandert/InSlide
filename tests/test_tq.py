@@ -1,7 +1,10 @@
 import csv
 import io
+import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -210,11 +213,25 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(2, len(slides))
         return slides
 
+    def wait_for_accession_catalog(self):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            job = self.client.get("/accessions/job").get_json()
+            if job["status"] not in {"queued", "catalog_syncing"}:
+                self.assertIn(job["status"], {"files_syncing", "complete"}, job)
+                return job
+            time.sleep(0.02)
+        self.fail("Accession catalog sync did not finish")
+
     def test_accession_editor_updates_catalog_and_exports_current_files(self):
         self.catalog()
         page = self.client.get("/accessions").data
         self.assertIn(b"Find accessions", page)
         self.assertIn(b"Set one field for all loaded accessions", page)
+        self.assertIn(b"Preview changes", page)
+        self.assertLess(page.index(b"Change values"), page.index(b"Returned accessions"))
+        self.assertLess(page.index(b"Set one field for all loaded accessions"),
+                        page.index(b"Returned accessions"))
         batch_id = app_module.batch_catalog.list_batches(app_module.Config.INSTANCE_DIR)[0]["public_id"]
         app_module.batch_catalog.update_stages(app_module.Config.INSTANCE_DIR,
                                                 batch_id, renamed_complete=False)
@@ -236,13 +253,37 @@ class TQTransferTests(unittest.TestCase):
             "changes": {"PID": "BAD"},
         })
         self.assertEqual(409, invalid.status_code)
-        response = self.client.post("/accessions/update", json={
+        edit = {
             **selection,
             "versions": search["versions"],
             "changes": {"Organ": "BREAST", "PID": "BBBBBB", "Type": "RETRO"},
-        })
-        self.assertEqual(200, response.status_code, response.get_json())
-        self.assertTrue(self.client.post("/accessions/sync", json=selection).get_json()["ready"])
+        }
+        before_state = app_module.batch_catalog.document_state(
+            app_module.Config.INSTANCE_DIR, batch_id, "name_mapping")
+        preview = self.client.post("/accessions/preview", json=edit)
+        self.assertEqual(200, preview.status_code, preview.get_json())
+        self.assertEqual(2, preview.get_json()["changed_slides"])
+        self.assertEqual("BRAIN", preview.get_json()["slides"][0]["before"]["Organ"])
+        self.assertEqual("BREAST", preview.get_json()["slides"][0]["after"]["Organ"])
+        self.assertEqual(before_state["desired_version"],
+                         app_module.batch_catalog.document_state(
+                             app_module.Config.INSTANCE_DIR, batch_id,
+                             "name_mapping")["desired_version"])
+        workbook = load_workbook(self.sdl_path)
+        self.assertEqual("PROSP", workbook.active.cell(
+            2, app_module.SDL_HEADERS.index("Type") + 1).value)
+        workbook.close()
+        response = self.client.post("/accessions/update", json=edit)
+        self.assertEqual(202, response.status_code, response.get_json())
+        self.wait_for_accession_catalog()
+        sync = self.client.post("/accessions/sync", json=selection).get_json()
+        self.assertTrue(sync["ready"])
+        self.assertEqual(1, sync["pending_files"])
+        organs = self.client.get("/tq/catalog/options").get_json()["options"]["organ"]
+        self.assertIn("BREAST", organs)
+        self.assertNotIn("BRAIN", organs)
+        _, file_rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual("BRAIN", file_rows[0]["Organ"])
         metadata = self.client.post("/accessions/export/metadata", json=selection)
         self.assertEqual(200, metadata.status_code)
         rows = list(csv.DictReader(io.StringIO(metadata.get_data(as_text=True))))
@@ -260,6 +301,10 @@ class TQTransferTests(unittest.TestCase):
         copath = self.client.post("/accessions/export/copath", json=selection)
         self.assertEqual("Pending report", list(csv.DictReader(
             io.StringIO(copath.get_data(as_text=True))))[0]["report"])
+        app_module._drain_document_exports()
+        self.assertEqual("complete", self.client.get("/accessions/job").get_json()["status"])
+        _, file_rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual("BREAST", file_rows[0]["Organ"])
         workbook = load_workbook(self.sdl_path)
         self.assertEqual("RETRO", workbook.active.cell(2, app_module.SDL_HEADERS.index("Type") + 1).value)
         workbook.close()
@@ -274,6 +319,11 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(1, txt.get_json()["found"])
         self.assertEqual(["MISSING"], txt.get_json()["missing"])
         self.assertEqual(2, len(txt.get_json()["slides"]))
+        large_txt = self.client.post("/accessions/file", json={
+            "name": "large.txt", "text": "NP25-100\n" + "\n" * 2_100_000,
+        })
+        self.assertEqual(200, large_txt.status_code)
+        self.assertEqual(1, large_txt.get_json()["found"])
 
         csv_text = 'Comment,Accession,Other\n"contains, comma",NP25-100,x\nno match,MISSING,y\n'
         preview = self.client.post("/accessions/file", json={
@@ -288,6 +338,81 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(400, self.client.post("/accessions/file", json={
             "name": "bad.csv", "text": 'ID\n"unterminated', "column": 0,
         }).status_code)
+
+    def test_accession_editor_job_survives_page_navigation(self):
+        self.catalog()
+        search = self.client.get("/accessions/search?q=NP25-100").get_json()
+        key = search["accessions"][0]["accession_key"]
+        edit = {"accession_keys": [key], "loaded_keys": [key],
+                "versions": search["versions"], "changes": {"Organ": "BREAST"}}
+        entered, release = threading.Event(), threading.Event()
+        rebuild = app_module._tq_rebuild_catalog
+
+        def paused_rebuild(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(10))
+            return rebuild(*args, **kwargs)
+
+        try:
+            with mock.patch.object(app_module, "_tq_rebuild_catalog", side_effect=paused_rebuild):
+                started = self.client.post("/accessions/update", json=edit)
+                self.assertEqual(202, started.status_code, started.get_json())
+                self.assertTrue(entered.wait(10))
+                self.assertEqual(200, self.client.get("/accessions").status_code)
+                job = self.client.get("/accessions/job?include_selection=1").get_json()
+                self.assertEqual("catalog_syncing", job["status"])
+                self.assertEqual([key], job["accession_keys"])
+                self.assertEqual([key], job["loaded_keys"])
+                self.assertEqual(409, self.client.post(
+                    "/accessions/export/metadata", json={"accession_keys": [key]}).status_code)
+                self.assertEqual(409, self.client.post("/accessions/update", json=edit).status_code)
+                release.set()
+                finished = self.wait_for_accession_catalog()
+                self.assertTrue(finished["catalog_synced_at"])
+                restored = self.client.post("/accessions/selection", json={
+                    "accession_keys": job["accession_keys"],
+                }).get_json()
+                self.assertEqual("BREAST", restored["slides"][0]["organ"])
+        finally:
+            release.set()
+
+    def test_accession_editor_can_save_again_before_batch_file_export(self):
+        self.catalog()
+        search = self.client.get("/accessions/search?q=NP25-100").get_json()
+        key = search["accessions"][0]["accession_key"]
+        first = {"accession_keys": [key], "versions": search["versions"],
+                 "changes": {"Organ": "BREAST"}}
+        self.assertEqual(202, self.client.post("/accessions/update", json=first).status_code)
+        self.wait_for_accession_catalog()
+        status = self.client.post("/accessions/sync", json={"accession_keys": [key]}).get_json()
+        self.assertTrue(status["ready"])
+        self.assertEqual(1, status["pending_files"])
+        second = {"accession_keys": [key], "versions": status["versions"],
+                  "changes": {"PID": "CCCCCC"}}
+        self.assertEqual(200, self.client.post("/accessions/preview", json=second).status_code)
+        self.assertEqual(202, self.client.post("/accessions/update", json=second).status_code)
+        self.wait_for_accession_catalog()
+        _, file_rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual("BRAIN", file_rows[0]["Organ"])
+        self.assertEqual("AAAAAA", file_rows[0]["PID"])
+        app_module._drain_document_exports()
+        _, file_rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual("BREAST", file_rows[0]["Organ"])
+        self.assertEqual("CCCCCC", file_rows[0]["PID"])
+
+    def test_accession_editor_rejects_sdl_change_after_preview(self):
+        self.catalog()
+        search = self.client.get("/accessions/search?q=NP25-100").get_json()
+        edit = {"accession_keys": [search["accessions"][0]["accession_key"]],
+                "versions": search["versions"], "changes": {"Organ": "BREAST"}}
+        preview = self.client.post("/accessions/preview", json=edit).get_json()
+        stat = self.sdl_path.stat()
+        os.utime(self.sdl_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+        response = self.client.post("/accessions/update", json={
+            **edit, "sdl_state": preview["sdl_state"],
+        })
+        self.assertEqual(409, response.status_code)
+        self.assertIn("Preview again", response.get_json()["error"])
 
     def test_accession_editor_bulk_organ_update_over_thousand_accessions(self):
         self.catalog()
@@ -321,12 +446,17 @@ class TQTransferTests(unittest.TestCase):
         }).get_json()
         self.assertTrue(status["ready"])
         self.assertNotIn("slides", status)
-        updated = self.client.post("/accessions/update", json={
+        edit = {
             "accession_keys": keys,
             "versions": status["versions"],
             "changes": {"Organ": "BREAST"},
-        })
-        self.assertEqual(200, updated.status_code, updated.get_json())
+        }
+        preview = self.client.post("/accessions/preview", json=edit)
+        self.assertEqual(200, preview.status_code, preview.get_json())
+        self.assertEqual(1001, preview.get_json()["changed_slides"])
+        updated = self.client.post("/accessions/update", json=edit)
+        self.assertEqual(202, updated.status_code, updated.get_json())
+        self.wait_for_accession_catalog()
         exported = self.client.post("/accessions/export/metadata", json={
             "accession_keys": keys,
         })

@@ -18,8 +18,9 @@
         .list label{display:flex;gap:9px;padding:9px;border-bottom:1px solid #e8edf2;font-weight:normal;cursor:pointer}
         .list label:hover,details:hover{background:#f7faff} .muted{color:#687482} .error{color:#b42318}
         details{border:1px solid #dce2e8;border-radius:6px;margin:9px 0;padding:10px} summary{cursor:pointer;font-weight:bold}
-        .slides{overflow:auto} table{border-collapse:collapse;width:100%;font-size:13px} th,td{padding:8px;border-bottom:1px solid #e8edf2;text-align:left;white-space:nowrap}
+        .slides{overflow:auto} #preview-results .slides{max-height:45vh} table{border-collapse:collapse;width:100%;font-size:13px} th,td{padding:8px;border-bottom:1px solid #e8edf2;text-align:left;white-space:nowrap}
         .sync{padding:10px;border-radius:5px;background:#fff3cd;margin-top:14px} .sync.ready{background:#d1e7dd}
+        .sync.running{background:#cfe2ff;border:1px solid #84b6ff}.sync.failed{background:#f8d7da}
         [hidden]{display:none!important} @media(max-width:750px){.layout{grid-template-columns:1fr}}
     </style>
 </head>
@@ -27,8 +28,8 @@
 {% include '_app_sidebar.html' %}
 <header><h1>Accessions</h1></header>
 <main>
-    <div class="layout">
-        <section>
+    <section id="job-banner" class="sync" role="status" aria-live="polite" hidden></section>
+    <section>
             <h2>Find accessions</h2>
             <label for="search">Accession ID</label>
             <input id="search" type="search" autocomplete="off" placeholder="Type ID, or browse list" maxlength="200">
@@ -40,15 +41,7 @@
             </label>
             <div class="actions"><button id="add-file" disabled>Add file accessions</button></div>
             <p class="muted">Search and browse results, or load accessions from a file.</p>
-            <div id="list" class="list" aria-label="Accessions"></div>
-            <div class="actions"><button id="load-more" hidden>Show more accessions</button></div>
-        </section>
-        <div>
-            <section>
-                <h2>Selected slides</h2>
-                <p id="selection" class="muted">Select accessions from list.</p>
-                <div id="details"></div>
-            </section>
+    </section>
             <section>
                 <h2>Set one field for all loaded accessions</h2>
                 <p id="loaded-count" class="muted">Load a TXT or CSV file to use this action.</p>
@@ -60,11 +53,11 @@
                         <input id="bulk-value" maxlength="200" placeholder="e.g. BREAST">
                     </label>
                 </div>
-                <div class="actions"><button id="bulk-apply" disabled>Set field for all loaded</button></div>
+                <div class="actions"><button id="bulk-apply" disabled>Preview field for all loaded</button></div>
             </section>
             <section>
                 <h2>Change values</h2>
-                <p class="muted">Fill only fields to change. Changes apply to selected accessions and their slides. Type updates matching Slide Digitization Log rows.</p>
+                <p class="muted">Fill only fields to change. Preview does not save. Save commits changes, refreshes catalog, then updates batch files in the background. Type updates matching Slide Digitization Log rows.</p>
                 <div class="fields">
                     {% for field in fields %}
                     <label>{{ field }}
@@ -75,44 +68,100 @@
                     </label>
                     {% endfor %}
                 </div>
-                <div class="actions"><button id="save" disabled>Save changes</button><span id="message" role="status"></span></div>
+                <div class="actions"><button id="preview" disabled>Preview changes</button><span id="message" role="status"></span></div>
+                <div id="preview-results" hidden>
+                    <h3>Changes to save</h3><p id="preview-count" role="status"></p>
+                    <div class="slides"><table><thead><tr><th>Accession</th><th>Batch</th><th>Original filename</th><th>Current values</th><th>New values</th><th>Current filename</th><th>New filename</th></tr></thead><tbody id="preview-rows"></tbody></table></div>
+                    <div class="actions"><button id="save" disabled>Save changes</button></div>
+                </div>
                 <div id="sync" class="sync" role="status">Select accessions to check catalog sync.</div>
                 <div class="actions"><button id="metadata" disabled>Save metadata CSV</button><button id="copath" disabled>Save CoPath CSV</button></div>
                 <p class="muted">Metadata includes catalog values, original paths, and new filenames. CoPath data saves separately when available.</p>
             </section>
-        </div>
+    <div class="layout">
+        <section>
+            <h2>Returned accessions</h2>
+            <div id="list" class="list" aria-label="Accessions"></div>
+            <div class="actions"><button id="load-more" hidden>Show more accessions</button></div>
+        </section>
+        <section>
+            <h2>Selected slides</h2>
+            <p id="selection" class="muted">Select accessions from list.</p>
+            <div id="details"></div>
+        </section>
     </div>
 </main>
 <script nonce="{{ csp_nonce() }}">
 const csrf={{ csrf_token()|tojson }};
-const urls={search:{{ url_for('accessions_search')|tojson }},file:{{ url_for('accessions_file')|tojson }},update:{{ url_for('accessions_update')|tojson }},sync:{{ url_for('accessions_sync')|tojson }},metadata:{{ url_for('accessions_export',kind='metadata')|tojson }},copath:{{ url_for('accessions_export',kind='copath')|tojson }}};
+const urls={search:{{ url_for('accessions_search')|tojson }},file:{{ url_for('accessions_file')|tojson }},preview:{{ url_for('accessions_preview')|tojson }},update:{{ url_for('accessions_update')|tojson }},job:{{ url_for('accessions_job')|tojson }},selection:{{ url_for('accessions_selection')|tojson }},sync:{{ url_for('accessions_sync')|tojson }},metadata:{{ url_for('accessions_export',kind='metadata')|tojson }},copath:{{ url_for('accessions_export',kind='copath')|tojson }}};
 const selected=new Set();
 const loaded=new Set();
 const opened=new Set();
 let catalog={accessions:[],slides:[],versions:{}};
 let ready=false;
 let bulkBusy=false;
+let saveBusy=false;
+let jobBusy=false;
+let lastSyncedJob='';
+let pendingEdit=null;
 let timer;
 let searchOffset=0;
 let searchSequence=0;
 let syncSequence=0;
+let jobSequence=0;
+let previewSequence=0;
 let fileData;
-const list=document.getElementById('list'), details=document.getElementById('details'), status=document.getElementById('sync'), message=document.getElementById('message');
+const list=document.getElementById('list'), details=document.getElementById('details'), status=document.getElementById('sync'), message=document.getElementById('message'), jobBanner=document.getElementById('job-banner');
 function request(url,body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});}
-function setReady(value){ready=value;document.getElementById('save').disabled=!value||!selected.size;document.getElementById('metadata').disabled=!value;document.getElementById('copath').disabled=!value;status.classList.toggle('ready',value);status.textContent=value?'Catalog synced. Files ready to save.':'Catalog sync needed before saving files.';}
+function setReady(value,pendingFiles=0,failedFiles=0){ready=value&&!jobBusy;document.getElementById('metadata').disabled=!ready;document.getElementById('copath').disabled=!ready;status.classList.toggle('ready',ready);status.textContent=ready?(failedFiles?`Catalog synced. ${failedFiles} batch file export(s) failed. Exports use catalog data.`:pendingFiles?`Catalog synced. ${pendingFiles} batch file(s) updating in background. Exports ready.`:'Catalog synced. Exports ready.'):'Catalog updating. Exports wait for catalog sync.';}
+async function refreshSelection(){
+  if(!selected.size)return;
+  const response=await request(urls.selection,{accession_keys:[...selected]}),data=await response.json();
+  if(!response.ok)throw Error(data.error);
+  const keys=new Set(selected),ids=new Set(data.slides.map(slide=>slide.id));
+  catalog.accessions=[...catalog.accessions.filter(item=>!keys.has(item.accession_key)),...data.accessions];
+  catalog.slides=[...catalog.slides.filter(slide=>!keys.has(slide.accession.trim().toLocaleLowerCase())&&!ids.has(slide.id)),...data.slides];
+  catalog.versions={...catalog.versions,...data.versions};render();
+}
+async function pollJob(restore=false){
+  const sequence=++jobSequence;
+  try{
+    const response=await fetch(`${urls.job}${restore?'?include_selection=1':''}`,{cache:'no-store'}),job=await response.json();
+    if(sequence!==jobSequence)return;
+    if(!response.ok)throw Error(job.error);
+    if(restore&&job.accession_keys?.length){
+      job.accession_keys.forEach(key=>selected.add(key));
+      job.loaded_keys?.forEach(key=>loaded.add(key));
+      await refreshSelection();
+    }
+    jobBusy=['queued','catalog_syncing'].includes(job.status);
+    jobBanner.hidden=job.status==='idle';
+    jobBanner.classList.toggle('running',jobBusy||job.status==='files_syncing');
+    jobBanner.classList.toggle('ready',job.status==='complete');
+    jobBanner.classList.toggle('failed',['failed','interrupted','file_failed'].includes(job.status));
+    const finished=job.catalog_synced_at?new Date(job.catalog_synced_at).toLocaleString():'';
+    jobBanner.textContent=jobBusy?'Catalog sync in progress. You can leave this page and return to see the result.':job.status==='files_syncing'?`Catalog synced ${finished}. ${job.pending_files} batch file(s) syncing in background. You can continue working.`:job.status==='complete'?`Catalog and batch files synced ${finished}. You can continue working.`:job.status==='file_failed'?`Catalog synced ${finished}. ${job.failed_files} batch file export(s) failed. You can continue working.`:job.message||'';
+    if(job.catalog_synced_at&&lastSyncedJob!==job.job_id){await refreshSelection();lastSyncedJob=job.job_id;}
+    if(jobBusy)setReady(false);
+    else if(selected.size)checkSync();
+    render();
+  }catch(error){if(sequence===jobSequence){jobBanner.hidden=false;jobBanner.classList.add('failed');jobBanner.textContent=`Could not check sync status: ${error.message}`;}}
+}
+function invalidatePreview(){previewSequence++;pendingEdit=null;document.getElementById('save').disabled=true;document.getElementById('preview-results').hidden=true;document.getElementById('preview-rows').replaceChildren();}
 function render(){
   list.replaceChildren();details.replaceChildren();
   for(const accession of catalog.accessions){
     const label=document.createElement('label'),check=document.createElement('input'),name=document.createElement('span');
-    check.type='checkbox';check.checked=selected.has(accession.accession_key);check.addEventListener('change',()=>{check.checked?selected.add(accession.accession_key):selected.delete(accession.accession_key);setReady(false);render();checkSync();});
+    check.type='checkbox';check.checked=selected.has(accession.accession_key);check.addEventListener('change',()=>{check.checked?selected.add(accession.accession_key):selected.delete(accession.accession_key);invalidatePreview();setReady(false);render();checkSync();});
     name.textContent=`${accession.accession} (${accession.slide_count})`;label.append(check,name);list.append(label);
   }
   if(!catalog.accessions.length)list.textContent='No accessions found. Catalog may still be updating.';
   const slides=catalog.slides.filter(slide=>selected.has(slide.accession.trim().toLocaleLowerCase()));
   document.getElementById('selection').textContent=`${selected.size} accession(s), ${slides.length} slide(s) selected`;
   document.getElementById('loaded-count').textContent=loaded.size?`${loaded.size} file accession(s) loaded. This changes all of them, including any unchecked in the list.`:'Load a TXT or CSV file to use this action.';
-  document.getElementById('bulk-apply').disabled=!loaded.size||bulkBusy;
-  document.getElementById('save').disabled=!selected.size||!ready;
+  document.getElementById('bulk-apply').disabled=!loaded.size||bulkBusy||saveBusy||jobBusy;
+  document.getElementById('preview').disabled=!selected.size||bulkBusy||saveBusy||jobBusy;
+  document.getElementById('save').disabled=!pendingEdit||saveBusy||jobBusy;
   for(const accession of catalog.accessions.filter(item=>selected.has(item.accession_key))){
     const group=document.createElement('details'),summary=document.createElement('summary'),wrap=document.createElement('div'),table=document.createElement('table');
     summary.textContent=`${accession.accession} — ${accession.slide_count} slide(s)`;
@@ -145,19 +194,20 @@ async function search(append=false){
 }
 async function checkSync(){
   const sequence=++syncSequence;
+  if(saveBusy||jobBusy)return;
   if(!selected.size){setReady(false);status.textContent='Select accessions to check catalog sync.';return;}
-  try{const includeSlides=!ready;const response=await request(urls.sync,{accession_keys:[...selected],include_slides:includeSlides});const data=await response.json();if(sequence!==syncSequence)return;const wasReady=ready;const changed=includeSlides&&JSON.stringify(catalog.slides)!==JSON.stringify(data.slides);setReady(response.ok&&data.ready);if(ready){if(includeSlides)catalog.slides=data.slides;catalog.versions={...catalog.versions,...data.versions};if(!wasReady||changed)render();}}
+  try{const includeSlides=!ready;const response=await request(urls.sync,{accession_keys:[...selected],include_slides:includeSlides});const data=await response.json();if(sequence!==syncSequence||jobBusy)return;const wasReady=ready;const changed=includeSlides&&JSON.stringify(catalog.slides)!==JSON.stringify(data.slides);if(pendingEdit&&(!data.ready||Object.entries(pendingEdit.versions).some(([batch,version])=>data.versions[batch]!=null&&data.versions[batch]!==version)))invalidatePreview();setReady(response.ok&&data.ready,data.pending_files,data.failed_files);if(ready){if(includeSlides)catalog.slides=data.slides;catalog.versions={...catalog.versions,...data.versions};if(!wasReady||changed)render();}}
   catch(error){if(sequence===syncSequence){setReady(false);status.textContent=error.message;}}
 }
 document.getElementById('search').addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(search,250);});
 document.getElementById('load-more').addEventListener('click',()=>search(true));
 document.getElementById('accession-file').addEventListener('change',async event=>{
+  invalidatePreview();
   fileData=undefined;document.getElementById('add-file').disabled=true;
   const field=document.getElementById('column-field'),column=document.getElementById('accession-column');
   field.hidden=true;column.replaceChildren(new Option('Choose a column',''));
   const file=event.target.files[0];if(!file)return;
   try{
-    if(file.size>2021000)throw Error('Accession file must be smaller than 2 MB.');
     fileData={name:file.name,text:new TextDecoder('utf-8',{fatal:true}).decode(await file.arrayBuffer())};
     if(file.name.toLowerCase().endsWith('.csv')){
       const response=await request(urls.file,fileData),data=await response.json();if(!response.ok)throw Error(data.error);
@@ -176,6 +226,7 @@ document.getElementById('add-file').addEventListener('click',async()=>{
   try{
     const response=await request(urls.file,payload),data=await response.json();if(!response.ok)throw Error(data.error);
     for(const item of data.accessions){selected.add(item.accession_key);loaded.add(item.accession_key);}
+    invalidatePreview();
     const newKeys=new Set(data.accessions.map(item=>item.accession_key)),newSlides=new Set(data.slides.map(slide=>slide.id));
     catalog.accessions=[...catalog.accessions.filter(item=>!newKeys.has(item.accession_key)),...data.accessions];
     catalog.slides=[...catalog.slides.filter(slide=>!newSlides.has(slide.id)),...data.slides];
@@ -184,28 +235,62 @@ document.getElementById('add-file').addEventListener('click',async()=>{
     message.textContent=`Found ${data.found}/${data.requested} accessions in ${fileData.name}.${data.missing.length?` Missing: ${data.missing.slice(0,5).join(', ')}${data.missing.length>5?'…':''}`:''}`;message.className='';
   }catch(error){message.textContent=error.message;message.className='error';}
 });
-document.getElementById('save').addEventListener('click',async()=>{
+function showPreview(data){
+  const rows=document.getElementById('preview-rows');rows.replaceChildren();
+  for(const slide of data.slides){
+    const row=document.createElement('tr');
+    for(const value of [slide.accession,slide.batch,slide.original_filename,
+      Object.entries(slide.before).map(([field,item])=>`${field}: ${item}`).join('; '),
+      Object.entries(slide.after).map(([field,item])=>`${field}: ${item}`).join('; '),
+      slide.old_filename,slide.new_filename]){
+      const cell=document.createElement('td');cell.textContent=value;row.append(cell);
+    }
+    rows.append(row);
+  }
+  document.getElementById('preview-count').textContent=`${data.accessions} accession(s), ${data.changed_slides} slide(s) would change. Nothing saved yet.`;
+  document.getElementById('preview-results').hidden=false;
+  document.getElementById('preview-results').scrollIntoView({block:'start'});
+}
+async function previewChanges(keys,changes,versions){
+  invalidatePreview();message.textContent=`Preparing preview for ${keys.length} accession(s)…`;message.className='';
+  const sequence=previewSequence;
+  const payload={accession_keys:keys,changes,versions};
+  const response=await request(urls.preview,payload),data=await response.json();
+  if(sequence!==previewSequence)return;
+  if(!response.ok)throw Error(data.error);
+  showPreview(data);
+  if(data.changed_slides){pendingEdit={...payload,sdl_state:data.sdl_state};document.getElementById('save').disabled=false;}
+  message.textContent=data.changed_slides?'Preview ready. Review it, then save.':'No values would change.';
+}
+document.querySelectorAll('[data-field],#bulk-field,#bulk-value').forEach(input=>input.addEventListener('input',invalidatePreview));
+document.getElementById('preview').addEventListener('click',async()=>{
   const changes=Object.fromEntries([...document.querySelectorAll('[data-field]')].map(input=>[input.dataset.field,input.value.trim()]).filter(([,value])=>value));
   if(!Object.keys(changes).length){message.textContent='Fill at least one field.';return;}
-  setReady(false);message.textContent='Saving changes…';
-  try{const response=await request(urls.update,{accession_keys:[...selected],changes,versions:catalog.versions});const data=await response.json();if(!response.ok)throw Error(data.error);message.textContent=data.message;document.querySelectorAll('[data-field]').forEach(input=>input.value='');await search();}
+  try{await previewChanges([...selected],changes,{...catalog.versions});}
   catch(error){message.textContent=error.message;message.className='error';}
+});
+document.getElementById('save').addEventListener('click',async()=>{
+  if(!pendingEdit||saveBusy||jobBusy)return;
+  saveBusy=true;document.getElementById('save').disabled=true;setReady(false);message.textContent='Saving changes and syncing catalog…';message.className='';
+  try{
+    const response=await request(urls.update,{...pendingEdit,loaded_keys:[...loaded]}),data=await response.json();
+    if(!response.ok)throw Error(data.error);
+    invalidatePreview();document.querySelectorAll('[data-field]').forEach(input=>input.value='');document.getElementById('bulk-value').value='';
+    jobBusy=true;setReady(false);render();jobBanner.hidden=false;jobBanner.classList.add('running');jobBanner.textContent='Catalog sync in progress. You can leave this page and return to see the result.';message.textContent='Catalog sync started. You can leave this page.';await pollJob();
+  }catch(error){message.textContent=error.message;message.className='error';}
+  finally{saveBusy=false;render();if(!jobBusy)checkSync();}
 });
 document.getElementById('bulk-apply').addEventListener('click',async()=>{
   const field=document.getElementById('bulk-field').value,value=document.getElementById('bulk-value').value.trim();
   if(!loaded.size||!value){message.textContent='Choose a field and enter a value.';return;}
-  const button=document.getElementById('bulk-apply');bulkBusy=true;button.disabled=true;setReady(false);message.textContent=`Checking ${loaded.size} loaded accessions…`;message.className='';
+  const button=document.getElementById('bulk-apply');bulkBusy=true;button.disabled=true;document.getElementById('preview').disabled=true;message.textContent=`Checking ${loaded.size} loaded accessions…`;message.className='';
   try{
     const keys=[...loaded],syncResponse=await request(urls.sync,{accession_keys:keys,include_slides:false}),state=await syncResponse.json();
     if(!syncResponse.ok)throw Error(state.error);
-    if(!state.ready)throw Error('Catalog sync is required before changing loaded accessions.');
-    message.textContent=`Updating ${keys.length} accessions…`;
-    const response=await request(urls.update,{accession_keys:keys,changes:{[field]:value},versions:state.versions});
-    const data=await response.json();if(!response.ok)throw Error(data.error);
-    setReady(false);message.textContent=`Updated ${keys.length} loaded accessions. Waiting for catalog sync.`;
-    document.getElementById('bulk-value').value='';await search();
+    if(!state.ready)throw Error('Catalog is updating. Preview again shortly.');
+    await previewChanges(keys,{[field]:value},state.versions);
   }catch(error){message.textContent=error.message;message.className='error';}
-  finally{bulkBusy=false;button.disabled=!loaded.size;checkSync();}
+  finally{bulkBusy=false;render();}
 });
 async function saveFile(kind){
   if(!ready)return;
@@ -221,8 +306,8 @@ async function saveFile(kind){
 }
 document.getElementById('metadata').addEventListener('click',()=>saveFile('metadata'));
 document.getElementById('copath').addEventListener('click',()=>saveFile('copath'));
-setInterval(()=>{if(document.visibilityState==='visible'){if(selected.size)checkSync();else if(!catalog.accessions.length)search();}},5000);
-search();
+setInterval(()=>{if(document.visibilityState==='visible'){pollJob();if(!jobBusy&&selected.size)checkSync();else if(!catalog.accessions.length)search();}},5000);
+(async()=>{await pollJob(true);await search();})();
 </script>
 </body>
 </html>
