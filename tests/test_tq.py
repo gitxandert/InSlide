@@ -229,9 +229,8 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b"Find accessions", page)
         self.assertIn(b"Set one field for all loaded accessions", page)
         self.assertIn(b"Preview changes", page)
-        self.assertLess(page.index(b"Change values"), page.index(b"Returned accessions"))
-        self.assertLess(page.index(b"Set one field for all loaded accessions"),
-                        page.index(b"Returned accessions"))
+        self.assertLess(page.index(b"Find accessions"), page.index(b"Returned accessions"))
+        self.assertLess(page.index(b"Returned accessions"), page.index(b"Selected slides"))
         batch_id = app_module.batch_catalog.list_batches(app_module.Config.INSTANCE_DIR)[0]["public_id"]
         app_module.batch_catalog.update_stages(app_module.Config.INSTANCE_DIR,
                                                 batch_id, renamed_complete=False)
@@ -245,7 +244,7 @@ class TQTransferTests(unittest.TestCase):
         selection = {"accession_keys": [key]}
         app_module.batch_catalog.set_metadata(app_module.Config.INSTANCE_DIR,
                                               "transfer_signature", "")
-        self.assertEqual(409, self.client.post(
+        self.assertEqual(200, self.client.post(
             "/accessions/export/metadata", json=selection).status_code)
         app_module._tq_prepare_catalog()
         invalid = self.client.post("/accessions/update", json={
@@ -365,10 +364,24 @@ class TQTransferTests(unittest.TestCase):
                 self.assertEqual([key], job["loaded_keys"])
                 self.assertEqual(409, self.client.post(
                     "/accessions/export/metadata", json={"accession_keys": [key]}).status_code)
-                self.assertEqual(409, self.client.post("/accessions/update", json=edit).status_code)
+                queued = self.client.post("/accessions/update", json={
+                    **edit, "changes": {"PID": "CCCCCC"},
+                })
+                self.assertEqual(202, queued.status_code)
+                self.assertEqual(1, queued.get_json()["position"])
+                self.assertEqual(1, self.client.get("/accessions/job").get_json()["queued_count"])
                 release.set()
                 finished = self.wait_for_accession_catalog()
                 self.assertTrue(finished["catalog_synced_at"])
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    restored = self.client.post("/accessions/selection", json={
+                        "accession_keys": job["accession_keys"],
+                    }).get_json()
+                    if restored["slides"][0]["pid"] == "CCCCCC":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual("CCCCCC", restored["slides"][0]["pid"])
                 restored = self.client.post("/accessions/selection", json={
                     "accession_keys": job["accession_keys"],
                 }).get_json()
@@ -400,7 +413,69 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual("BREAST", file_rows[0]["Organ"])
         self.assertEqual("CCCCCC", file_rows[0]["PID"])
 
-    def test_accession_editor_rejects_sdl_change_after_preview(self):
+    def test_accession_editor_stages_different_fields_per_slide(self):
+        self.catalog()
+        search = self.client.get("/accessions/search?q=NP25-100").get_json()
+        slides = search["slides"]
+        self.assertEqual("B4", slides[0]["block_number"])
+        self.assertIn("timepoint", slides[0])
+        edit = {
+            "accession_keys": [search["accessions"][0]["accession_key"]],
+            "versions": search["versions"], "changes": {},
+            "slide_changes": {
+                slides[0]["id"]: {"BlockNumber": "B9"},
+                slides[1]["id"]: {"PID": "DDDDDD"},
+            },
+        }
+        preview = self.client.post("/accessions/preview", json=edit)
+        self.assertEqual(200, preview.status_code, preview.get_json())
+        self.assertEqual(2, preview.get_json()["changed_slides"])
+        self.assertEqual(202, self.client.post("/accessions/update", json=edit).status_code)
+        self.wait_for_accession_catalog()
+        updated = self.client.post("/accessions/selection", json={
+            "accession_keys": edit["accession_keys"],
+        }).get_json()["slides"]
+        by_id = {slide["id"]: slide for slide in updated}
+        self.assertEqual("B9", by_id[slides[0]["id"]]["block_number"])
+        self.assertEqual("DDDDDD", by_id[slides[1]["id"]]["pid"])
+        self.assertEqual(slides[1]["block_number"], by_id[slides[1]["id"]]["block_number"])
+
+    def test_accession_editor_exports_other_accession_during_sync(self):
+        self.catalog()
+        batch_id = app_module.batch_catalog.list_batches(app_module.Config.INSTANCE_DIR)[0]["public_id"]
+        fields, rows, _ = app_module._load_batch_document(batch_id, "name_mapping")
+        rows[1]["AccessionID"] = "NP25-101"
+        rows[1]["NewName"] = renaming.build_new_name(rows[1])
+        app_module._replace_batch_document(batch_id, "name_mapping", fields, rows)
+        app_module._tq_prepare_catalog()
+        first = self.client.get("/accessions/search?q=NP25-100").get_json()
+        other = self.client.get("/accessions/search?q=NP25-101").get_json()
+        entered, release = threading.Event(), threading.Event()
+        rebuild = app_module._tq_rebuild_catalog
+
+        def paused_rebuild(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(10))
+            return rebuild(*args, **kwargs)
+
+        try:
+            with mock.patch.object(app_module, "_tq_rebuild_catalog", side_effect=paused_rebuild):
+                edit = {"accession_keys": [first["accessions"][0]["accession_key"]],
+                        "versions": first["versions"], "changes": {"Organ": "BREAST"}}
+                self.assertEqual(202, self.client.post("/accessions/update", json=edit).status_code)
+                self.assertTrue(entered.wait(10))
+                export = self.client.post("/accessions/export/metadata", json={
+                    "accession_keys": [other["accessions"][0]["accession_key"]],
+                })
+                self.assertEqual(200, export.status_code, export.get_json() if export.is_json else "")
+                self.assertEqual("NP25-101", list(csv.DictReader(
+                    io.StringIO(export.get_data(as_text=True))))[0]["accession"])
+                release.set()
+                self.wait_for_accession_catalog()
+        finally:
+            release.set()
+
+    def test_accession_editor_allows_sdl_change_after_preview(self):
         self.catalog()
         search = self.client.get("/accessions/search?q=NP25-100").get_json()
         edit = {"accession_keys": [search["accessions"][0]["accession_key"]],
@@ -408,11 +483,9 @@ class TQTransferTests(unittest.TestCase):
         preview = self.client.post("/accessions/preview", json=edit).get_json()
         stat = self.sdl_path.stat()
         os.utime(self.sdl_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
-        response = self.client.post("/accessions/update", json={
-            **edit, "sdl_state": preview["sdl_state"],
-        })
-        self.assertEqual(409, response.status_code)
-        self.assertIn("Preview again", response.get_json()["error"])
+        response = self.client.post("/accessions/update", json=edit)
+        self.assertEqual(202, response.status_code)
+        self.wait_for_accession_catalog()
 
     def test_accession_editor_bulk_organ_update_over_thousand_accessions(self):
         self.catalog()

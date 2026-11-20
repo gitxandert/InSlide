@@ -121,15 +121,27 @@ class BatchCatalogTests(unittest.TestCase):
             }
         finally:
             connection.close()
-        self.assertEqual("6", version)
+            self.assertEqual("7", version)
         self.assertIn("transfer_slides", tables)
         self.assertIn("transfer_sources", tables)
         self.assertIn("transfer_jobs", tables)
         self.assertIn("transfer_attempts", tables)
         self.assertIn("batch_documents", tables)
         self.assertTrue(
-            (legacy_instance / "batch_catalog.sqlite3.pre-v6.backup").is_file()
+            (legacy_instance / "batch_catalog.sqlite3.pre-v7.backup").is_file()
         )
+
+    def test_schema_version_six_adds_timepoint(self):
+        database = self.instance / "batch_catalog.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.execute("ALTER TABLE transfer_slides DROP COLUMN timepoint")
+            connection.execute(
+                "UPDATE catalog_metadata SET value='6' WHERE key='schema_version'"
+            )
+        BatchCatalog().list_batches(self.instance)
+        with sqlite3.connect(database) as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(transfer_slides)")}
+        self.assertIn("timepoint", columns)
 
     def test_transfer_checkpoint_survives_restart_and_resumes_unfinished_batches(self):
         batches = [

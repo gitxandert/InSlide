@@ -8,7 +8,7 @@
         body{margin:0;background:#f7f9fb;color:#27313d;font:15px Arial,sans-serif}
         header{padding:16px 30px;background:#0056b3;color:white} h1{margin:0;font-size:1.5rem}
         main{max-width:1400px;margin:24px auto;padding:0 18px} section{background:white;border:1px solid #dce2e8;border-radius:9px;padding:20px;margin-bottom:18px}
-        h2{margin-top:0} .layout{display:grid;grid-template-columns:minmax(240px,350px) minmax(0,1fr);gap:18px}
+        h2{margin-top:0}
         input,select,button{font:inherit} input,select{padding:8px;border:1px solid #aeb8c3;border-radius:5px;max-width:100%}
         button{padding:9px 13px;border:0;border-radius:5px;background:#007bff;color:white;cursor:pointer} button:disabled{opacity:.5;cursor:default}
         .fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px} label{display:block;font-weight:bold}
@@ -21,7 +21,7 @@
         .slides{overflow:auto} #preview-results .slides{max-height:45vh} table{border-collapse:collapse;width:100%;font-size:13px} th,td{padding:8px;border-bottom:1px solid #e8edf2;text-align:left;white-space:nowrap}
         .sync{padding:10px;border-radius:5px;background:#fff3cd;margin-top:14px} .sync.ready{background:#d1e7dd}
         .sync.running{background:#cfe2ff;border:1px solid #84b6ff}.sync.failed{background:#f8d7da}
-        [hidden]{display:none!important} @media(max-width:750px){.layout{grid-template-columns:1fr}}
+        [hidden]{display:none!important}
     </style>
 </head>
 <body>
@@ -41,6 +41,9 @@
             </label>
             <div class="actions"><button id="add-file" disabled>Add file accessions</button></div>
             <p class="muted">Search and browse results, or load accessions from a file.</p>
+            <h2>Returned accessions</h2>
+            <div id="list" class="list" aria-label="Accessions"></div>
+            <div class="actions"><button id="load-more" hidden>Show more accessions</button></div>
     </section>
             <section>
                 <h2>Set one field for all loaded accessions</h2>
@@ -57,7 +60,7 @@
             </section>
             <section>
                 <h2>Change values</h2>
-                <p class="muted">Fill only fields to change. Preview does not save. Save commits changes, refreshes catalog, then updates batch files in the background. Type updates matching Slide Digitization Log rows.</p>
+                <p class="muted">Fill fields for selected accessions, or stage slide fields below. Preview shows value changes immediately. Save checks changes, then queues catalog sync. Type and Organ apply to whole accessions and update matching Slide Digitization Log rows.</p>
                 <div class="fields">
                     {% for field in fields %}
                     <label>{{ field }}
@@ -71,37 +74,32 @@
                 <div class="actions"><button id="preview" disabled>Preview changes</button><span id="message" role="status"></span></div>
                 <div id="preview-results" hidden>
                     <h3>Changes to save</h3><p id="preview-count" role="status"></p>
-                    <div class="slides"><table><thead><tr><th>Accession</th><th>Batch</th><th>Original filename</th><th>Current values</th><th>New values</th><th>Current filename</th><th>New filename</th></tr></thead><tbody id="preview-rows"></tbody></table></div>
+                    <div class="slides"><table><thead><tr><th>Accession</th><th>Batch</th><th>Original filename</th><th>Current values</th><th>New values</th></tr></thead><tbody id="preview-rows"></tbody></table></div>
                     <div class="actions"><button id="save" disabled>Save changes</button></div>
                 </div>
                 <div id="sync" class="sync" role="status">Select accessions to check catalog sync.</div>
                 <div class="actions"><button id="metadata" disabled>Save metadata CSV</button><button id="copath" disabled>Save CoPath CSV</button></div>
                 <p class="muted">Metadata includes catalog values, original paths, and new filenames. CoPath data saves separately when available.</p>
             </section>
-    <div class="layout">
-        <section>
-            <h2>Returned accessions</h2>
-            <div id="list" class="list" aria-label="Accessions"></div>
-            <div class="actions"><button id="load-more" hidden>Show more accessions</button></div>
-        </section>
         <section>
             <h2>Selected slides</h2>
             <p id="selection" class="muted">Select accessions from list.</p>
             <div id="details"></div>
         </section>
-    </div>
 </main>
 <script nonce="{{ csp_nonce() }}">
 const csrf={{ csrf_token()|tojson }};
-const urls={search:{{ url_for('accessions_search')|tojson }},file:{{ url_for('accessions_file')|tojson }},preview:{{ url_for('accessions_preview')|tojson }},update:{{ url_for('accessions_update')|tojson }},job:{{ url_for('accessions_job')|tojson }},selection:{{ url_for('accessions_selection')|tojson }},sync:{{ url_for('accessions_sync')|tojson }},metadata:{{ url_for('accessions_export',kind='metadata')|tojson }},copath:{{ url_for('accessions_export',kind='copath')|tojson }}};
+const urls={search:{{ url_for('accessions_search')|tojson }},file:{{ url_for('accessions_file')|tojson }},update:{{ url_for('accessions_update')|tojson }},job:{{ url_for('accessions_job')|tojson }},selection:{{ url_for('accessions_selection')|tojson }},sync:{{ url_for('accessions_sync')|tojson }},metadata:{{ url_for('accessions_export',kind='metadata')|tojson }},copath:{{ url_for('accessions_export',kind='copath')|tojson }}};
 const selected=new Set();
 const loaded=new Set();
 const opened=new Set();
+const slideDrafts=new Map();
 let catalog={accessions:[],slides:[],versions:{}};
 let ready=false;
 let bulkBusy=false;
 let saveBusy=false;
 let jobBusy=false;
+let pendingKeys=new Set();
 let lastSyncedJob='';
 let pendingEdit=null;
 let timer;
@@ -109,11 +107,10 @@ let searchOffset=0;
 let searchSequence=0;
 let syncSequence=0;
 let jobSequence=0;
-let previewSequence=0;
 let fileData;
 const list=document.getElementById('list'), details=document.getElementById('details'), status=document.getElementById('sync'), message=document.getElementById('message'), jobBanner=document.getElementById('job-banner');
 function request(url,body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});}
-function setReady(value,pendingFiles=0,failedFiles=0){ready=value&&!jobBusy;document.getElementById('metadata').disabled=!ready;document.getElementById('copath').disabled=!ready;status.classList.toggle('ready',ready);status.textContent=ready?(failedFiles?`Catalog synced. ${failedFiles} batch file export(s) failed. Exports use catalog data.`:pendingFiles?`Catalog synced. ${pendingFiles} batch file(s) updating in background. Exports ready.`:'Catalog synced. Exports ready.'):'Catalog updating. Exports wait for catalog sync.';}
+function setReady(value,pendingFiles=0,failedFiles=0){ready=value;const blocked=!selected.size||[...selected].some(key=>pendingKeys.has(key));document.getElementById('metadata').disabled=blocked;document.getElementById('copath').disabled=blocked;status.classList.toggle('ready',ready);status.textContent=blocked&&selected.size?'Selected accessions have changes waiting for catalog sync.':ready?(failedFiles?`Catalog synced. ${failedFiles} batch file export(s) failed. Exports use catalog data.`:pendingFiles?`Catalog synced. ${pendingFiles} batch file(s) updating in background. Exports ready.`:'Catalog synced. Exports ready.'):'Catalog updating. Exports available for unchanged accessions.';}
 async function refreshSelection(){
   if(!selected.size)return;
   const response=await request(urls.selection,{accession_keys:[...selected]}),data=await response.json();
@@ -135,20 +132,23 @@ async function pollJob(restore=false){
       await refreshSelection();
     }
     jobBusy=['queued','catalog_syncing'].includes(job.status);
+    pendingKeys=new Set(job.pending_keys||[]);
     jobBanner.hidden=job.status==='idle';
     jobBanner.classList.toggle('running',jobBusy||job.status==='files_syncing');
     jobBanner.classList.toggle('ready',job.status==='complete');
     jobBanner.classList.toggle('failed',['failed','interrupted','file_failed'].includes(job.status));
     const finished=job.catalog_synced_at?new Date(job.catalog_synced_at).toLocaleString():'';
-    jobBanner.textContent=jobBusy?'Catalog sync in progress. You can leave this page and return to see the result.':job.status==='files_syncing'?`Catalog synced ${finished}. ${job.pending_files} batch file(s) syncing in background. You can continue working.`:job.status==='complete'?`Catalog and batch files synced ${finished}. You can continue working.`:job.status==='file_failed'?`Catalog synced ${finished}. ${job.failed_files} batch file export(s) failed. You can continue working.`:job.message||'';
+    jobBanner.textContent=jobBusy?`Catalog sync in progress. ${job.queued_count||0} queued. You can keep editing.`:job.status==='files_syncing'?`Catalog synced ${finished}. ${job.pending_files} batch file(s) syncing in background. You can continue working.`:job.status==='complete'?`Catalog and batch files synced ${finished}. You can continue working.`:job.status==='file_failed'?`Catalog synced ${finished}. ${job.failed_files} batch file export(s) failed. You can continue working.`:job.message||'';
     if(job.catalog_synced_at&&lastSyncedJob!==job.job_id){await refreshSelection();lastSyncedJob=job.job_id;}
     if(jobBusy)setReady(false);
     else if(selected.size)checkSync();
-    render();
   }catch(error){if(sequence===jobSequence){jobBanner.hidden=false;jobBanner.classList.add('failed');jobBanner.textContent=`Could not check sync status: ${error.message}`;}}
 }
-function invalidatePreview(){previewSequence++;pendingEdit=null;document.getElementById('save').disabled=true;document.getElementById('preview-results').hidden=true;document.getElementById('preview-rows').replaceChildren();}
+function invalidatePreview(){pendingEdit=null;document.getElementById('save').disabled=true;document.getElementById('preview-results').hidden=true;document.getElementById('preview-rows').replaceChildren();}
 function render(){
+  const positions=new Map([...details.querySelectorAll('details')].map(group=>[group.dataset.key,group.querySelector('.slides').scrollLeft]));
+  const editing=new Map([...details.querySelectorAll('[data-slide-id]')].map(cell=>[cell.dataset.slideId,[cell.querySelector('select').value,cell.querySelector('input').value]]));
+  const listTop=list.scrollTop;
   list.replaceChildren();details.replaceChildren();
   for(const accession of catalog.accessions){
     const label=document.createElement('label'),check=document.createElement('input'),name=document.createElement('span');
@@ -156,27 +156,44 @@ function render(){
     name.textContent=`${accession.accession} (${accession.slide_count})`;label.append(check,name);list.append(label);
   }
   if(!catalog.accessions.length)list.textContent='No accessions found. Catalog may still be updating.';
+  list.scrollTop=listTop;
   const slides=catalog.slides.filter(slide=>selected.has(slide.accession.trim().toLocaleLowerCase()));
   document.getElementById('selection').textContent=`${selected.size} accession(s), ${slides.length} slide(s) selected`;
   document.getElementById('loaded-count').textContent=loaded.size?`${loaded.size} file accession(s) loaded. This changes all of them, including any unchecked in the list.`:'Load a TXT or CSV file to use this action.';
-  document.getElementById('bulk-apply').disabled=!loaded.size||bulkBusy||saveBusy||jobBusy;
-  document.getElementById('preview').disabled=!selected.size||bulkBusy||saveBusy||jobBusy;
-  document.getElementById('save').disabled=!pendingEdit||saveBusy||jobBusy;
+  document.getElementById('bulk-apply').disabled=!loaded.size||bulkBusy||saveBusy;
+  document.getElementById('preview').disabled=!selected.size||bulkBusy||saveBusy;
+  document.getElementById('save').disabled=!pendingEdit||saveBusy;
   for(const accession of catalog.accessions.filter(item=>selected.has(item.accession_key))){
     const group=document.createElement('details'),summary=document.createElement('summary'),wrap=document.createElement('div'),table=document.createElement('table');
     summary.textContent=`${accession.accession} — ${accession.slide_count} slide(s)`;
+    group.dataset.key=accession.accession_key;
     group.open=opened.has(accession.accession_key);
     const fill=()=>{
       if(table.rows.length)return;
-      const columns=['batch_name','organ','pid','sdl_types','image_type','samp_acq_type','stain','disposition','original_filename','destination_name','original_path'];
-      const head=document.createElement('tr');for(const column of columns){const cell=document.createElement('th');cell.textContent=column.replaceAll('_',' ');head.append(cell);}table.append(head);
+      const columns=['batch_name','organ','pid','accession_date','timepoint','stain','image_type','samp_acq_type','block_number','section_count','sdl_types','disposition','original_filename','destination_name','original_path'];
+      const head=document.createElement('tr');for(const column of [...columns,'edit slide']){const cell=document.createElement('th');cell.textContent=column.replaceAll('_',' ');head.append(cell);}table.append(head);
       for(const slide of slides.filter(item=>item.accession.trim().toLocaleLowerCase()===accession.accession_key)){
         const row=document.createElement('tr');for(const column of columns){const cell=document.createElement('td');cell.textContent=Array.isArray(slide[column])?slide[column].join(', '):(slide[column]??'');row.append(cell);}table.append(row);
+        const edit=document.createElement('td'),field=document.createElement('select'),value=document.createElement('input'),stage=document.createElement('button');
+        edit.dataset.slideId=slide.id;
+        for(const name of ['PID','AccessionDate','Timepoint','Stain','ImageType','SampAcqType','BlockNumber','SectionCount'])field.add(new Option(name,name));
+        if(editing.has(slide.id)){field.value=editing.get(slide.id)[0];value.value=editing.get(slide.id)[1];}
+        else value.value=slideDrafts.get(slide.id)?.[field.value]||'';
+        value.placeholder='New value';value.maxLength=200;value.setAttribute('aria-label',`New ${field.value} for ${slide.original_filename}`);
+        field.addEventListener('change',()=>{value.setAttribute('aria-label',`New ${field.value} for ${slide.original_filename}`);value.value=slideDrafts.get(slide.id)?.[field.value]||'';});
+        stage.textContent='Stage';stage.type='button';stage.addEventListener('click',()=>{
+          const fields={...slideDrafts.get(slide.id)};
+          if(value.value.trim())fields[field.value]=value.value.trim();
+          else delete fields[field.value];
+          if(Object.keys(fields).length)slideDrafts.set(slide.id,fields);else slideDrafts.delete(slide.id);
+          invalidatePreview();message.textContent=`${Object.keys(fields).length} field(s) staged for ${slide.original_filename}. Preview changes to save.`;
+        });
+        edit.append(field,value,stage);row.append(edit);
       }
     };
     if(group.open)fill();
     group.addEventListener('toggle',()=>{if(group.open){opened.add(accession.accession_key);fill();}else opened.delete(accession.accession_key);});
-    wrap.className='slides';wrap.append(table);group.append(summary,wrap);details.append(group);
+    wrap.className='slides';wrap.append(table);group.append(summary,wrap);details.append(group);wrap.scrollLeft=positions.get(accession.accession_key)||0;
   }
 }
 async function search(append=false){
@@ -194,9 +211,9 @@ async function search(append=false){
 }
 async function checkSync(){
   const sequence=++syncSequence;
-  if(saveBusy||jobBusy)return;
+  if(saveBusy)return;
   if(!selected.size){setReady(false);status.textContent='Select accessions to check catalog sync.';return;}
-  try{const includeSlides=!ready;const response=await request(urls.sync,{accession_keys:[...selected],include_slides:includeSlides});const data=await response.json();if(sequence!==syncSequence||jobBusy)return;const wasReady=ready;const changed=includeSlides&&JSON.stringify(catalog.slides)!==JSON.stringify(data.slides);if(pendingEdit&&(!data.ready||Object.entries(pendingEdit.versions).some(([batch,version])=>data.versions[batch]!=null&&data.versions[batch]!==version)))invalidatePreview();setReady(response.ok&&data.ready,data.pending_files,data.failed_files);if(ready){if(includeSlides)catalog.slides=data.slides;catalog.versions={...catalog.versions,...data.versions};if(!wasReady||changed)render();}}
+  try{const includeSlides=!ready&&!jobBusy;const response=await request(urls.sync,{accession_keys:[...selected],include_slides:includeSlides});const data=await response.json();if(sequence!==syncSequence)return;const wasReady=ready;const changed=includeSlides&&JSON.stringify(catalog.slides)!==JSON.stringify(data.slides);if(pendingEdit&&!jobBusy&&Object.entries(pendingEdit.versions).some(([batch,version])=>data.versions[batch]!=null&&data.versions[batch]!==version))invalidatePreview();setReady(response.ok&&data.ready,data.pending_files,data.failed_files);if(ready){if(includeSlides)catalog.slides=data.slides;catalog.versions={...catalog.versions,...data.versions};if(!wasReady||changed)render();}}
   catch(error){if(sequence===syncSequence){setReady(false);status.textContent=error.message;}}
 }
 document.getElementById('search').addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(search,250);});
@@ -241,8 +258,7 @@ function showPreview(data){
     const row=document.createElement('tr');
     for(const value of [slide.accession,slide.batch,slide.original_filename,
       Object.entries(slide.before).map(([field,item])=>`${field}: ${item}`).join('; '),
-      Object.entries(slide.after).map(([field,item])=>`${field}: ${item}`).join('; '),
-      slide.old_filename,slide.new_filename]){
+      Object.entries(slide.after).map(([field,item])=>`${field}: ${item}`).join('; ')]){
       const cell=document.createElement('td');cell.textContent=value;row.append(cell);
     }
     rows.append(row);
@@ -251,32 +267,41 @@ function showPreview(data){
   document.getElementById('preview-results').hidden=false;
   document.getElementById('preview-results').scrollIntoView({block:'start'});
 }
-async function previewChanges(keys,changes,versions){
-  invalidatePreview();message.textContent=`Preparing preview for ${keys.length} accession(s)…`;message.className='';
-  const sequence=previewSequence;
-  const payload={accession_keys:keys,changes,versions};
-  const response=await request(urls.preview,payload),data=await response.json();
-  if(sequence!==previewSequence)return;
-  if(!response.ok)throw Error(data.error);
-  showPreview(data);
-  if(data.changed_slides){pendingEdit={...payload,sdl_state:data.sdl_state};document.getElementById('save').disabled=false;}
-  message.textContent=data.changed_slides?'Preview ready. Review it, then save.':'No values would change.';
+function previewChanges(keys,changes,versions,includeDrafts=true){
+  invalidatePreview();message.className='';
+  const slide_changes=Object.fromEntries(catalog.slides.filter(slide=>keys.includes(slide.accession.trim().toLocaleLowerCase())&&slideDrafts.has(slide.id)).map(slide=>[slide.id,slideDrafts.get(slide.id)]));
+  const payload={accession_keys:keys,changes,versions,slide_changes:includeDrafts?slide_changes:{}};
+  const fieldNames={Organ:'organ',PID:'pid',AccessionDate:'accession_date',Timepoint:'timepoint',Stain:'stain',ImageType:'image_type',SampAcqType:'samp_acq_type',BlockNumber:'block_number',SectionCount:'section_count',Type:'sdl_types'};
+  const slides=catalog.slides.filter(slide=>keys.includes(slide.accession.trim().toLocaleLowerCase())).map(slide=>{
+    const before={},after={};
+    for(const [field,value] of Object.entries({...changes,...payload.slide_changes[slide.id]})){
+      before[field]=field==='Type'?(slide.sdl_types||[]).join(', '):(slide[fieldNames[field]]??'');
+      after[field]=value.trim().toUpperCase();
+    }
+    return {accession:slide.accession,batch:slide.batch_name,original_filename:slide.original_filename,before,after};
+  });
+  const changed=slides.filter(slide=>Object.keys(slide.before).some(field=>slide.before[field]!==slide.after[field]));
+  showPreview({accessions:keys.length,changed_slides:changed.length,slides:changed});
+  if(changed.length){pendingEdit=payload;document.getElementById('save').disabled=false;}
+  message.textContent=changed.length?'Preview ready. Save will validate filenames and SDL values.':'No values would change.';
 }
 document.querySelectorAll('[data-field],#bulk-field,#bulk-value').forEach(input=>input.addEventListener('input',invalidatePreview));
 document.getElementById('preview').addEventListener('click',async()=>{
   const changes=Object.fromEntries([...document.querySelectorAll('[data-field]')].map(input=>[input.dataset.field,input.value.trim()]).filter(([,value])=>value));
-  if(!Object.keys(changes).length){message.textContent='Fill at least one field.';return;}
+  if(!Object.keys(changes).length&&!catalog.slides.some(slide=>selected.has(slide.accession.trim().toLocaleLowerCase())&&slideDrafts.has(slide.id))){message.textContent='Fill or stage at least one field.';return;}
   try{await previewChanges([...selected],changes,{...catalog.versions});}
   catch(error){message.textContent=error.message;message.className='error';}
 });
 document.getElementById('save').addEventListener('click',async()=>{
-  if(!pendingEdit||saveBusy||jobBusy)return;
+  if(!pendingEdit||saveBusy)return;
+  const submitted=pendingEdit;
   saveBusy=true;document.getElementById('save').disabled=true;setReady(false);message.textContent='Saving changes and syncing catalog…';message.className='';
   try{
-    const response=await request(urls.update,{...pendingEdit,loaded_keys:[...loaded]}),data=await response.json();
+    const response=await request(urls.update,{...submitted,loaded_keys:[...loaded]}),data=await response.json();
     if(!response.ok)throw Error(data.error);
+    Object.keys(submitted.slide_changes).forEach(id=>slideDrafts.delete(id));
     invalidatePreview();document.querySelectorAll('[data-field]').forEach(input=>input.value='');document.getElementById('bulk-value').value='';
-    jobBusy=true;setReady(false);render();jobBanner.hidden=false;jobBanner.classList.add('running');jobBanner.textContent='Catalog sync in progress. You can leave this page and return to see the result.';message.textContent='Catalog sync started. You can leave this page.';await pollJob();
+    jobBusy=true;pendingKeys=new Set([...pendingKeys,...submitted.accession_keys]);setReady(false);render();jobBanner.hidden=false;jobBanner.classList.add('running');jobBanner.textContent=data.position?`Catalog sync queued at position ${data.position}.`:'Catalog sync in progress. You can keep editing.';message.textContent=data.position?'Changes queued. You can keep editing.':'Catalog sync started. You can keep editing.';await pollJob();
   }catch(error){message.textContent=error.message;message.className='error';}
   finally{saveBusy=false;render();if(!jobBusy)checkSync();}
 });
@@ -285,15 +310,13 @@ document.getElementById('bulk-apply').addEventListener('click',async()=>{
   if(!loaded.size||!value){message.textContent='Choose a field and enter a value.';return;}
   const button=document.getElementById('bulk-apply');bulkBusy=true;button.disabled=true;document.getElementById('preview').disabled=true;message.textContent=`Checking ${loaded.size} loaded accessions…`;message.className='';
   try{
-    const keys=[...loaded],syncResponse=await request(urls.sync,{accession_keys:keys,include_slides:false}),state=await syncResponse.json();
-    if(!syncResponse.ok)throw Error(state.error);
-    if(!state.ready)throw Error('Catalog is updating. Preview again shortly.');
-    await previewChanges(keys,{[field]:value},state.versions);
+    const keys=[...loaded];
+    await previewChanges(keys,{[field]:value},{...catalog.versions},false);
   }catch(error){message.textContent=error.message;message.className='error';}
   finally{bulkBusy=false;render();}
 });
 async function saveFile(kind){
-  if(!ready)return;
+  if(!selected.size||[...selected].some(key=>pendingKeys.has(key)))return;
   try{
     let handle;
     if(window.showSaveFilePicker)handle=await window.showSaveFilePicker({suggestedName:`accessions-${kind}.csv`,types:[{description:'CSV',accept:{'text/csv':['.csv']}}]});

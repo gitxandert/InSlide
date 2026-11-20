@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 QUEUE_STATUSES = {"pending", "leased", "completed"}
 DOCUMENT_KINDS = {"enriched", "name_mapping"}
 
@@ -209,6 +209,7 @@ class BatchCatalog:
                         organ TEXT NOT NULL,
                         pid TEXT NOT NULL,
                         accession_date TEXT NOT NULL,
+                        timepoint TEXT NOT NULL DEFAULT '',
                         stain TEXT NOT NULL,
                         image_type TEXT NOT NULL,
                         samp_acq_type TEXT NOT NULL,
@@ -411,6 +412,18 @@ class BatchCatalog:
                     if "mapping_version" not in source_columns:
                         connection.execute(
                             "ALTER TABLE transfer_sources ADD COLUMN mapping_version INTEGER"
+                        )
+                    connection.execute(
+                        "UPDATE catalog_metadata SET value=? WHERE key='schema_version'",
+                        ("6",),
+                    )
+                    version = "6"
+                if int(version) == 6:
+                    if "timepoint" not in {
+                        row[1] for row in connection.execute("PRAGMA table_info(transfer_slides)")
+                    }:
+                        connection.execute(
+                            "ALTER TABLE transfer_slides ADD COLUMN timepoint TEXT NOT NULL DEFAULT ''"
                         )
                     connection.execute(
                         "UPDATE catalog_metadata SET value=? WHERE key='schema_version'",
@@ -1381,17 +1394,17 @@ class BatchCatalog:
                 """
                 INSERT INTO transfer_slides(
                     slide_id,batch_id,source_row,raw_original_path,original_path,
-                    accession,accession_key,organ,pid,accession_date,stain,image_type,
+                    accession,accession_key,organ,pid,accession_date,timepoint,stain,image_type,
                     samp_acq_type,block_number,section_count,destination_name,digitization_date,
                     source_size,disposition,duplicate_of_batch,duplicate_of_path,conflict_name
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
                         row["id"], batch_ids[str(row["batch_id"])], row["source_row"],
                         row["raw_original_path"], row["original_path"], row["accession"],
                         row["accession_key"], row["organ"], row["pid"],
-                        row["accession_date"], row["stain"], row["image_type"],
+                        row["accession_date"], row.get("timepoint", ""), row["stain"], row["image_type"],
                         row["samp_acq_type"], row["block_number"], row["section_count"],
                         row["destination_name"], row["digitization_date"],
                         row.get("source_size"), row.get("disposition", "active"),
@@ -1423,6 +1436,7 @@ class BatchCatalog:
         slide_ids: Optional[Iterable[str]] = None,
         *,
         include_unfinished: bool = False,
+        allow_stale: bool = False,
     ) -> list[dict]:
         """Return matching indexed slides; transfer callers require finalized batches."""
         exact_columns = {
@@ -1440,11 +1454,10 @@ class BatchCatalog:
             "original_path": "s.original_path",
             "destination_name": "s.destination_name",
         }
-        conditions = [
-            "b.validity='ready'",
-            "source.status='ready'",
-            "source.mapping_version=mapping.desired_version",
-        ]
+        conditions = ["b.validity='ready'"]
+        if not allow_stale:
+            conditions.extend(("source.status='ready'",
+                               "source.mapping_version=mapping.desired_version"))
         if not include_unfinished:
             conditions.extend(("b.renamed_complete=1", "s.disposition='active'"))
         parameters: list[object] = []
