@@ -217,7 +217,7 @@ class TQTransferTests(unittest.TestCase):
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             job = self.client.get("/accessions/job").get_json()
-            if job["status"] not in {"queued", "catalog_syncing"}:
+            if job["status"] not in {"queued", "catalog_syncing", "sdl_syncing"}:
                 self.assertIn(job["status"], {"files_syncing", "complete"}, job)
                 return job
             time.sleep(0.02)
@@ -229,6 +229,7 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b"Find accessions", page)
         self.assertIn(b"Set one field for all loaded accessions", page)
         self.assertIn(b"Preview changes", page)
+        self.assertIn(b"Assign next available PID", page)
         self.assertIn(b"request(urls.preview,payload)", page)
         self.assertIn(b"selected.clear();loaded.clear();opened.clear();slideDrafts.clear()", page)
         self.assertIn(b"catalog={accessions:data.accessions,slides:data.slides,versions:data.versions}", page)
@@ -290,35 +291,36 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual("PROSP", workbook.active.cell(
             2, app_module.SDL_HEADERS.index("Type") + 1).value)
         workbook.close()
-        response = self.client.post("/accessions/update", json=edit)
-        self.assertEqual(202, response.status_code, response.get_json())
-        self.wait_for_accession_catalog()
-        sync = self.client.post("/accessions/sync", json=selection).get_json()
-        self.assertTrue(sync["ready"])
-        self.assertEqual(1, sync["pending_files"])
-        organs = self.client.get("/tq/catalog/options").get_json()["options"]["organ"]
-        self.assertIn("BREAST", organs)
-        self.assertNotIn("BRAIN", organs)
-        _, file_rows = renaming.read_csv(self.batch / "name_mapping.csv")
-        self.assertEqual("BRAIN", file_rows[0]["Organ"])
-        metadata = self.client.post("/accessions/export/metadata", json=selection)
-        self.assertEqual(200, metadata.status_code)
-        rows = list(csv.DictReader(io.StringIO(metadata.get_data(as_text=True))))
-        self.assertEqual(2, len(rows))
-        self.assertTrue(all(row["accession_slide_count"] == "2" for row in rows))
-        self.assertTrue(all(row["organ"] == "BREAST" and row["pid"] == "AAAAAB"
-                            and row["sdl_types"] == "RETRO" for row in rows))
-        self.assertIn("one.svs", rows[0]["original_path"])
-        self.assertEqual("one.svs", rows[0]["original_filename"])
-        self.assertIn("AAAAAB", rows[0]["destination_name"])
-        copath = self.client.post("/accessions/export/copath", json=selection)
-        self.assertEqual(200, copath.status_code)
-        self.assertEqual([], list(csv.DictReader(io.StringIO(copath.get_data(as_text=True)))))
-        write_csv(self.batch / "pending_CoPath_data.csv", renaming.COPATH_FIELDS,
-                  [{"accession_id": "NP25-100", "report": "Pending report"}])
-        copath = self.client.post("/accessions/export/copath", json=selection)
-        self.assertEqual("Pending report", list(csv.DictReader(
-            io.StringIO(copath.get_data(as_text=True))))[0]["report"])
+        with mock.patch.object(app_module.batch_catalog, "claim_export", return_value=None):
+            response = self.client.post("/accessions/update", json=edit)
+            self.assertEqual(202, response.status_code, response.get_json())
+            self.wait_for_accession_catalog()
+            sync = self.client.post("/accessions/sync", json=selection).get_json()
+            self.assertTrue(sync["ready"])
+            self.assertEqual(1, sync["pending_files"])
+            organs = self.client.get("/tq/catalog/options").get_json()["options"]["organ"]
+            self.assertIn("BREAST", organs)
+            self.assertNotIn("BRAIN", organs)
+            _, file_rows = renaming.read_csv(self.batch / "name_mapping.csv")
+            self.assertEqual("BRAIN", file_rows[0]["Organ"])
+            metadata = self.client.post("/accessions/export/metadata", json=selection)
+            self.assertEqual(200, metadata.status_code)
+            rows = list(csv.DictReader(io.StringIO(metadata.get_data(as_text=True))))
+            self.assertEqual(2, len(rows))
+            self.assertTrue(all(row["accession_slide_count"] == "2" for row in rows))
+            self.assertTrue(all(row["organ"] == "BREAST" and row["pid"] == "AAAAAB"
+                                and row["sdl_types"] == "RETRO" for row in rows))
+            self.assertIn("one.svs", rows[0]["original_path"])
+            self.assertEqual("one.svs", rows[0]["original_filename"])
+            self.assertIn("AAAAAB", rows[0]["destination_name"])
+            copath = self.client.post("/accessions/export/copath", json=selection)
+            self.assertEqual(200, copath.status_code)
+            self.assertEqual([], list(csv.DictReader(io.StringIO(copath.get_data(as_text=True)))))
+            write_csv(self.batch / "pending_CoPath_data.csv", renaming.COPATH_FIELDS,
+                      [{"accession_id": "NP25-100", "report": "Pending report"}])
+            copath = self.client.post("/accessions/export/copath", json=selection)
+            self.assertEqual("Pending report", list(csv.DictReader(
+                io.StringIO(copath.get_data(as_text=True))))[0]["report"])
         app_module._drain_document_exports()
         self.assertEqual("complete", self.client.get("/accessions/job").get_json()["status"])
         _, file_rows = renaming.read_csv(self.batch / "name_mapping.csv")
@@ -376,6 +378,72 @@ class TQTransferTests(unittest.TestCase):
         self.assertTrue(all(
             row["organ"] == "BREAST" and row["pid"] == "AAAAAB" for row in rows
         ))
+
+    def test_accession_editor_assigns_next_pid_for_current_organ_and_mrn(self):
+        self.catalog()
+        write_csv(
+            Path(app_module.Config.COPATH_CLONE) / "all_iuh_identifiers.csv",
+            renaming.IDENTIFIER_FIELDS,
+            [
+                {"AccessionID": "NP25-100", "Organ": "BRAIN", "MRN": "MRN1", "PID": "AAAAFJ"},
+                {"AccessionID": "NP24-1", "Organ": "BRAIN", "MRN": "MRN2", "PID": "AAABCD"},
+            ],
+        )
+        search = self.client.get("/accessions/search?q=NP25-100").get_json()
+        key = search["accessions"][0]["accession_key"]
+        edit = {"accession_keys": [key], "versions": search["versions"],
+                "changes": {}, "assign_next_pid": True}
+        preview = self.client.post("/accessions/preview", json=edit)
+        self.assertEqual(200, preview.status_code, preview.get_json())
+        self.assertEqual({"PID": "AAABCE"}, preview.get_json()["slides"][0]["after"])
+        self.assertEqual(202, self.client.post("/accessions/update", json=edit).status_code)
+        self.wait_for_accession_catalog()
+        _, identifiers = renaming.read_csv(
+            Path(app_module.Config.COPATH_CLONE) / "all_iuh_identifiers.csv"
+        )
+        self.assertEqual("AAABCE", next(row for row in identifiers
+                                       if row["AccessionID"] == "NP25-100")["PID"])
+        rows = self.client.post("/accessions/selection", json={"accession_keys": [key]}).get_json()
+        self.assertTrue(all(slide["pid"] == "AAABCE" for slide in rows["slides"]))
+
+        write_csv(
+            Path(app_module.Config.COPATH_CLONE) / "all_iuh_identifiers.csv",
+            renaming.IDENTIFIER_FIELDS,
+            [*identifiers, {"AccessionID": "NP25-101", "Organ": "BRAIN",
+                            "MRN": "MRN1", "PID": "AAABCE"}],
+        )
+        rejected = self.client.post("/accessions/preview", json={**edit, "versions": rows["versions"]})
+        self.assertEqual(409, rejected.status_code)
+        self.assertIn("share this organ and MRN", rejected.get_json()["error"])
+
+    def test_accession_editor_assigns_next_pid_without_mrn(self):
+        self.catalog()
+        write_csv(
+            Path(app_module.Config.COPATH_CLONE) / "all_iuh_identifiers.csv",
+            renaming.IDENTIFIER_FIELDS,
+            [
+                {"AccessionID": "NP25-100", "Organ": "BRAIN", "MRN": "", "PID": "AAAAFJ"},
+                {"AccessionID": "NP24-1", "Organ": "BRAIN", "MRN": "", "PID": "AAABCD"},
+            ],
+        )
+        search = self.client.get("/accessions/search?q=NP25-100").get_json()
+        key = search["accessions"][0]["accession_key"]
+        edit = {"accession_keys": [key], "versions": search["versions"],
+                "changes": {}, "assign_next_pid": True}
+        preview = self.client.post("/accessions/preview", json=edit)
+        self.assertEqual(200, preview.status_code, preview.get_json())
+        self.assertEqual("AAABCE", preview.get_json()["slides"][0]["after"]["PID"])
+        self.assertEqual(202, self.client.post("/accessions/update", json=edit).status_code)
+        self.wait_for_accession_catalog()
+        _, identifiers = renaming.read_csv(
+            Path(app_module.Config.COPATH_CLONE) / "all_iuh_identifiers.csv"
+        )
+        self.assertEqual("AAABCE", next(row for row in identifiers
+                                       if row["AccessionID"] == "NP25-100")["PID"])
+        self.assertEqual("AAABCD", next(row for row in identifiers
+                                       if row["AccessionID"] == "NP24-1")["PID"])
+        selected = self.client.post("/accessions/selection", json={"accession_keys": [key]}).get_json()
+        self.assertTrue(all(slide["pid"] == "AAABCE" for slide in selected["slides"]))
 
     def test_accession_editor_imports_txt_and_selected_csv_column(self):
         self.catalog()
@@ -458,25 +526,82 @@ class TQTransferTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_accession_editor_exports_catalog_while_sdl_syncs(self):
+        self.catalog()
+        search = self.client.get("/accessions/search?q=NP25-100").get_json()
+        key = search["accessions"][0]["accession_key"]
+        edit = {
+            "accession_keys": [key],
+            "versions": search["versions"],
+            "changes": {"Organ": "BREAST", "Type": "RETRO"},
+        }
+        entered, release = threading.Event(), threading.Event()
+        update_sdl = app_module._accession_edit_sdl
+
+        def paused_sdl(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(10))
+            return update_sdl(*args, **kwargs)
+
+        try:
+            with mock.patch.object(app_module, "_accession_edit_sdl", side_effect=paused_sdl):
+                started = self.client.post("/accessions/update", json=edit)
+                self.assertEqual(202, started.status_code, started.get_json())
+                self.assertTrue(entered.wait(10))
+
+                job = self.client.get("/accessions/job").get_json()
+                self.assertEqual("sdl_syncing", job["status"])
+                self.assertTrue(job["catalog_synced_at"])
+                metadata = self.client.post(
+                    "/accessions/export/metadata", json={"accession_keys": [key]}
+                )
+                self.assertEqual(200, metadata.status_code)
+                rows = list(csv.DictReader(io.StringIO(metadata.get_data(as_text=True))))
+                self.assertTrue(all(
+                    row["organ"] == "BREAST" and row["sdl_types"] == "RETRO"
+                    for row in rows
+                ))
+
+                workbook = load_workbook(self.sdl_path)
+                self.assertEqual(
+                    "PROSP",
+                    workbook.active.cell(2, app_module.SDL_HEADERS.index("Type") + 1).value,
+                )
+                workbook.close()
+
+                release.set()
+                self.wait_for_accession_catalog()
+                workbook = load_workbook(self.sdl_path)
+                self.assertEqual(
+                    "RETRO",
+                    workbook.active.cell(2, app_module.SDL_HEADERS.index("Type") + 1).value,
+                )
+                workbook.close()
+        finally:
+            release.set()
+
     def test_accession_editor_can_save_again_before_batch_file_export(self):
         self.catalog()
         search = self.client.get("/accessions/search?q=NP25-100").get_json()
         key = search["accessions"][0]["accession_key"]
         first = {"accession_keys": [key], "versions": search["versions"],
                  "changes": {"Organ": "BREAST"}}
-        self.assertEqual(202, self.client.post("/accessions/update", json=first).status_code)
-        self.wait_for_accession_catalog()
-        status = self.client.post("/accessions/sync", json={"accession_keys": [key]}).get_json()
-        self.assertTrue(status["ready"])
-        self.assertEqual(1, status["pending_files"])
-        second = {"accession_keys": [key], "versions": status["versions"],
-                  "changes": {"PID": "CCCCCC"}}
-        self.assertEqual(200, self.client.post("/accessions/preview", json=second).status_code)
-        self.assertEqual(202, self.client.post("/accessions/update", json=second).status_code)
-        self.wait_for_accession_catalog()
-        _, file_rows = renaming.read_csv(self.batch / "name_mapping.csv")
-        self.assertEqual("BRAIN", file_rows[0]["Organ"])
-        self.assertEqual("AAAAAA", file_rows[0]["PID"])
+        with mock.patch.object(app_module.batch_catalog, "claim_export", return_value=None):
+            self.assertEqual(202, self.client.post("/accessions/update", json=first).status_code)
+            self.wait_for_accession_catalog()
+            status = self.client.post(
+                "/accessions/sync", json={"accession_keys": [key]}
+            ).get_json()
+            self.assertTrue(status["ready"])
+            self.assertEqual(1, status["pending_files"])
+            second = {"accession_keys": [key], "versions": status["versions"],
+                      "changes": {"PID": "CCCCCC"}}
+            self.assertEqual(200, self.client.post("/accessions/preview", json=second).status_code)
+            self.assertEqual(202, self.client.post("/accessions/update", json=second).status_code)
+            self.wait_for_accession_catalog()
+            _, file_rows = renaming.read_csv(self.batch / "name_mapping.csv")
+            self.assertEqual("BRAIN", file_rows[0]["Organ"])
+            self.assertEqual("AAAAAA", file_rows[0]["PID"])
         app_module._drain_document_exports()
         _, file_rows = renaming.read_csv(self.batch / "name_mapping.csv")
         self.assertEqual("BREAST", file_rows[0]["Organ"])

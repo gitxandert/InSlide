@@ -60,7 +60,7 @@
             </section>
             <section>
                 <h2>Change values</h2>
-                <p class="muted">Fill fields for selected accessions, or stage slide fields below. Preview shows value changes immediately. Save checks changes, then queues catalog sync. Type and Organ apply to whole accessions and update matching Slide Digitization Log rows.</p>
+                <p class="muted">Fill fields for selected accessions, or stage slide fields below. Preview shows value changes immediately. Save updates the catalog first. Type and Organ then sync to matching Slide Digitization Log rows in the background.</p>
                 <div class="fields">
                     {% for field in fields %}
                     <label>{{ field }}
@@ -71,7 +71,7 @@
                     </label>
                     {% endfor %}
                 </div>
-                <div class="actions"><button id="preview" disabled>Preview changes</button><span id="message" role="status"></span></div>
+                <div class="actions"><button id="preview" disabled>Preview changes</button><button id="assign-next-pid" disabled>Assign next available PID</button><span id="message" role="status"></span></div>
                 <div id="preview-results" hidden>
                     <h3>Changes to save</h3><p id="preview-count" role="status"></p>
                     <div class="slides"><table><thead><tr><th>Accession</th><th>Batch</th><th>Original filename</th><th>Current values</th><th>New values</th></tr></thead><tbody id="preview-rows"></tbody></table></div>
@@ -130,11 +130,11 @@ async function pollJob(){
     jobBusy=['queued','catalog_syncing'].includes(job.status);
     pendingKeys=new Set(job.pending_keys||[]);
     jobBanner.hidden=job.status==='idle';
-    jobBanner.classList.toggle('running',jobBusy||job.status==='files_syncing');
+    jobBanner.classList.toggle('running',jobBusy||['sdl_syncing','files_syncing'].includes(job.status));
     jobBanner.classList.toggle('ready',job.status==='complete');
-    jobBanner.classList.toggle('failed',['failed','interrupted','file_failed'].includes(job.status));
+    jobBanner.classList.toggle('failed',['failed','interrupted','sdl_failed','file_failed'].includes(job.status));
     const finished=job.catalog_synced_at?new Date(job.catalog_synced_at).toLocaleString():'';
-    jobBanner.textContent=jobBusy?`Catalog sync in progress. ${job.queued_count||0} queued. You can keep editing.`:job.status==='files_syncing'?`Catalog synced ${finished}. ${job.pending_files} batch file(s) syncing in background. You can continue working.`:job.status==='complete'?`Catalog and batch files synced ${finished}. You can continue working.`:job.status==='file_failed'?`Catalog synced ${finished}. ${job.failed_files} batch file export(s) failed. You can continue working.`:job.message||'';
+    jobBanner.textContent=jobBusy?`Catalog sync in progress. ${job.queued_count||0} queued. You can keep editing.`:job.status==='sdl_syncing'?`Catalog synced ${finished}. Slide Digitization Log syncing in background. Metadata export is ready.`:job.status==='files_syncing'?`Catalog synced ${finished}. ${job.pending_files} batch file(s) syncing in background. You can continue working.`:job.status==='complete'?`Catalog and background files synced ${finished}. You can continue working.`:job.status==='sdl_failed'?`${job.message} Metadata export uses saved catalog data.`:job.status==='file_failed'?`Catalog synced ${finished}. ${job.failed_files} batch file export(s) failed. You can continue working.`:job.message||'';
     if(job.catalog_synced_at&&lastSyncedJob!==job.job_id){await refreshSelection();lastSyncedJob=job.job_id;}
     if(jobBusy)setReady(false);
     else if(selected.size)checkSync();
@@ -160,6 +160,7 @@ function render(){
   document.getElementById('loaded-count').textContent=loaded.size?`${loaded.size} file accession(s) loaded. This changes all of them, including any unchecked in the list.`:'Load a TXT or CSV file to use this action.';
   document.getElementById('bulk-apply').disabled=!loaded.size||bulkBusy||saveBusy;
   document.getElementById('preview').disabled=!selected.size||bulkBusy||saveBusy;
+  document.getElementById('assign-next-pid').disabled=selected.size!==1||bulkBusy||saveBusy;
   document.getElementById('save').disabled=!pendingEdit||saveBusy;
   for(const accession of catalog.accessions.filter(item=>selected.has(item.accession_key))){
     const group=document.createElement('details'),summary=document.createElement('summary'),wrap=document.createElement('div'),table=document.createElement('table');
@@ -265,10 +266,10 @@ function showPreview(data){
   document.getElementById('preview-results').hidden=false;
   document.getElementById('preview-results').scrollIntoView({block:'start'});
 }
-async function previewChanges(keys,changes,versions,includeDrafts=true){
+async function previewChanges(keys,changes,versions,includeDrafts=true,assignNextPid=false){
   invalidatePreview();message.className='';
   const slide_changes=Object.fromEntries(catalog.slides.filter(slide=>keys.includes(slide.accession.trim().toLocaleLowerCase())&&slideDrafts.has(slide.id)).map(slide=>[slide.id,slideDrafts.get(slide.id)]));
-  const payload={accession_keys:keys,changes,versions,slide_changes:includeDrafts?slide_changes:{}};
+  const payload={accession_keys:keys,changes,versions,slide_changes:includeDrafts?slide_changes:{},assign_next_pid:assignNextPid};
   const response=await request(urls.preview,payload),data=await response.json();
   if(!response.ok)throw Error(data.error);
   showPreview(data);
@@ -280,6 +281,10 @@ document.getElementById('preview').addEventListener('click',async()=>{
   const changes=Object.fromEntries([...document.querySelectorAll('[data-field]')].map(input=>[input.dataset.field,input.value.trim()]).filter(([,value])=>value));
   if(!Object.keys(changes).length&&!catalog.slides.some(slide=>selected.has(slide.accession.trim().toLocaleLowerCase())&&slideDrafts.has(slide.id))){message.textContent='Fill or stage at least one field.';return;}
   try{await previewChanges([...selected],changes,{...catalog.versions});}
+  catch(error){message.textContent=error.message;message.className='error';}
+});
+document.getElementById('assign-next-pid').addEventListener('click',async()=>{
+  try{await previewChanges([...selected],{},{...catalog.versions},false,true);}
   catch(error){message.textContent=error.message;message.className='error';}
 });
 document.getElementById('save').addEventListener('click',async()=>{

@@ -4270,19 +4270,41 @@ def _tq_catalog_signature(batches: Sequence[BatchContext]) -> str:
 
 
 def _tq_rebuild_catalog(
-    batches: Sequence[BatchContext], signature: str
+    batches: Sequence[BatchContext],
+    signature: str,
+    *,
+    preserve_sdl: bool = False,
+    sdl_type_overrides: Optional[Mapping[str, str]] = None,
 ) -> List[str]:
-    sdl_metadata, sdl_warning = _tq_sdl_accession_metadata()
-    warnings = [sdl_warning] if sdl_warning else []
     sdl_path = Path(Config.SDL_FILE_PATH)
-    sdl_stat = _tq_source_stat(sdl_path)
+    stored_sdl: Dict[str, Tuple[str, List[str]]] = {}
+    if preserve_sdl:
+        sdl_source = batch_catalog.transfer_source(Config.INSTANCE_DIR, "sdl")
+        if sdl_source is None:
+            raise DataLoadError("Transfer catalog has no stored SDL metadata.")
+        stored_sdl = {
+            slide["id"]: (slide["digitization_date"], slide["sdl_types"])
+            for slide in batch_catalog.list_transfer_slides(
+                Config.INSTANCE_DIR, include_unfinished=True, allow_stale=True
+            )
+        }
+        sdl_metadata = None
+        sdl_warning = str(sdl_source["error"]) if sdl_source["status"] != "ready" else None
+        sdl_stat = {"size": sdl_source["size"], "mtime_ns": sdl_source["mtime_ns"]}
+        sdl_status = str(sdl_source["status"])
+    else:
+        sdl_metadata, sdl_warning = _tq_sdl_accession_metadata()
+        sdl_stat = _tq_source_stat(sdl_path)
+        sdl_status = "warning" if sdl_warning else "ready"
+    warnings = [sdl_warning] if sdl_warning else []
+    type_overrides = sdl_type_overrides or {}
     sources: List[Dict[str, Any]] = [
         {
             "source_key": "sdl",
             "source_kind": "sdl",
             "path": str(sdl_path),
             **sdl_stat,
-            "status": "warning" if sdl_warning else "ready",
+            "status": sdl_status,
             "error": sdl_warning or "",
         }
     ]
@@ -4341,19 +4363,30 @@ def _tq_rebuild_catalog(
                         "contains a row missing OriginalPath, AccessionID, "
                         "Organ, PID, or NewName"
                     )
-                digitization_date = _tq_digitization_date(
-                    original_path,
-                    context.root,
-                    accession,
-                    sdl_metadata["dates"],
-                )
-                scanner = _sdl_scanner_for_batch(context.root)
-                slide_type = _tq_sdl_type(
-                    sdl_metadata, accession, scanner, digitization_date
-                )
+                slide_id = _tq_slide_id(context.id, original_path)
+                if preserve_sdl:
+                    try:
+                        digitization_date, slide_types = stored_sdl[slide_id]
+                    except KeyError as exc:
+                        raise renaming.RenamingError(
+                            "stored SDL metadata is missing for an existing slide"
+                        ) from exc
+                else:
+                    digitization_date = _tq_digitization_date(
+                        original_path,
+                        context.root,
+                        accession,
+                        sdl_metadata["dates"],
+                    )
+                    scanner = _sdl_scanner_for_batch(context.root)
+                    slide_types = [
+                        _tq_sdl_type(sdl_metadata, accession, scanner, digitization_date)
+                    ]
+                if accession_key in type_overrides:
+                    slide_types = [type_overrides[accession_key]]
                 batch_slides.append(
                     {
-                        "id": _tq_slide_id(context.id, original_path),
+                        "id": slide_id,
                         "batch_id": context.id,
                         "source_row": source_row,
                         "raw_original_path": raw_original_path,
@@ -4378,7 +4411,7 @@ def _tq_rebuild_catalog(
                         "duplicate_of_batch": row.get("DuplicateOfBatch", ""),
                         "duplicate_of_path": row.get("DuplicateOfPath", ""),
                         "conflict_name": row.get("ConflictName", ""),
-                        "sdl_types": [slide_type],
+                        "sdl_types": slide_types,
                         "digitization_date": digitization_date,
                     }
                 )
@@ -6898,11 +6931,14 @@ def _accession_edit_plan(payload: Any) -> Dict[str, Any]:
     keys, changes, versions = (payload.get(name) for name in
                                ("accession_keys", "changes", "versions"))
     slide_changes = payload.get("slide_changes", {})
+    assign_next_pid = payload.get("assign_next_pid", False)
     if (not isinstance(keys, list) or not keys
             or not all(isinstance(key, str) and 0 < len(key) <= 200 for key in keys)
             or len(set(keys)) != len(keys)
             or not isinstance(changes, dict) or not isinstance(slide_changes, dict)
-            or not (changes or slide_changes)
+            or not (changes or slide_changes or assign_next_pid)
+            or not isinstance(assign_next_pid, bool)
+            or (assign_next_pid and (len(keys) != 1 or "PID" in changes or "Organ" in changes))
             or not isinstance(versions, dict)):
         raise ValueError("Select accessions and changes first.")
     if any(field not in ACCESSION_EDIT_FIELDS or not isinstance(value, str)
@@ -6932,12 +6968,16 @@ def _accession_edit_plan(payload: Any) -> Dict[str, Any]:
         raise renaming.RenamingError("Some accessions are unavailable. Search again.")
     identifier_organs = {}
     identity_pids = {}
-    if "Organ" in changes:
+    if "Organ" in changes or assign_next_pid:
+        if assign_next_pid and len({slide["organ"] for slide in slides}) != 1:
+            raise renaming.RenamingError("Selected accession has conflicting organs.")
         identifier_organs = {
-            slide["accession"]: changes["Organ"] for slide in slides
+            slide["accession"]: changes.get("Organ", slide["organ"]) for slide in slides
         }
         identity_pids = renaming.reassign_accession_organs(
-            Path(Config.COPATH_CLONE), identifier_organs
+            Path(Config.COPATH_CLONE), identifier_organs,
+            force_new_pid=assign_next_pid,
+            batch_base=Path(Config.INSLIDE_BATCHES) if assign_next_pid else None,
         )
     slide_by_path = {(slide["batch_id"], slide["original_path"]): slide
                      for slide in slides}
@@ -6950,7 +6990,7 @@ def _accession_edit_plan(payload: Any) -> Dict[str, Any]:
         if str(state["desired_version"]) != str(versions.get(batch_id, "")):
             raise renaming.RenamingError("Mapping changed. Preview again before saving.")
         original = {row["OriginalPath"]: dict(row) for row in rows}
-        if changes or slide_changes:
+        if changes or slide_changes or identity_pids:
             for row in rows:
                 if renaming.row_accession_key(row) in selected:
                     slide = slide_by_path.get((batch_id, str(runtime_path(row["OriginalPath"]))))
@@ -7011,7 +7051,8 @@ def _accession_edit_plan(payload: Any) -> Dict[str, Any]:
                          for item in preview)
     return {"selected": selected, "changes": changes, "slide_type": slide_type,
             "prepared": prepared, "preview": preview, "changed_slides": changed_slides,
-            "identifier_organs": identifier_organs, "identity_pids": identity_pids}
+            "identifier_organs": identifier_organs, "identity_pids": identity_pids,
+            "assign_next_pid": assign_next_pid}
 
 
 def _accession_edit_sdl(selected: set[str], changes: Dict[str, str],
@@ -7075,7 +7116,6 @@ def accessions_preview():
 
 def _commit_accession_edit(payload: Dict[str, Any]) -> Dict[str, Any]:
     saved_batches = []
-    sdl_saved = False
     clone_saved = False
     try:
         with _renaming_clone_lock:
@@ -7083,11 +7123,11 @@ def _commit_accession_edit(payload: Dict[str, Any]) -> Dict[str, Any]:
             if not plan["changed_slides"]:
                 raise renaming.RenamingError("No values would change.")
             batches, warnings = discover_batches()
-            sdl_saved = _accession_edit_sdl(plan["selected"], plan["changes"],
-                                           plan["slide_type"], save=True)
             if plan["identifier_organs"]:
                 saved_pids = renaming.reassign_accession_organs(
-                    Path(Config.COPATH_CLONE), plan["identifier_organs"], save=True
+                    Path(Config.COPATH_CLONE), plan["identifier_organs"], save=True,
+                    force_new_pid=plan["assign_next_pid"],
+                    batch_base=Path(Config.INSLIDE_BATCHES) if plan["assign_next_pid"] else None,
                 )
                 if saved_pids != plan["identity_pids"]:
                     raise renaming.RenamingError(
@@ -7104,7 +7144,16 @@ def _commit_accession_edit(payload: Dict[str, Any]) -> Dict[str, Any]:
                     )
                     saved_batches.append(batch_id)
                 signature = _tq_catalog_signature(batches)
-                warnings.extend(_tq_rebuild_catalog(batches, signature))
+                type_overrides = (
+                    {key: plan["slide_type"] for key in plan["selected"]}
+                    if plan["slide_type"] is not None else None
+                )
+                warnings.extend(_tq_rebuild_catalog(
+                    batches,
+                    signature,
+                    preserve_sdl=True,
+                    sdl_type_overrides=type_overrides,
+                ))
                 for warning in batch_catalog.list_transfer_warnings(Config.INSTANCE_DIR):
                     if warning and warning not in warnings:
                         warnings.append(warning)
@@ -7117,13 +7166,23 @@ def _commit_accession_edit(payload: Dict[str, Any]) -> Dict[str, Any]:
         message = "Saved and catalog synced."
         if pending_files:
             message += f" {pending_files} batch file(s) updating in the background."
-        return {"message": message, "pending_files": pending_files}
+        sdl_needed = plan["slide_type"] is not None or (
+            "Organ" in plan["changes"] and Path(Config.SDL_FILE_PATH).is_file()
+        )
+        return {
+            "message": message,
+            "pending_files": pending_files,
+            "sdl_needed": sdl_needed,
+            "selected": plan["selected"],
+            "changes": plan["changes"],
+            "slide_type": plan["slide_type"],
+        }
     except (renaming.RenamingError, DataLoadError, DataSaveError,
             SDLWorkbookError, SDLValidationError, KeyError, sqlite3.Error,
             ValueError) as exc:
         if saved_batches:
             _document_export_event.set()
-        suffix = " Some changes were saved; search again." if saved_batches or sdl_saved or clone_saved else ""
+        suffix = " Some changes were saved; search again." if saved_batches or clone_saved else ""
         raise RuntimeError(str(exc) + suffix) from exc
 
 
@@ -7131,6 +7190,7 @@ _accession_job_lock = threading.Lock()
 _accession_job_threads: Dict[str, threading.Thread] = {}
 # shortcut: queued payloads live in process memory; use a durable queue for restart recovery.
 _accession_job_queues: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+_ACCESSION_ACTIVE_STATUSES = {"queued", "catalog_syncing", "sdl_syncing"}
 
 
 def _accession_job_read(owner_id: str) -> Dict[str, Any]:
@@ -7175,12 +7235,45 @@ def _run_accession_edit_job(owner_id: str, job_id: str,
             with _accession_job_lock:
                 job = _accession_job_read(owner_id)
                 if job.get("job_id") == job_id:
-                    job.update(status="files_syncing" if result["pending_files"] else "complete",
-                               message=result["message"], catalog_synced_at=_iso_utc(),
-                               pending_files=result["pending_files"])
-                    if not result["pending_files"]:
+                    job.update(
+                        status=("sdl_syncing" if result["sdl_needed"] else
+                                "files_syncing" if result["pending_files"] else "complete"),
+                        message=("Catalog saved. Slide Digitization Log syncing in background."
+                                 if result["sdl_needed"] else result["message"]),
+                        catalog_synced_at=_iso_utc(),
+                        pending_files=result["pending_files"],
+                    )
+                    if not result["sdl_needed"] and not result["pending_files"]:
                         job["finished_at"] = _iso_utc()
                     _accession_job_write(owner_id, job)
+            if result["sdl_needed"]:
+                try:
+                    _accession_edit_sdl(
+                        result["selected"], result["changes"], result["slide_type"], save=True
+                    )
+                except Exception as exc:
+                    app.logger.exception("Accession SDL sync failed for job %s", job_id)
+                    with _accession_job_lock:
+                        job = _accession_job_read(owner_id)
+                        if job.get("job_id") == job_id:
+                            job.update(
+                                status="sdl_failed",
+                                message=f"Catalog saved, but Slide Digitization Log sync failed: {exc}",
+                                finished_at=_iso_utc(),
+                            )
+                            _accession_job_write(owner_id, job)
+                else:
+                    with _accession_job_lock:
+                        job = _accession_job_read(owner_id)
+                        if job.get("job_id") == job_id:
+                            job.update(
+                                status=("files_syncing" if result["pending_files"] else "complete"),
+                                message=result["message"],
+                                sdl_synced_at=_iso_utc(),
+                            )
+                            if not result["pending_files"]:
+                                job["finished_at"] = _iso_utc()
+                            _accession_job_write(owner_id, job)
         with _accession_job_lock:
             queue = _accession_job_queues.get(owner_id, [])
             if queue:
@@ -7209,14 +7302,17 @@ def accessions_update():
         return jsonify({"error": "Invalid loaded accessions."}), 400
     try:
         with _accession_job_lock:
-            busy = _accession_job_read(owner_id).get("status") in {"queued", "catalog_syncing"}
+            busy = _accession_job_read(owner_id).get("status") in _ACCESSION_ACTIVE_STATUSES
         if busy:
             keys, changes = payload.get("accession_keys"), payload.get("changes")
             slide_changes = payload.get("slide_changes", {})
+            assign_next_pid = payload.get("assign_next_pid", False)
             if (not isinstance(keys, list) or not keys or len(set(keys)) != len(keys)
                     or not all(isinstance(key, str) and 0 < len(key) <= 200 for key in keys)
                     or not isinstance(changes, dict) or not isinstance(slide_changes, dict)
-                    or not (changes or slide_changes)
+                    or not (changes or slide_changes or assign_next_pid)
+                    or not isinstance(assign_next_pid, bool)
+                    or (assign_next_pid and (len(keys) != 1 or "PID" in changes or "Organ" in changes))
                     or any(field not in ACCESSION_EDIT_FIELDS or not isinstance(value, str)
                            or not value.strip() or len(value) > 200 for field, value in changes.items())
                     or any(not isinstance(slide_id, str) or len(slide_id) > 200
@@ -7231,8 +7327,6 @@ def accessions_update():
                 plan = _accession_edit_plan(payload)
                 if not plan["changed_slides"]:
                     raise renaming.RenamingError("No values would change.")
-                _accession_edit_sdl(plan["selected"], plan["changes"],
-                                    plan["slide_type"], save=False)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except (renaming.RenamingError, DataLoadError, SDLWorkbookError,
@@ -7241,7 +7335,7 @@ def accessions_update():
     with _accession_job_lock:
         existing = _accession_job_read(owner_id)
         job_id = uuid.uuid4().hex
-        if existing.get("status") in {"queued", "catalog_syncing"}:
+        if existing.get("status") in _ACCESSION_ACTIVE_STATUSES:
             queue = _accession_job_queues.setdefault(owner_id, [])
             queue.append((job_id, payload))
             return jsonify({"job_id": job_id, "status": "queued", "position": len(queue)}), 202
@@ -7272,6 +7366,15 @@ def accessions_job():
                 job.update(status="interrupted", message="Catalog sync was interrupted. Reload accessions before trying again.",
                            finished_at=_iso_utc())
                 _accession_job_write(owner_id, job)
+        elif job["status"] == "sdl_syncing":
+            thread = _accession_job_threads.get(job["job_id"])
+            if thread is None or not thread.is_alive():
+                job.update(
+                    status="sdl_failed",
+                    message="Catalog saved, but Slide Digitization Log sync was interrupted.",
+                    finished_at=_iso_utc(),
+                )
+                _accession_job_write(owner_id, job)
         elif job["status"] == "files_syncing":
             sync = _accession_sync_payload(job["accession_keys"], include_slides=False)
             if sync["ready"]:
@@ -7284,11 +7387,12 @@ def accessions_job():
                     job.update(status="complete", message="Catalog and batch files synced.",
                                finished_at=_iso_utc())
                 _accession_job_write(owner_id, job)
-        if job["status"] not in {"queued", "catalog_syncing"}:
+        if job["status"] not in _ACCESSION_ACTIVE_STATUSES:
             _accession_job_threads.pop(job["job_id"], None)
         response = {key: job.get(key) for key in
                     ("job_id", "status", "message", "started_at", "updated_at",
-                     "catalog_synced_at", "finished_at", "pending_files", "failed_files")}
+                     "catalog_synced_at", "sdl_synced_at", "finished_at",
+                     "pending_files", "failed_files")}
         response["queued_count"] = len(_accession_job_queues.get(owner_id, []))
         response["pending_keys"] = list(dict.fromkeys(
             (job.get("accession_keys", []) if job["status"] in {"queued", "catalog_syncing"} else [])

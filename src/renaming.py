@@ -910,6 +910,8 @@ def reassign_accession_organs(
     accession_organs: Mapping[str, str],
     *,
     save: bool = False,
+    force_new_pid: bool = False,
+    batch_base: Optional[Path] = None,
 ) -> Dict[str, str]:
     """Return target PIDs and optionally persist accession organ moves."""
     identifiers = _identifier_rows(clone_root)
@@ -965,6 +967,12 @@ def reassign_accession_organs(
         }
         for organ in ORGANS
     }
+    if force_new_pid:
+        if len(requested) != 1 or batch_base is None:
+            raise RenamingError("Select one accession to assign the next PID")
+        staged = _reserved_pids(batch_base)
+        for organ in ORGANS:
+            reserved[organ].update(staged[organ])
     pairs = {
         (row.get("MRN", "").strip(), row.get("Organ", "").strip().upper()):
             row.get("PID", "").strip().upper()
@@ -979,7 +987,19 @@ def reassign_accession_organs(
         old_organ = current.get("Organ", "").strip().upper()
         old_pid = current.get("PID", "").strip().upper()
         mrn = current.get("MRN", "").strip()
-        if old_organ == organ and PID_RE.fullmatch(old_pid):
+        if force_new_pid:
+            if old_organ != organ:
+                raise RenamingError("Catalog and identifier organs differ; resolve the organ first")
+            if mrn and any(row is not current and row.get("MRN", "").strip() == mrn
+                   and row.get("Organ", "").strip().upper() == organ
+                   for row in identifiers):
+                raise RenamingError("Other accessions share this organ and MRN; update them together")
+            other_pids = reserved[organ] - {old_pid}
+            pid = increment_pid(max(other_pids)) if other_pids else "AAAAAA"
+            while pid in reserved[organ]:
+                pid = increment_pid(pid)
+            reserved[organ].add(pid)
+        elif old_organ == organ and PID_RE.fullmatch(old_pid):
             pid = old_pid
         else:
             pid = pairs.get((mrn, organ), "") if mrn else ""

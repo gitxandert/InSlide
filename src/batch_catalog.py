@@ -1792,6 +1792,13 @@ class BatchCatalog:
                 )
         return warnings
 
+    def transfer_source(self, instance_dir: str | Path, source_key: str) -> Optional[dict]:
+        with self.connection(instance_dir) as connection:
+            row = connection.execute(
+                "SELECT * FROM transfer_sources WHERE source_key=?", (source_key,)
+            ).fetchone()
+            return dict(row) if row is not None else None
+
     def acquire_reconcile_lease(
         self, instance_dir: str | Path, owner: str, lease_seconds: int
     ) -> bool:
